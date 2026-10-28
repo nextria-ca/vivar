@@ -1,11 +1,19 @@
 //! Isolated tool environments (`vivar tool …`) and throwaway environments for
-//! PEP 723 single-file scripts. Both are vivar venvs filled by the backend.
+//! PEP 723 single-file scripts. Both are vivar venvs filled by the backend and
+//! held to the same policy as projects.
 
 use crate::backend::Backend;
-use crate::{dirs, project, sha256, venv};
+use crate::project::{self, Policy};
+use crate::python::Installed;
+use crate::{dirs, licenses, python, sha256, venv};
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// Commands this env linked into `~/.local/bin`, one per line.
+const LINKS: &str = "vivar-links.txt";
+/// The requirement and Python request the env was built from.
+const SPEC: &str = "vivar-tool.txt";
 
 pub fn tools_dir() -> Result<PathBuf> {
     Ok(dirs::data()?.join("tools"))
@@ -15,27 +23,85 @@ fn tool_env(name: &str) -> Result<PathBuf> {
     Ok(tools_dir()?.join(project::normalize(name)))
 }
 
-/// Creates (if needed) a tool env for `package` and returns it.
-pub fn ensure(backend: &dyn Backend, package: &str, python: Option<&str>) -> Result<PathBuf> {
+/// Builds `env` on `interpreter` and installs `specs` into it, under `policy`.
+/// A failed or non-compliant install leaves nothing behind.
+fn fill(
+    backend: &dyn Backend,
+    policy: &Policy,
+    env: &Path,
+    interpreter: &Installed,
+    prompt: &str,
+    specs: &[String],
+) -> Result<()> {
+    policy.check_deny(specs)?;
+    venv::create(env, interpreter, prompt)?;
+    let result = (|| {
+        if !specs.is_empty() {
+            backend.install(&venv::python(env), specs)?;
+        }
+        licenses::check(
+            env,
+            policy.allow_licenses.as_deref(),
+            &policy.license_exceptions,
+        )
+    })();
+    if let Err(e) = result {
+        let _ = fs::remove_dir_all(env);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// The tool env for `package` (a requirement spec), built or rebuilt as needed.
+pub fn ensure(
+    backend: &dyn Backend,
+    policy: &Policy,
+    package: &str,
+    python_request: Option<&str>,
+) -> Result<PathBuf> {
     let name = project::normalize(project::requirement_name(package));
     let env = tool_env(&name)?;
-    if !env.join("pyvenv.cfg").exists() {
-        let interpreter = venv::interpreter(python)?;
-        venv::create(&env, &interpreter, &name)?;
-        if let Err(e) = backend.install(&venv::python(&env), &[package.to_owned()]) {
-            let _ = fs::remove_dir_all(&env);
-            return Err(e);
-        }
+    let wanted = format!("{package}\n{}\n", python_request.unwrap_or(""));
+    if env.join("pyvenv.cfg").exists()
+        && fs::read_to_string(env.join(SPEC)).ok() == Some(wanted.clone())
+    {
+        // Reused envs still have to pass today's policy.
+        policy.check_deny(&[package])?;
+        licenses::check(
+            &env,
+            policy.allow_licenses.as_deref(),
+            &policy.license_exceptions,
+        )?;
+        return Ok(env);
     }
+    if env.exists() {
+        remove_links(&env);
+        fs::remove_dir_all(&env)?;
+    }
+    let interpreter = venv::interpreter(python_request)?;
+    fill(
+        backend,
+        policy,
+        &env,
+        &interpreter,
+        &name,
+        &[package.to_owned()],
+    )?;
+    fs::write(env.join(SPEC), wanted)?;
     Ok(env)
 }
 
-/// `vivar tool install`: the env plus its console scripts linked into `~/.local/bin`.
-pub fn install(backend: &dyn Backend, package: &str, python: Option<&str>) -> Result<()> {
-    let env = ensure(backend, package, python)?;
+/// `vivar tool install`: the env plus its commands linked into `~/.local/bin`.
+pub fn install(
+    backend: &dyn Backend,
+    policy: &Policy,
+    package: &str,
+    python: Option<&str>,
+) -> Result<()> {
+    let env = ensure(backend, policy, package, python)?;
     let bin = dirs::bin()?;
     fs::create_dir_all(&bin)?;
-    let scripts = console_scripts(&env)?;
+    let scripts = commands_of(&env)?;
     if scripts.is_empty() {
         println!(
             "installed {package} into {} (it provides no commands)",
@@ -43,12 +109,19 @@ pub fn install(backend: &dyn Backend, package: &str, python: Option<&str>) -> Re
         );
         return Ok(());
     }
+    let mine = links_of(&env);
     for script in &scripts {
-        let target = env.join(venv::BIN).join(exe(script));
         let link = bin.join(exe(script));
+        if link.exists() && !mine.contains(script) && !owned_by_a_tool(script)? {
+            bail!(
+                "refusing to replace {}: it was not installed by vivar",
+                link.display()
+            );
+        }
         let _ = fs::remove_file(&link);
-        link_or_copy(&target, &link)?;
+        link_or_copy(&env.join(venv::BIN).join(exe(script)), &link)?;
     }
+    fs::write(env.join(LINKS), scripts.join("\n") + "\n")?;
     println!(
         "installed {}: {} in {}",
         package,
@@ -70,10 +143,7 @@ pub fn uninstall(package: &str) -> Result<()> {
     if !env.exists() {
         bail!("tool {name} is not installed");
     }
-    let bin = dirs::bin()?;
-    for script in console_scripts(&env).unwrap_or_default() {
-        let _ = fs::remove_file(bin.join(exe(&script)));
-    }
+    remove_links(&env);
     fs::remove_dir_all(&env)?;
     println!("uninstalled {name}");
     Ok(())
@@ -94,8 +164,20 @@ pub fn list() -> Result<()> {
         println!("no tools installed; try `vivar tool install ruff`");
     }
     for name in names {
-        let scripts = console_scripts(&dir.join(&name)).unwrap_or_default();
-        println!("{name:<24} {}", scripts.join(", "));
+        let env = dir.join(&name);
+        let linked = links_of(&env);
+        let commands = commands_of(&env).unwrap_or_default();
+        let shown: Vec<String> = commands
+            .iter()
+            .map(|c| {
+                if linked.contains(c) {
+                    format!("{c} (linked)")
+                } else {
+                    c.clone()
+                }
+            })
+            .collect();
+        println!("{name:<24} {}", shown.join(", "));
     }
     Ok(())
 }
@@ -103,36 +185,61 @@ pub fn list() -> Result<()> {
 /// Runs `cmd` from the tool env of `package` (the command itself by default).
 pub fn run(
     backend: &dyn Backend,
+    policy: &Policy,
     package: Option<&str>,
     cmd: &str,
     args: &[String],
     python: Option<&str>,
 ) -> Result<i32> {
-    let env = ensure(backend, package.unwrap_or(cmd), python)?;
+    let env = ensure(backend, policy, package.unwrap_or(cmd), python)?;
     let mut full = vec![cmd.to_owned()];
     full.extend_from_slice(args);
     venv::exec(&env, &full)
 }
 
-/// Console scripts of the packages in an env, from `entry_points.txt`.
-fn console_scripts(env: &Path) -> Result<Vec<String>> {
+/// Commands an env provides: `[console_scripts]` entry points plus any
+/// executables wheels dropped straight into the bin directory (recorded in RECORD).
+fn commands_of(env: &Path) -> Result<Vec<String>> {
     let site = venv::site_packages(env)?;
+    let bin = fs::canonicalize(env.join(venv::BIN))?;
     let mut scripts = Vec::new();
     for entry in fs::read_dir(&site)?.flatten() {
         let path = entry.path();
         if !path.extension().is_some_and(|e| e == "dist-info") {
             continue;
         }
-        let Ok(text) = fs::read_to_string(path.join("entry_points.txt")) else {
-            continue;
-        };
-        let mut in_console = false;
-        for line in text.lines().map(str::trim) {
-            if line.starts_with('[') {
-                in_console = line == "[console_scripts]";
-            } else if in_console {
-                if let Some((name, _)) = line.split_once('=') {
-                    scripts.push(name.trim().to_owned());
+        if let Ok(text) = fs::read_to_string(path.join("entry_points.txt")) {
+            let mut in_console = false;
+            for line in text.lines().map(str::trim) {
+                if line.starts_with('[') {
+                    in_console = line == "[console_scripts]";
+                } else if in_console {
+                    if let Some((name, _)) = line.split_once('=') {
+                        scripts.push(name.trim().to_owned());
+                    }
+                }
+            }
+        }
+        if let Ok(record) = fs::read_to_string(path.join("RECORD")) {
+            for line in record.lines() {
+                let Some(file) = line.split(',').next() else {
+                    continue;
+                };
+                if !file.starts_with("..") {
+                    continue;
+                }
+                let Ok(full) = fs::canonicalize(site.join(file)) else {
+                    continue;
+                };
+                if full.parent() == Some(bin.as_path()) {
+                    if let Some(name) = full.file_name().and_then(|n| n.to_str()) {
+                        let name = name
+                            .strip_suffix(std::env::consts::EXE_SUFFIX)
+                            .unwrap_or(name);
+                        if !name.starts_with("python") && !name.starts_with("activate") {
+                            scripts.push(name.to_owned());
+                        }
+                    }
                 }
             }
         }
@@ -140,6 +247,36 @@ fn console_scripts(env: &Path) -> Result<Vec<String>> {
     scripts.sort();
     scripts.dedup();
     Ok(scripts)
+}
+
+fn links_of(env: &Path) -> Vec<String> {
+    fs::read_to_string(env.join(LINKS))
+        .map(|t| {
+            t.lines()
+                .map(str::to_owned)
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether some tool env (not necessarily this one) linked `command`.
+fn owned_by_a_tool(command: &str) -> Result<bool> {
+    let Ok(entries) = fs::read_dir(tools_dir()?) else {
+        return Ok(false);
+    };
+    Ok(entries
+        .flatten()
+        .any(|e| links_of(&e.path()).iter().any(|l| l == command)))
+}
+
+/// Removes the commands this env linked, and only those.
+pub fn remove_links(env: &Path) {
+    let Ok(bin) = dirs::bin() else { return };
+    for command in links_of(env) {
+        let _ = fs::remove_file(bin.join(exe(&command)));
+    }
+    let _ = fs::remove_file(env.join(LINKS));
 }
 
 fn exe(name: &str) -> String {
@@ -169,9 +306,13 @@ pub struct ScriptMeta {
 pub fn script_metadata(path: &Path) -> Result<Option<ScriptMeta>> {
     let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut lines = text.lines();
-    let Some(_) = lines.by_ref().find(|l| l.trim_end() == "# /// script") else {
+    if lines
+        .by_ref()
+        .find(|l| l.trim_end() == "# /// script")
+        .is_none()
+    {
         return Ok(None);
-    };
+    }
     let mut toml = String::new();
     for line in lines {
         if line.trim_end() == "# ///" {
@@ -207,14 +348,8 @@ pub fn script_metadata(path: &Path) -> Result<Option<ScriptMeta>> {
 }
 
 /// A cached environment for the script's dependencies, keyed by their hash.
-pub fn script_env(backend: &dyn Backend, meta: &ScriptMeta) -> Result<PathBuf> {
-    // `>=3.12` → `3.12`; anything fancier just takes the newest installed.
-    let python = meta
-        .requires_python
-        .as_deref()
-        .and_then(|r| r.strip_prefix(">="))
-        .map(|v| v.trim().to_owned());
-    let interpreter = venv::interpreter(python.as_deref())?;
+pub fn script_env(backend: &dyn Backend, policy: &Policy, meta: &ScriptMeta) -> Result<PathBuf> {
+    let interpreter = python::select(meta.requires_python.as_deref())?;
     let mut hasher = sha256::Sha256::new();
     hasher.update(interpreter.key.as_bytes());
     for dep in &meta.dependencies {
@@ -223,23 +358,36 @@ pub fn script_env(backend: &dyn Backend, meta: &ScriptMeta) -> Result<PathBuf> {
     }
     let key = &sha256::hex(&hasher.finish())[..16];
     let env = dirs::cache()?.join("scripts").join(key);
-    if !env.join("pyvenv.cfg").exists() {
-        venv::create(&env, &interpreter, "script")?;
-        if !meta.dependencies.is_empty() {
-            if let Err(e) = backend.install(&venv::python(&env), &meta.dependencies) {
-                let _ = fs::remove_dir_all(&env);
-                return Err(e);
-            }
-        }
+    if env.join("pyvenv.cfg").exists() {
+        policy.check_deny(&meta.dependencies)?;
+        licenses::check(
+            &env,
+            policy.allow_licenses.as_deref(),
+            &policy.license_exceptions,
+        )?;
+    } else {
+        fill(
+            backend,
+            policy,
+            &env,
+            &interpreter,
+            "script",
+            &meta.dependencies,
+        )?;
     }
     Ok(env)
 }
 
 /// `vivar run script.py` for a file with inline metadata.
-pub fn run_script(backend: &dyn Backend, script: &Path, args: &[String]) -> Result<i32> {
+pub fn run_script(
+    backend: &dyn Backend,
+    policy: &Policy,
+    script: &Path,
+    args: &[String],
+) -> Result<i32> {
     let meta = script_metadata(script)?
         .ok_or_else(|| anyhow!("{} has no `# /// script` metadata block", script.display()))?;
-    let env = script_env(backend, &meta)?;
+    let env = script_env(backend, policy, &meta)?;
     let mut full = vec!["python".to_owned(), script.to_string_lossy().into_owned()];
     full.extend_from_slice(args);
     venv::exec(&env, &full)

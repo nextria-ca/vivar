@@ -147,6 +147,77 @@ pub fn find(request: Option<&str>) -> Result<Option<Installed>> {
         .find(|p| satisfies(p.version, &request)))
 }
 
+/// One clause of a PEP 440 specifier on release segments only.
+fn clause_ok(version: [u32; 3], clause: &str) -> Result<bool> {
+    let clause = clause.trim();
+    let (op, rest) = ["===", "==", "!=", "<=", ">=", "~=", "<", ">"]
+        .iter()
+        .find_map(|op| clause.strip_prefix(op).map(|r| (*op, r.trim())))
+        .ok_or_else(|| anyhow!("unsupported Python specifier {clause:?}"))?;
+    let wildcard = rest.ends_with(".*");
+    let parts: Vec<u32> = rest
+        .trim_end_matches(".*")
+        .split('.')
+        .map(|p| {
+            p.trim_start_matches(|c: char| !c.is_ascii_digit())
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+        })
+        .collect::<Result<_, _>>()
+        .map_err(|_| anyhow!("unsupported Python version in specifier {clause:?}"))?;
+    let padded = [
+        *parts.first().unwrap_or(&0),
+        *parts.get(1).unwrap_or(&0),
+        *parts.get(2).unwrap_or(&0),
+    ];
+    let prefix = |n: usize| version.iter().take(n).eq(padded.iter().take(n));
+    Ok(match op {
+        "==" | "===" if wildcard => prefix(parts.len()),
+        "==" | "===" => version == padded,
+        "!=" if wildcard => !prefix(parts.len()),
+        "!=" => version != padded,
+        ">=" => version >= padded,
+        ">" => version > padded,
+        "<=" => version <= padded,
+        "<" => version < padded,
+        // `~=3.12` means `>=3.12, ==3.*`; `~=3.12.1` means `>=3.12.1, ==3.12.*`.
+        "~=" => version >= padded && prefix(parts.len().saturating_sub(1).max(1)),
+        _ => unreachable!(),
+    })
+}
+
+/// Whether `version` satisfies a full specifier like `>=3.10,<3.13`.
+pub fn satisfies_spec(version: [u32; 3], spec: &str) -> Result<bool> {
+    for clause in spec.split(',').filter(|c| !c.trim().is_empty()) {
+        if !clause_ok(version, clause)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The newest installed build satisfying `spec` (a PEP 440 specifier), or the
+/// newest downloadable one, installed. No spec means the newest installed.
+pub fn select(spec: Option<&str>) -> Result<Installed> {
+    let Some(spec) = spec.filter(|s| !s.trim().is_empty()) else {
+        return crate::venv::interpreter(None);
+    };
+    for p in installed()? {
+        if satisfies_spec(p.version, spec)? {
+            return Ok(p);
+        }
+    }
+    for (version, _) in available()? {
+        if satisfies_spec(version, spec)? {
+            let [a, b, c] = version;
+            return install(&format!("{a}.{b}.{c}"));
+        }
+    }
+    bail!("no CPython build satisfies requires-python = {spec:?}")
+}
+
 /// Downloads for this machine in the latest python-build-standalone release:
 /// `(version, file name)`, newest first. Pre-releases are left out.
 fn available() -> Result<Vec<([u32; 3], String)>> {
@@ -256,6 +327,38 @@ mod tests {
         assert!(satisfies([3, 12, 4], &[3, 12]));
         assert!(satisfies([3, 12, 4], &[]));
         assert!(!satisfies([3, 13, 0], &[3, 12]));
+    }
+
+    #[test]
+    fn evaluates_specifiers() {
+        let v = [3, 12, 4];
+        assert!(satisfies_spec(v, ">=3.12").unwrap());
+        assert!(satisfies_spec(v, ">=3.12,<3.13").unwrap());
+        assert!(!satisfies_spec(v, ">=3.13").unwrap());
+        assert!(satisfies_spec(v, "==3.12.*").unwrap());
+        assert!(!satisfies_spec(v, "==3.11.*").unwrap());
+        assert!(satisfies_spec(v, "==3.12.4").unwrap());
+        assert!(!satisfies_spec(v, "==3.12.3").unwrap());
+        assert!(satisfies_spec(v, "~=3.12").unwrap());
+        assert!(satisfies_spec(v, "~=3.12.1").unwrap());
+        assert!(!satisfies_spec(v, "~=3.11.9").unwrap());
+        assert!(satisfies_spec(v, "!=3.12.3, <4").unwrap());
+        assert!(!satisfies_spec(v, "!=3.12.*").unwrap());
+        assert!(satisfies_spec(v, " >3.11 ").unwrap());
+        assert!(satisfies_spec(v, "").unwrap());
+        assert!(satisfies_spec([3, 12, 0], ">=3.12").unwrap());
+        assert!(satisfies_spec(v, ">=3.12.0rc1").unwrap());
+        assert!(satisfies_spec(v, "<3.12.5").unwrap());
+        assert!(satisfies_spec(v, "<3.13").unwrap());
+        assert!(!satisfies_spec(v, "<=3.12").unwrap());
+        assert!(satisfies_spec([3, 12, 0], "<=3.12").unwrap());
+        assert!(satisfies_spec(v, "~=3.12.1, !=3.12.3").unwrap());
+        assert!(satisfies_spec(v, ">=3.12.4").unwrap());
+        assert!(satisfies_spec(v, "<3.12.5,>=3.12.4").unwrap());
+        assert!(!satisfies_spec(v, "==3").unwrap());
+        assert!(!satisfies_spec(v, "==3.12").unwrap());
+        assert!(satisfies_spec([3, 12, 0], "==3.12").unwrap());
+        assert!(satisfies_spec(v, "latest").is_err());
     }
 
     #[test]

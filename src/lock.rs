@@ -2,7 +2,7 @@
 //! `diff` and the hash policy.
 
 use anyhow::{Context, Result};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::path::Path;
 use toml_edit::{DocumentMut, Item};
@@ -17,10 +17,17 @@ pub struct Package {
     pub source_kind: String,
     /// The registry URL for registry packages.
     pub source: String,
-    /// Direct dependency names (all extras and groups flattened).
-    pub dependencies: Vec<String>,
+    /// Direct dependencies (all extras and groups flattened). Forked lockfiles
+    /// pin an edge to a version when several variants of a package exist.
+    pub dependencies: Vec<Dep>,
     /// Every artifact has a hash (registry packages always do with uv).
     pub hashed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Dep {
+    pub name: String,
+    pub version: Option<String>,
 }
 
 pub struct Lock {
@@ -59,12 +66,17 @@ impl Lock {
             let mut dependencies = Vec::new();
             let mut push_deps = |item: Option<&Item>| {
                 if let Some(arr) = item.and_then(Item::as_array) {
-                    dependencies.extend(
-                        arr.iter()
-                            .filter_map(|v| v.as_inline_table())
-                            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
-                            .map(str::to_owned),
-                    );
+                    for t in arr.iter().filter_map(|v| v.as_inline_table()) {
+                        if let Some(name) = t.get("name").and_then(|n| n.as_str()) {
+                            dependencies.push(Dep {
+                                name: name.to_owned(),
+                                version: t
+                                    .get("version")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_owned),
+                            });
+                        }
+                    }
                 }
             };
             push_deps(table.get("dependencies"));
@@ -106,6 +118,21 @@ impl Lock {
         self.packages.iter().find(|p| p.name == name)
     }
 
+    /// The package an edge points at: the pinned variant, else the only one.
+    fn resolve(&self, dep: &Dep) -> Option<&Package> {
+        match &dep.version {
+            Some(v) => self
+                .packages
+                .iter()
+                .find(|p| p.name == dep.name && &p.version == v),
+            None => self.get(&dep.name),
+        }
+    }
+
+    fn edge_hits(dep: &Dep, target: &Package) -> bool {
+        dep.name == target.name && dep.version.as_deref().is_none_or(|v| v == target.version)
+    }
+
     /// The project itself and workspace members: what everything hangs off.
     pub fn roots(&self) -> Vec<&Package> {
         let roots: Vec<&Package> = self
@@ -118,7 +145,7 @@ impl Lock {
             let depended: BTreeSet<&str> = self
                 .packages
                 .iter()
-                .flat_map(|p| p.dependencies.iter().map(String::as_str))
+                .flat_map(|p| p.dependencies.iter().map(|d| d.name.as_str()))
                 .collect();
             return self
                 .packages
@@ -148,7 +175,8 @@ impl Lock {
         seen: &mut BTreeSet<String>,
         out: &mut String,
     ) {
-        let repeat = !seen.insert(pkg.name.clone()) && !pkg.dependencies.is_empty();
+        let repeat =
+            !seen.insert(format!("{}@{}", pkg.name, pkg.version)) && !pkg.dependencies.is_empty();
         out.push_str(&format!(
             "{prefix}{} v{}{}\n",
             pkg.name,
@@ -172,7 +200,9 @@ impl Lock {
         };
         let last = pkg.dependencies.len().saturating_sub(1);
         for (i, dep) in pkg.dependencies.iter().enumerate() {
-            let Some(child) = self.get(dep) else { continue };
+            let Some(child) = self.resolve(dep) else {
+                continue;
+            };
             let branch = if i == last {
                 "└── "
             } else {
@@ -189,36 +219,32 @@ impl Lock {
         }
     }
 
-    /// Every chain from a root down to `name`, shortest first.
+    /// Every chain from a root down to any variant of `name`, shortest first.
     pub fn why(&self, name: &str) -> Vec<Vec<&Package>> {
-        let mut parents: BTreeMap<&str, Vec<&Package>> = BTreeMap::new();
-        for p in &self.packages {
-            for d in &p.dependencies {
-                parents.entry(d.as_str()).or_default().push(p);
-            }
-        }
-        let Some(target) = self.get(name) else {
-            return Vec::new();
-        };
+        let targets: Vec<&Package> = self.packages.iter().filter(|p| p.name == name).collect();
         let mut paths = Vec::new();
-        let mut queue: VecDeque<Vec<&Package>> = VecDeque::from([vec![target]]);
+        let mut queue: VecDeque<Vec<&Package>> = targets.into_iter().map(|t| vec![t]).collect();
         while let Some(path) = queue.pop_front() {
             let top = path[0];
-            match parents.get(top.name.as_str()) {
-                None => paths.push(path),
-                Some(ps) => {
-                    for parent in ps {
-                        if path.iter().any(|p| p.name == parent.name) {
-                            continue; // cycle
-                        }
-                        let mut next = vec![*parent];
-                        next.extend(path.iter().copied());
-                        queue.push_back(next);
-                    }
+            let parents: Vec<&Package> = self
+                .packages
+                .iter()
+                .filter(|p| p.dependencies.iter().any(|d| Self::edge_hits(d, top)))
+                .collect();
+            if parents.is_empty() {
+                paths.push(path);
+                if paths.len() >= 20 {
+                    break;
                 }
+                continue;
             }
-            if paths.len() >= 20 {
-                break;
+            for parent in parents {
+                if path.iter().any(|p| std::ptr::eq(*p, parent)) {
+                    continue; // cycle
+                }
+                let mut next = vec![parent];
+                next.extend(path.iter().copied());
+                queue.push_back(next);
             }
         }
         paths
@@ -272,7 +298,8 @@ wheels = [{ url = "w", hash = "sha256:c" }]
         assert_eq!(lock.packages.len(), 5);
         let app = lock.get("app").unwrap();
         assert_eq!(app.source_kind, "virtual");
-        assert_eq!(app.dependencies, vec!["pytest", "six"]);
+        let names: Vec<&str> = app.dependencies.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["pytest", "six"]);
         assert!(lock.get("pytest").unwrap().hashed);
         assert!(!lock.get("pluggy").unwrap().hashed);
         assert!(!lock.get("iniconfig").unwrap().hashed);
@@ -294,5 +321,38 @@ wheels = [{ url = "w", hash = "sha256:c" }]
         assert_eq!(names, vec!["app", "pytest", "pluggy"]);
         assert!(lock.why("nope").is_empty());
         assert_eq!(lock.tree(0), "app v0.1.0\n");
+    }
+
+    #[test]
+    fn forked_variants_keep_their_identity() {
+        let lock = Lock::parse(
+            r#"
+[[package]]
+name = "app"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "numpy", version = "1.26.4", marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.1.0", marker = "python_full_version >= '3.12'" },
+]
+
+[[package]]
+name = "numpy"
+version = "1.26.4"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "numpy"
+version = "2.1.0"
+source = { registry = "https://pypi.org/simple" }
+"#,
+        )
+        .unwrap();
+        let tree = lock.tree(5);
+        assert!(
+            tree.contains("numpy v1.26.4") && tree.contains("numpy v2.1.0"),
+            "{tree}"
+        );
+        assert_eq!(lock.why("numpy").len(), 2);
     }
 }

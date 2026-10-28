@@ -168,10 +168,10 @@ pub fn violations<'a>(dists: &'a [Dist], allow: &[String], exceptions: &[String]
         .collect()
 }
 
-pub fn check(venv: &Path, allow: &[String], exceptions: &[String]) -> Result<()> {
-    if allow.is_empty() {
+pub fn check(venv: &Path, allow: Option<&[String]>, exceptions: &[String]) -> Result<()> {
+    let Some(allow) = allow else {
         return Ok(());
-    }
+    };
     let dists = inventory(venv)?;
     let bad = violations(&dists, allow, exceptions);
     if bad.is_empty() {

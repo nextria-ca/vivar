@@ -85,7 +85,7 @@ pub fn run(cwd: &Path) -> Result<i32> {
                 "org policy {} (deny {}, licenses {}, require-hashes {})",
                 path.display(),
                 policy.deny.len(),
-                policy.allow_licenses.len(),
+                policy.allow_licenses.as_ref().map_or(0, Vec::len),
                 policy.require_hashes
             ),
         ),
@@ -117,7 +117,7 @@ pub fn run(cwd: &Path) -> Result<i32> {
             } else {
                 println!("warn no .venv yet; run `vivar sync`");
             }
-            let policy = project.policy();
+            let policy = project.policy()?;
             if let Some(index) = &policy.index_url {
                 let ok =
                     !index.contains("://") && Path::new(index).is_dir() || index.contains("://");

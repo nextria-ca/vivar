@@ -55,8 +55,9 @@ pub struct Policy {
     /// Package index to use instead of PyPI: an internal mirror URL, or a local
     /// directory of wheels (an offline wheelhouse).
     pub index_url: Option<String>,
-    /// SPDX identifiers every installed package must satisfy (empty = no check).
-    pub allow_licenses: Vec<String>,
+    /// SPDX identifiers every installed package must satisfy. `None` means no
+    /// check; an empty list (two policies with nothing in common) allows nothing.
+    pub allow_licenses: Option<Vec<String>>,
     /// Normalized package names exempt from the license check.
     pub license_exceptions: Vec<String>,
     /// Every locked package must be a hashed registry artifact from `index-url`.
@@ -64,6 +65,22 @@ pub struct Policy {
 }
 
 impl Policy {
+    /// Refuses requirements whose package name is on the deny list.
+    pub fn check_deny<S: AsRef<str>>(&self, reqs: &[S]) -> Result<()> {
+        let blocked: Vec<&str> = reqs
+            .iter()
+            .map(AsRef::as_ref)
+            .filter(|r| self.deny.contains(&normalize(requirement_name(r))))
+            .collect();
+        if !blocked.is_empty() {
+            bail!(
+                "blocked by [tool.vivar.policy] deny list: {}",
+                blocked.join(", ")
+            );
+        }
+        Ok(())
+    }
+
     fn from_table(table: Option<&Item>, base: &Path) -> Policy {
         let list = |key: &str| -> Vec<String> {
             table
@@ -85,10 +102,14 @@ impl Policy {
                 // A wheelhouse directory, relative to the file if not absolute.
                 false => base.join(s).to_string_lossy().into_owned(),
             });
+        let allow_licenses = table
+            .and_then(|p| p.get("allow-licenses"))
+            .is_some()
+            .then(|| list("allow-licenses"));
         Policy {
             deny: list("deny").iter().map(|s| normalize(s)).collect(),
             index_url,
-            allow_licenses: list("allow-licenses"),
+            allow_licenses,
             license_exceptions: list("license-exceptions")
                 .iter()
                 .map(|s| normalize(s))
@@ -110,17 +131,14 @@ impl Policy {
             }
         }
         self.index_url = self.index_url.or(org.index_url);
-        self.allow_licenses = match (
-            self.allow_licenses.is_empty(),
-            org.allow_licenses.is_empty(),
-        ) {
-            (true, _) => org.allow_licenses,
-            (false, true) => self.allow_licenses,
-            (false, false) => self
-                .allow_licenses
-                .into_iter()
-                .filter(|l| org.allow_licenses.iter().any(|o| o.eq_ignore_ascii_case(l)))
-                .collect(),
+        self.allow_licenses = match (self.allow_licenses, org.allow_licenses) {
+            (None, org) => org,
+            (mine, None) => mine,
+            (Some(mine), Some(org)) => Some(
+                mine.into_iter()
+                    .filter(|l| org.iter().any(|o| o.eq_ignore_ascii_case(l)))
+                    .collect(),
+            ),
         };
         self.license_exceptions.extend(org.license_exceptions);
         self.require_hashes |= org.require_hashes;
@@ -177,7 +195,7 @@ impl Project {
             for parent in ancestors {
                 if parent.join(PYPROJECT).is_file() {
                     let candidate = Self::load(parent)?;
-                    if candidate.is_workspace_root() {
+                    if candidate.is_workspace_root() && candidate.has_member(&project.root) {
                         project.workspace = Some(Box::new(candidate));
                     }
                     break;
@@ -185,6 +203,31 @@ impl Project {
             }
         }
         Ok(Some(project))
+    }
+
+    /// Whether `dir` matches the root's `members` globs and none of `exclude`.
+    fn has_member(&self, dir: &Path) -> bool {
+        let Ok(rel) = dir.strip_prefix(&self.root) else {
+            return false;
+        };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let patterns = |key: &str| -> Vec<String> {
+            self.doc
+                .get("tool")
+                .and_then(|t| t.get("uv"))
+                .and_then(|u| u.get("workspace"))
+                .and_then(|w| w.get(key))
+                .and_then(Item::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        patterns("members").iter().any(|p| glob_match(p, &rel))
+            && !patterns("exclude").iter().any(|p| glob_match(p, &rel))
     }
 
     fn is_workspace_root(&self) -> bool {
@@ -198,6 +241,15 @@ impl Project {
     /// Where `.venv` lives: the workspace root, or the project itself.
     pub fn venv_root(&self) -> &Path {
         self.workspace.as_deref().map_or(&self.root, |w| &w.root)
+    }
+
+    /// `[project] requires-python`, if declared.
+    pub fn requires_python(&self) -> Option<String> {
+        self.doc
+            .get("project")
+            .and_then(|p| p.get("requires-python"))
+            .and_then(Item::as_str)
+            .map(str::to_owned)
     }
 
     /// `[tool.vivar.scripts]`: named commands for `vivar run <name>`.
@@ -251,15 +303,16 @@ impl Project {
     }
 
     /// This project's policy, under the workspace root's and the org's.
-    pub fn policy(&self) -> Policy {
+    pub fn policy(&self) -> Result<Policy> {
         let mut policy = self.own_policy();
         if let Some(ws) = &self.workspace {
             policy = policy.merge(ws.own_policy());
         }
-        if let Ok(Some((_, org))) = org_policy() {
+        // An org policy that exists but can't be read is an error, never skipped.
+        if let Some((_, org)) = org_policy()? {
             policy = policy.merge(org);
         }
-        policy
+        Ok(policy)
     }
 
     fn own_policy(&self) -> Policy {
@@ -273,19 +326,7 @@ impl Project {
 
     /// Refuses requirements whose package name is on the deny list.
     pub fn check_requirements<S: AsRef<str>>(&self, reqs: &[S]) -> Result<()> {
-        let policy = self.policy();
-        let blocked: Vec<&str> = reqs
-            .iter()
-            .map(AsRef::as_ref)
-            .filter(|r| policy.deny.contains(&normalize(requirement_name(r))))
-            .collect();
-        if !blocked.is_empty() {
-            bail!(
-                "blocked by [tool.vivar.policy] deny list: {}",
-                blocked.join(", ")
-            );
-        }
-        Ok(())
+        self.policy()?.check_deny(reqs)
     }
 
     /// Checks every dependency declared in `pyproject.toml` against the deny list,
@@ -351,6 +392,36 @@ pub fn write_defaults(root: &Path) -> Result<()> {
     tool["vivar"] = Item::Table(vivar);
 
     fs::write(&path, project.doc.to_string()).with_context(|| format!("writing {}", path.display()))
+}
+
+/// uv-style workspace globs: `*` within one path segment, `**` across segments.
+pub fn glob_match(pattern: &str, path: &str) -> bool {
+    fn segments(s: &str) -> Vec<&str> {
+        s.split('/')
+            .filter(|p| !p.is_empty() && *p != ".")
+            .collect()
+    }
+    fn seg_match(p: &str, s: &str) -> bool {
+        match p.split_once('*') {
+            None => p == s,
+            Some((head, tail)) => {
+                s.starts_with(head)
+                    && (0..=s.len() - head.len().min(s.len())).any(|i| {
+                        let rest = &s[head.len().min(s.len()) + i..];
+                        s.len() >= head.len() && seg_match(tail, rest)
+                    })
+            }
+        }
+    }
+    fn go(p: &[&str], s: &[&str]) -> bool {
+        match (p.first(), s.first()) {
+            (None, None) => true,
+            (Some(&"**"), _) => go(&p[1..], s) || (!s.is_empty() && go(p, &s[1..])),
+            (Some(pp), Some(ss)) => seg_match(pp, ss) && go(&p[1..], &s[1..]),
+            _ => false,
+        }
+    }
+    go(&segments(pattern), &segments(path))
 }
 
 /// `"pandas[excel]>=2; python_version>'3.9'"` -> `"pandas"`
@@ -423,14 +494,14 @@ mod tests {
     fn reads_policy_with_defaults() {
         let tmp = TempDir::new("policy");
         let project = project_with(&tmp.0, "[project]\nname = \"t\"\n");
-        assert_eq!(project.policy(), Policy::default());
+        assert_eq!(project.policy().unwrap(), Policy::default());
 
         let project = project_with(
             &tmp.0,
             "[tool.vivar.policy]\ndeny = [\"a\"]\nindex-url = \"https://pypi.internal/simple\"\n",
         );
         assert_eq!(
-            project.policy(),
+            project.policy().unwrap(),
             Policy {
                 deny: vec!["a".into()],
                 index_url: Some("https://pypi.internal/simple".into()),
@@ -509,28 +580,51 @@ lint = ["ruff"]
         let project = Policy {
             deny: vec!["a".into()],
             index_url: Some("/wheelhouse".into()),
-            allow_licenses: vec!["MIT".into(), "GPL-3.0-only".into()],
+            allow_licenses: Some(vec!["MIT".into(), "GPL-3.0-only".into()]),
             ..Default::default()
         };
         let org = Policy {
             deny: vec!["b".into(), "a".into()],
             index_url: Some("https://mirror/simple".into()),
-            allow_licenses: vec!["mit".into(), "Apache-2.0".into()],
+            allow_licenses: Some(vec!["mit".into(), "Apache-2.0".into()]),
             license_exceptions: vec!["legacy".into()],
             require_hashes: true,
         };
         let merged = project.merge(org);
         assert_eq!(merged.deny, vec!["a", "b"]);
         assert_eq!(merged.index_url.as_deref(), Some("/wheelhouse"));
-        assert_eq!(merged.allow_licenses, vec!["MIT"]);
+        assert_eq!(merged.allow_licenses, Some(vec!["MIT".to_owned()]));
         assert_eq!(merged.license_exceptions, vec!["legacy"]);
         assert!(merged.require_hashes);
 
         let only_org = Policy::default().merge(Policy {
-            allow_licenses: vec!["MIT".into()],
+            allow_licenses: Some(vec!["MIT".into()]),
             ..Default::default()
         });
-        assert_eq!(only_org.allow_licenses, vec!["MIT"]);
+        assert_eq!(only_org.allow_licenses, Some(vec!["MIT".to_owned()]));
+
+        // Nothing in common: nothing is allowed, rather than everything.
+        let disjoint = Policy {
+            allow_licenses: Some(vec!["GPL-3.0-only".into()]),
+            ..Default::default()
+        }
+        .merge(Policy {
+            allow_licenses: Some(vec!["MIT".into()]),
+            ..Default::default()
+        });
+        assert_eq!(disjoint.allow_licenses, Some(Vec::new()));
+    }
+
+    #[test]
+    fn workspace_globs() {
+        assert!(glob_match("pkgs/*", "pkgs/a"));
+        assert!(!glob_match("pkgs/*", "pkgs/a/b"));
+        assert!(glob_match("pkgs/**", "pkgs/a/b"));
+        assert!(glob_match("pkgs/lib-*", "pkgs/lib-x"));
+        assert!(!glob_match("pkgs/lib-*", "pkgs/x"));
+        assert!(glob_match("exact/path", "exact/path"));
+        assert!(!glob_match("other/*", "pkgs/a"));
+        assert!(glob_match("*", "a"));
     }
 
     #[test]
@@ -543,7 +637,7 @@ lint = ["ruff"]
         assert_eq!(project.script("test").as_deref(), Some("pytest -x"));
         assert_eq!(project.script("nope"), None);
         let policy = project.own_policy();
-        assert_eq!(policy.allow_licenses, vec!["MIT"]);
+        assert_eq!(policy.allow_licenses, Some(vec!["MIT".to_owned()]));
         assert_eq!(policy.license_exceptions, vec!["legacy-pkg"]);
         assert!(policy.require_hashes);
     }
@@ -567,12 +661,20 @@ lint = ["ruff"]
         let project = Project::find(&member.join("src")).unwrap().unwrap();
         assert_eq!(project.root, member);
         assert_eq!(project.venv_root(), root.as_path());
-        let deny = project.policy().deny;
+        let deny = project.policy().unwrap().deny;
         assert!(
             deny.contains(&"member-denied".to_owned()) && deny.contains(&"root-denied".to_owned())
         );
         let at_root = Project::find(root).unwrap().unwrap();
         assert!(at_root.workspace.is_none());
         assert_eq!(at_root.venv_root(), root.as_path());
+
+        // A nested project outside the member globs keeps its own env.
+        let stray = root.join("tools").join("x");
+        fs::create_dir_all(&stray).unwrap();
+        fs::write(stray.join(PYPROJECT), "[project]\nname = \"x\"\n").unwrap();
+        let stray_project = Project::find(&stray).unwrap().unwrap();
+        assert!(stray_project.workspace.is_none());
+        assert_eq!(stray_project.venv_root(), stray.as_path());
     }
 }

@@ -716,6 +716,11 @@ fn tasks_and_inline_scripts_run_in_the_right_env() {
         + "\n[tool.vivar.scripts]\nwhere = \"python -c 'import sys; print(\\\"at\\\", sys.prefix)'\"\ncalc = \"python -c\"\n";
     fs::write(&path, text).unwrap();
 
+    // A task named like a script file is still a task when no such file exists.
+    let text = read(&path) + "\"oops.py\" = \"python -c 'print(7)'\"\n";
+    fs::write(&path, text).unwrap();
+    assert_eq!(stdout_of(&ok(dir, &["run", "oops.py"])).trim(), "7");
+
     let out = ok(dir, &["run", "where"]);
     let stdout = stdout_of(&out);
     assert!(
@@ -730,7 +735,7 @@ fn tasks_and_inline_scripts_run_in_the_right_env() {
     let script = dir.join("tool.py");
     fs::write(
         &script,
-        "# /// script\n# dependencies = [\"six\"]\n# ///\nimport six, sys\nprint(six.__version__, sys.argv[1:], '.venv' in sys.prefix)\n",
+        "# /// script\n# requires-python = \">=3.10,<3.13\"\n# dependencies = [\"six\"]\n# ///\nimport six, sys\nprint(six.__version__, sys.argv[1:], '.venv' in sys.prefix, sys.version_info[:2] == (3, 12))\n",
     )
     .unwrap();
     let cache = dir.join("cache");
@@ -750,7 +755,7 @@ fn tasks_and_inline_scripts_run_in_the_right_env() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = stdout_of(&out);
-    assert!(stdout.contains("['--flag'] False"), "{stdout}");
+    assert!(stdout.contains("['--flag'] False True"), "{stdout}");
     assert!(cache.join("scripts").is_dir());
 
     let out = run(&["env", "list"]);
@@ -793,13 +798,22 @@ fn tools_get_their_own_env_and_linked_commands() {
         stdout_of(&out)
     );
 
+    // A command vivar didn't install is never overwritten.
+    let link = home.join(".local").join("bin").join(exe("pycodestyle"));
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    fs::write(&link, "someone else's").unwrap();
+    let out = run(&["tool", "install", "pycodestyle"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not installed by vivar"));
+    assert_eq!(read(&link), "someone else's");
+    fs::remove_file(&link).unwrap();
+
     let out = run(&["tool", "install", "pycodestyle"]);
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let link = home.join(".local").join("bin").join(exe("pycodestyle"));
     assert!(link.exists(), "no linked command at {}", link.display());
     let out = Command::new(&link).arg("--version").output().unwrap();
     assert!(out.status.success());
@@ -810,6 +824,22 @@ fn tools_get_their_own_env_and_linked_commands() {
         "{}",
         stdout_of(&out)
     );
+    // Pinning a different version rebuilds the env instead of reusing it.
+    let out = run(&[
+        "tool",
+        "run",
+        "--from",
+        "pycodestyle==2.14.0",
+        "pycodestyle",
+        "--version",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout_of(&out).trim(), "2.14.0");
+
     let out = run(&["tool", "uninstall", "pycodestyle"]);
     assert!(
         out.status.success(),

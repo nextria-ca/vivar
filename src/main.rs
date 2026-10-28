@@ -214,7 +214,11 @@ fn main() -> Result<()> {
     // Commands always execute from the current directory so relative paths in
     // `vivar run` keep working; the project is only discovered for policy.
     let project = Project::find(&cwd)?;
-    let policy = project.as_ref().map(Project::policy).unwrap_or_default();
+    // Outside a project the org policy still applies (tools, scripts).
+    let policy = match &project {
+        Some(p) => p.policy()?,
+        None => project::org_policy()?.map(|(_, p)| p).unwrap_or_default(),
+    };
     let backend = UvBackend::new(&policy);
 
     match cli.command {
@@ -249,24 +253,26 @@ fn main() -> Result<()> {
             let project = require(project, &cwd)?;
             project.check_requirements(&packages)?;
             venv::ensure(project.venv_root(), &project.name())?;
-            let before = declared_names(&project);
+            // Snapshot what `add` rewrites, so a policy failure can be undone exactly.
+            let snapshot: Vec<(std::path::PathBuf, Option<Vec<u8>>)> = [
+                project.root.join(project::PYPROJECT),
+                project.venv_root().join(lock::LOCKFILE),
+            ]
+            .into_iter()
+            .map(|p| (p.clone(), std::fs::read(&p).ok()))
+            .collect();
             backend.add(&cwd, &packages, group.as_deref())?;
             if let Err(e) = after_install(&project, &policy) {
-                // Undo the add so the project never carries a package policy refuses.
-                let added: Vec<String> = Project::load(&project.root)
-                    .map(|p| declared_names(&p))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|n| !before.contains(n))
-                    .collect();
-                if !added.is_empty() {
-                    println!("rolling back: vivar remove {}", added.join(" "));
-                    let mut cmd_args = added.clone();
-                    if let Some(group) = group.as_deref() {
-                        cmd_args.extend(["--group".to_owned(), group.to_owned()]);
+                println!("rolling back the add");
+                for (path, contents) in snapshot {
+                    match contents {
+                        Some(bytes) => std::fs::write(&path, bytes)?,
+                        None => {
+                            let _ = std::fs::remove_file(&path);
+                        }
                     }
-                    let _ = backend.remove(&cwd, &cmd_args);
                 }
+                let _ = backend.sync(&cwd);
                 return Err(e);
             }
         }
@@ -291,14 +297,12 @@ fn main() -> Result<()> {
         Command::Run { args } => {
             let first = args[0].as_str();
             // A PEP 723 script carries its own environment.
+            let script = std::path::Path::new(first);
             if first.ends_with(".py")
-                && tool::script_metadata(std::path::Path::new(first))?.is_some()
+                && script.is_file()
+                && tool::script_metadata(script)?.is_some()
             {
-                std::process::exit(tool::run_script(
-                    &backend,
-                    std::path::Path::new(first),
-                    &args[1..],
-                )?);
+                std::process::exit(tool::run_script(&backend, &policy, script, &args[1..])?);
             }
             let project = require(project, &cwd)?;
             project.check_declared()?;
@@ -402,6 +406,7 @@ fn main() -> Result<()> {
             ToolCommand::Run { from, python, args } => {
                 let code = tool::run(
                     &backend,
+                    &policy,
                     from.as_deref(),
                     &args[0],
                     &args[1..],
@@ -410,7 +415,7 @@ fn main() -> Result<()> {
                 std::process::exit(code);
             }
             ToolCommand::Install { package, python } => {
-                tool::install(&backend, &package, python.as_deref())?
+                tool::install(&backend, &policy, &package, python.as_deref())?
             }
             ToolCommand::Uninstall { package } => tool::uninstall(&package)?,
             ToolCommand::List => tool::list()?,
@@ -505,22 +510,13 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Normalized names of everything the project declares, for diffing around an add.
-fn declared_names(project: &Project) -> Vec<String> {
-    project
-        .declared_requirements()
-        .iter()
-        .map(|r| project::normalize(project::requirement_name(r)))
-        .collect()
-}
-
 /// Policy checks that need the environment installed: licenses, and the
 /// lockfile's hashes/sources when `require-hashes` is on.
 fn after_install(project: &Project, policy: &project::Policy) -> Result<()> {
     check_hashes(project, policy)?;
     licenses::check(
         &project.venv_root().join(".venv"),
-        &policy.allow_licenses,
+        policy.allow_licenses.as_deref(),
         &policy.license_exceptions,
     )
 }
@@ -530,9 +526,17 @@ fn check_hashes(project: &Project, policy: &project::Policy) -> Result<()> {
         return Ok(());
     }
     let lock = lock::Lock::read(project.venv_root())?;
+    let tree = std::fs::canonicalize(project.venv_root()).unwrap_or_default();
     let mut bad = Vec::new();
     for p in &lock.packages {
-        if matches!(p.source_kind.as_str(), "virtual" | "editable") {
+        // The project and its workspace members are the code being locked, not
+        // dependencies; an editable checkout from elsewhere is a dependency.
+        let own = p.source_kind == "virtual"
+            || (p.source_kind == "editable"
+                && std::fs::canonicalize(project.venv_root().join(&p.source))
+                    .map(|path| path.starts_with(&tree))
+                    .unwrap_or(false));
+        if own {
             continue;
         }
         if p.source_kind != "registry" {

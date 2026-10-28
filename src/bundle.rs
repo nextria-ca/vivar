@@ -168,28 +168,33 @@ pub fn diff(a: &Path, b: &Path) -> Result<String> {
                 out.push_str(&format!("{key}: {va} -> {vb}\n"));
             }
         }
-        let va: std::collections::BTreeMap<&str, &str> = la
-            .packages
-            .iter()
-            .map(|p| (p.name.as_str(), p.version.as_str()))
-            .collect();
-        let vb: std::collections::BTreeMap<&str, &str> = lb
-            .packages
-            .iter()
-            .map(|p| (p.name.as_str(), p.version.as_str()))
-            .collect();
-        for (name, version) in &vb {
+        // Every variant counts: a forked lock can pin two versions of one package.
+        let versions = |lock: &crate::lock::Lock| {
+            let mut map: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+                Default::default();
+            for p in &lock.packages {
+                map.entry(p.name.clone())
+                    .or_default()
+                    .insert(p.version.clone());
+            }
+            map
+        };
+        let (va, vb) = (versions(&la), versions(&lb));
+        let joined = |set: &std::collections::BTreeSet<String>| {
+            set.iter().cloned().collect::<Vec<_>>().join("/")
+        };
+        for (name, new) in &vb {
             match va.get(name) {
-                None => out.push_str(&format!("+ {name} {version}\n")),
-                Some(old) if old != version => {
-                    out.push_str(&format!("~ {name} {old} -> {version}\n"))
+                None => out.push_str(&format!("+ {name} {}\n", joined(new))),
+                Some(old) if old != new => {
+                    out.push_str(&format!("~ {name} {} -> {}\n", joined(old), joined(new)))
                 }
                 _ => {}
             }
         }
-        for (name, version) in &va {
+        for (name, old) in &va {
             if !vb.contains_key(name) {
-                out.push_str(&format!("- {name} {version}\n"));
+                out.push_str(&format!("- {name} {}\n", joined(old)));
             }
         }
         Ok(out)

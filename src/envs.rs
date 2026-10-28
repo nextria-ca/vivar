@@ -87,8 +87,14 @@ pub fn clean(tools: bool) -> Result<()> {
         let dir = tool::tools_dir()?;
         if dir.exists() {
             let size = size_of(&dir);
+            for env in each_dir(&dir) {
+                tool::remove_links(&env);
+            }
             fs::remove_dir_all(&dir)?;
-            println!("removed tool environments ({})", mb(size));
+            println!(
+                "removed tool environments and their linked commands ({})",
+                mb(size)
+            );
         }
     }
     if let Ok(status) = std::process::Command::new("uv")

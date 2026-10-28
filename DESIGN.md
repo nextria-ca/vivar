@@ -180,6 +180,8 @@ Phase 0 is done (`src/`, 14 tests, CI in `.github/workflows/ci.yml`):
 - Linux, macOS and Windows: CI runs the full suite on all three; release workflow ships
   static binaries for six targets plus `install.sh` / `install.ps1`, and per-target offline
   bundles (vivar + uv + a CPython runtime) whose installer needs no network at all.
+- `upgrade`: replaces the running binary from the latest (or a named) GitHub release via
+  `gh`/`curl`, or from a local archive/bundle/URL for offline machines.
 - Three direct crates, minimal clap features, size-optimised release profile (<1 MB static binary).
   Inventory in `THIRD_PARTY_LICENSES.md` (all MIT/Apache-2.0/Unlicense), checked in CI.
 

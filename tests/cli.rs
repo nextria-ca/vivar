@@ -496,3 +496,55 @@ fn a_directory_index_url_is_an_offline_wheelhouse() {
         "six came from outside the wheelhouse"
     );
 }
+
+#[test]
+fn upgrade_installs_from_a_local_archive_or_bundle_dir() {
+    let tmp = TempDir::new("upgrade");
+    let me = PathBuf::from(env!("CARGO_BIN_EXE_vivar"));
+
+    // A copy standing in for the installed vivar, and a release-style archive
+    // around another copy of the same binary.
+    let installed = tmp.0.join("bin").join(exe("vivar"));
+    fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    fs::copy(&me, &installed).unwrap();
+    let release = tmp.0.join("vivar-some-target");
+    fs::create_dir_all(&release).unwrap();
+    fs::copy(&me, release.join(exe("vivar"))).unwrap();
+    let archive = tmp.0.join("vivar-some-target.tar.gz");
+    let status = Command::new("tar")
+        .current_dir(&tmp.0)
+        .args(["-czf", archive.to_str().unwrap(), "vivar-some-target"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    for from in [archive.to_str().unwrap(), release.to_str().unwrap()] {
+        let out = Command::new(&installed)
+            .current_dir(&tmp.0)
+            .args(["upgrade", "--from", from])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "upgrade --from {from} failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout_of(&out).contains(" -> vivar "),
+            "{}",
+            stdout_of(&out)
+        );
+        let out = Command::new(&installed).arg("--version").output().unwrap();
+        assert!(out.status.success(), "replaced binary does not run");
+    }
+    // The second run must have cleaned up after the first on Windows.
+    let out = Command::new(&installed).arg("--version").output().unwrap();
+    assert!(out.status.success());
+    assert!(!installed.with_extension("new").exists());
+
+    let out = Command::new(&installed)
+        .args(["upgrade", "--from", tmp.0.join("nope").to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+}

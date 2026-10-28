@@ -1,6 +1,7 @@
 mod backend;
 mod bundle;
 mod project;
+mod upgrade;
 mod verify;
 
 use anyhow::Result;
@@ -79,6 +80,15 @@ enum Command {
         #[arg(short, long)]
         verbose: bool,
     },
+    /// Replace this binary with the latest release (or a given one)
+    Upgrade {
+        /// Release tag to install, e.g. v0.2.0 (default: latest)
+        #[arg(long)]
+        version: Option<String>,
+        /// Install from a release archive, extracted offline bundle, or URL instead
+        #[arg(long)]
+        from: Option<String>,
+    },
     /// Manage Python installations
     Python {
         #[command(subcommand)]
@@ -95,6 +105,7 @@ enum PythonCommand {
 }
 
 fn main() -> Result<()> {
+    upgrade::cleanup();
     let cli = Cli::parse();
     let cwd = std::env::current_dir()?;
 
@@ -192,6 +203,7 @@ fn main() -> Result<()> {
             let venv = verify::find_venv(&base)?;
             std::process::exit(verify::run(&venv, allow_missing_gpu, verbose)?);
         }
+        Command::Upgrade { version, from } => upgrade::run(version.as_deref(), from.as_deref())?,
         Command::Python { command } => match command {
             PythonCommand::Install { version } => backend.python_install(&version)?,
             PythonCommand::List => backend.python_list()?,

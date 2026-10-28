@@ -48,6 +48,16 @@ gh api repos/nextria-ca/vivar/contents/install.ps1 -H "Accept: application/vnd.g
 Both installers take `VIVAR_VERSION`, `VIVAR_INSTALL_DIR`, `VIVAR_ARCHIVE`
 (install from a local file or internal URL instead of GitHub) and `VIVAR_SKIP_UV`.
 
+### Upgrading
+
+```sh
+vivar upgrade                      # latest release, through gh or curl + GITHUB_TOKEN
+vivar upgrade --version v0.2.0
+vivar upgrade --from vivar-offline-x86_64-unknown-linux-musl   # extracted bundle, archive, or URL
+```
+
+It swaps the running binary in place and leaves everything else alone.
+
 ### Offline install
 
 Each release also carries `vivar-offline-<target>.tar.gz` / `.zip` bundles with

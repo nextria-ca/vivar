@@ -155,7 +155,7 @@ We never write our own SAT/PubGrub resolver or wheel/conda package parsers. Thos
 | **1: Own the core** | In-process resolver + installer + Python downloads, `vivar.lock`, global cache | No `uv` binary needed, speed on par with uv |
 | **2: Native deps** | rattler integration, `--native`, unified conda-forge + PyPI solve | GPU/GDAL project fully reproducible from the lock |
 | **3: Policy** | License allowlist, vulnerability audit (OSV), mirrors/offline, org policy file, `export docker` | `vivar audit` runs in CI and passes |
-| **4: Polish** | Workspaces, PEP 723 scripts, `tool run`, tasks, Windows/macOS installers | — |
+| **4: Polish** | Workspaces, PEP 723 scripts, `tool run`, tasks (installers ✅) | — |
 
 ## 12. Implementation status
 
@@ -173,16 +173,17 @@ Phase 0 is done (`src/`, 14 tests, CI in `.github/workflows/ci.yml`):
 - `verify`: a Python script embedded in the binary runs with the env's interpreter (no uv):
   imports every package in a forked child, `ldd`s every extension, requires an NVIDIA driver
   when CUDA packages are present (`--allow-missing-gpu` to warn), checks script shebangs.
-- `[tool.vivar.policy] index-url` already works (pulled forward from phase 3): it
-  replaces PyPI as the default index.
+- `[tool.vivar.policy] index-url` already works (pulled forward from phase 3): a mirror URL
+  replaces PyPI as the default index; a directory of wheels becomes the only source (offline).
 - `channels`/`blocked-channels` are not written until the native backend can enforce them (phase 2).
-- Linux/WSL tested; macOS expected to work; Windows untested.
+- Linux, macOS and Windows: CI runs the full suite on all three; release workflow ships
+  static binaries for six targets plus `install.sh` / `install.ps1`, and per-target offline
+  bundles (vivar + uv + a CPython runtime) whose installer needs no network at all.
 - Three direct crates, minimal clap features, size-optimised release profile (<1 MB static binary).
   Inventory in `THIRD_PARTY_LICENSES.md` (all MIT/Apache-2.0/Unlicense), checked in CI.
 
 ## 13. Open questions
 
 - Our own license (internal vs. open source).
-- Windows: deferred past phase 0 (dev and CI are Linux/WSL today).
 - Where does the org policy file live?
 - Do we already have an internal package mirror (Artifactory/Nexus/devpi)? `index-url` is ready for it.

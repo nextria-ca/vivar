@@ -24,7 +24,8 @@ pub trait Backend {
 const UV_INSTALL_HINT: &str = "install it with `curl -LsSf https://astral.sh/uv/install.sh | sh`";
 
 pub struct UvBackend {
-    /// Replaces PyPI as the default index when set (`[tool.vivar.policy] index-url`).
+    /// Replaces PyPI when set (`[tool.vivar.policy] index-url`): a mirror URL, or a
+    /// local directory of wheels that is then the only source.
     index_url: Option<String>,
 }
 
@@ -40,8 +41,15 @@ impl UvBackend {
         if let Some(dir) = dir {
             cmd.current_dir(dir);
         }
-        if let Some(url) = &self.index_url {
-            cmd.env("UV_DEFAULT_INDEX", url);
+        match &self.index_url {
+            // A directory of wheels (an offline wheelhouse) is the only package source.
+            Some(dir) if Path::new(dir).is_dir() => {
+                cmd.env("UV_FIND_LINKS", dir).env("UV_NO_INDEX", "1");
+            }
+            Some(url) => {
+                cmd.env("UV_DEFAULT_INDEX", url);
+            }
+            None => {}
         }
         cmd
     }

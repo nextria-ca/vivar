@@ -163,10 +163,22 @@ fn main() -> Result<()> {
                 PathBuf::from(stem.trim_end_matches(".tar.gz").trim_end_matches(".tgz"))
             });
             let dest = bundle::unpack(&archive, &dest)?;
-            println!(
-                "Unpacked to {0}\n  activate:  source {0}/.venv/bin/activate\n  or run:    {0}/.venv/bin/python",
-                dest.display()
-            );
+            let bin = dest.join(".venv").join(bundle::VENV_BIN);
+            if cfg!(windows) {
+                println!(
+                    "Unpacked to {}\n  activate:  {}\n  or run:    {}",
+                    dest.display(),
+                    bin.join("activate").display(),
+                    bin.join("python.exe").display()
+                );
+            } else {
+                println!(
+                    "Unpacked to {}\n  activate:  source {}\n  or run:    {}",
+                    dest.display(),
+                    bin.join("activate").display(),
+                    bin.join("python").display()
+                );
+            }
         }
         Command::Verify {
             path,

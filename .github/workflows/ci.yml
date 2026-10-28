@@ -4,8 +4,12 @@ on:
     branches: [main]
   pull_request:
 jobs:
-  ci:
-    runs-on: ubuntu-latest
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -16,9 +20,11 @@ jobs:
         with:
           python-version: "3.12"
       - run: cargo fmt --check
+        if: runner.os == 'Linux'
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - name: License inventory is current
+        if: runner.os == 'Linux'
         run: |
           cargo metadata --format-version 1 > /tmp/meta.json
           python3 scripts/licenses.py /tmp/meta.json | diff -u THIRD_PARTY_LICENSES.md -

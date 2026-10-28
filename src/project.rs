@@ -12,7 +12,8 @@ pub const PYPROJECT: &str = "pyproject.toml";
 pub struct Policy {
     /// Normalized package names that `vivar add`/`lock`/`sync`/`run` refuse.
     pub deny: Vec<String>,
-    /// Package index to use instead of PyPI (e.g. an internal mirror).
+    /// Package index to use instead of PyPI: an internal mirror URL, or a local
+    /// directory of wheels (an offline wheelhouse).
     pub index_url: Option<String>,
 }
 
@@ -86,7 +87,11 @@ impl Project {
         let index_url = table
             .and_then(|p| p.get("index-url"))
             .and_then(Item::as_str)
-            .map(str::to_owned);
+            .map(|s| match s.contains("://") {
+                true => s.to_owned(),
+                // A wheelhouse directory, relative to the project if not absolute.
+                false => self.root.join(s).to_string_lossy().into_owned(),
+            });
         Policy { deny, index_url }
     }
 

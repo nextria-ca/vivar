@@ -5,6 +5,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+/// `Scripts` on Windows, `bin` elsewhere.
+const BIN: &str = if cfg!(windows) { "Scripts" } else { "bin" };
+
 struct TempDir(PathBuf);
 
 impl TempDir {
@@ -34,8 +37,9 @@ fn ok(dir: &Path, args: &[&str]) -> Output {
     let out = vivar(dir, args);
     assert!(
         out.status.success(),
-        "vivar {} failed:\n{}",
+        "vivar {} failed:\n{}{}",
         args.join(" "),
+        stdout_of(&out),
         String::from_utf8_lossy(&out.stderr)
     );
     out
@@ -55,12 +59,46 @@ fn fails_with(dir: &Path, args: &[&str], needle: &str) {
     );
 }
 
+fn stdout_of(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
 fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap()
 }
 
 fn init(dir: &Path) {
     ok(dir, &["init", "demo", "--python", "3.12"]);
+}
+
+fn exe(name: &str) -> String {
+    format!("{name}{}", std::env::consts::EXE_SUFFIX)
+}
+
+fn site_packages(dir: &Path) -> PathBuf {
+    if cfg!(windows) {
+        return dir.join(".venv").join("Lib").join("site-packages");
+    }
+    fs::read_dir(dir.join(".venv").join("lib"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("python")
+        })
+        .unwrap()
+        .join("site-packages")
+}
+
+/// A PATH with no `uv` on it.
+fn bare_path() -> &'static str {
+    if cfg!(windows) {
+        r"C:\Windows\System32"
+    } else {
+        "/usr/bin:/bin"
+    }
 }
 
 #[test]
@@ -112,7 +150,7 @@ fn run_propagates_exit_code_and_relative_paths() {
     fs::create_dir_all(&sub).unwrap();
     fs::write(sub.join("hello.py"), "print('hello from vivar')\n").unwrap();
     let out = ok(&sub, &["run", "python", "hello.py"]);
-    assert!(String::from_utf8_lossy(&out.stdout).contains("hello from vivar"));
+    assert!(stdout_of(&out).contains("hello from vivar"));
 }
 
 #[test]
@@ -193,7 +231,7 @@ fn pack_and_unpack_produce_a_self_contained_env() {
     let src = tmp.0.join("src-machine");
     fs::create_dir_all(&src).unwrap();
     init(&src);
-    // pycodestyle ships a console script, so its shebang must survive the move.
+    // pycodestyle ships a console script, so its launcher must survive the move.
     ok(&src, &["add", "six", "pycodestyle"]);
 
     let archive = tmp.0.join("demo.tar.gz");
@@ -206,13 +244,16 @@ fn pack_and_unpack_produce_a_self_contained_env() {
         .unwrap();
     let listing = String::from_utf8_lossy(&listing.stdout);
     assert!(listing.contains("vivar-bundle.toml"), "{listing}");
-    assert!(listing.contains(".venv/bin/activate"), "{listing}");
+    assert!(
+        listing.contains(&format!(".venv/{BIN}/activate")),
+        "{listing}"
+    );
     assert!(
         !listing.contains("__pycache__"),
         "pycache should be excluded"
     );
     assert!(
-        !listing.contains("/lib/python3.12/test/"),
+        !listing.contains("/lib/python3.12/test/") && !listing.contains("/Lib/test/"),
         "stdlib tests should be excluded"
     );
 
@@ -224,8 +265,8 @@ fn pack_and_unpack_produce_a_self_contained_env() {
     );
     fs::remove_dir_all(&src).unwrap();
 
-    let python = dest.join(".venv").join("bin").join("python");
-    let out = Command::new(&python)
+    let bin = dest.join(".venv").join(BIN);
+    let out = Command::new(bin.join(exe("python")))
         .args([
             "-c",
             "import six, sys; print(sys.prefix); print(sys.base_prefix)",
@@ -237,17 +278,17 @@ fn pack_and_unpack_produce_a_self_contained_env() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let dest_str = dest.canonicalize().unwrap().to_string_lossy().into_owned();
-    for line in stdout.lines() {
-        assert!(
-            line.starts_with(&dest_str),
-            "{line} is outside the unpacked bundle"
-        );
+    let inside = |line: &str| {
+        let canonical = dest.canonicalize().unwrap();
+        let p = Path::new(line);
+        p.starts_with(&dest) || p.canonicalize().is_ok_and(|p| p.starts_with(&canonical))
+    };
+    for line in stdout_of(&out).lines() {
+        assert!(inside(line), "{line} is outside the unpacked bundle");
     }
 
-    // Console script shebang points at the new venv.
-    let out = Command::new(dest.join(".venv/bin/pycodestyle"))
+    // Console script launcher points at the new venv.
+    let out = Command::new(bin.join(exe("pycodestyle")))
         .arg("--version")
         .output()
         .unwrap();
@@ -257,21 +298,36 @@ fn pack_and_unpack_produce_a_self_contained_env() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Activation works in a plain POSIX shell.
-    let script = format!(
-        ". '{0}/.venv/bin/activate' && printf '%s\\n' \"$VIRTUAL_ENV\" && command -v python && python -c 'import six'",
-        dest.display()
-    );
-    let out = Command::new("sh").args(["-c", &script]).output().unwrap();
+    // Activation works in the platform's plain shell.
+    let venv_s = dest.join(".venv").to_string_lossy().into_owned();
+    #[cfg(unix)]
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            ". '{venv_s}/bin/activate' && printf '%s\\n' \"$VIRTUAL_ENV\" && python -c 'import six, sys; print(sys.executable)'"
+        ))
+        .output()
+        .unwrap();
+    #[cfg(windows)]
+    let out = {
+        use std::os::windows::process::CommandExt;
+        Command::new("cmd")
+            .raw_arg(format!(
+                "/C \"call \"{venv_s}\\Scripts\\activate.bat\" && echo %VIRTUAL_ENV% && python -c \"import six, sys; print(sys.executable)\"\""
+            ))
+            .output()
+            .unwrap()
+    };
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut lines = stdout.lines();
-    assert_eq!(lines.next().unwrap(), format!("{}/.venv", dest.display()));
-    assert!(lines.next().unwrap().starts_with(dest.to_str().unwrap()));
+    let stdout = stdout_of(&out);
+    let mut lines = stdout.lines().map(str::trim);
+    assert_eq!(lines.next().unwrap(), venv_s);
+    let executable = lines.next().unwrap();
+    assert!(inside(executable), "{executable} is not the bundled python");
 
     fails_with(
         &tmp.0,
@@ -282,7 +338,7 @@ fn pack_and_unpack_produce_a_self_contained_env() {
     // verify works on the bundle with no uv anywhere on PATH.
     let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
         .current_dir(&tmp.0)
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", bare_path())
         .args(["verify", dest.to_str().unwrap()])
         .output()
         .unwrap();
@@ -293,10 +349,6 @@ fn pack_and_unpack_produce_a_self_contained_env() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(stdout.contains("0 errors"), "{stdout}");
-}
-
-fn stdout_of(out: &Output) -> String {
-    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 #[test]
@@ -311,17 +363,7 @@ fn verify_reports_broken_packages_and_missing_cuda() {
     assert!(stdout.contains("ok   six"), "{stdout}");
     assert!(stdout.contains("0 errors"), "{stdout}");
 
-    let site = fs::read_dir(dir.join(".venv/lib"))
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .find(|p| {
-            p.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("python")
-        })
-        .unwrap()
-        .join("site-packages");
+    let site = site_packages(dir);
     let dist_info = |name: &str, top_level: &str| {
         let info = site.join(format!("{}-1.0.dist-info", name.replace('-', "_")));
         fs::create_dir_all(&info).unwrap();
@@ -336,7 +378,7 @@ fn verify_reports_broken_packages_and_missing_cuda() {
     dist_info("gpu-thing", "gpu_thing\n");
     fs::create_dir_all(site.join("gpu_thing")).unwrap();
     fs::write(
-        site.join("gpu_thing/__init__.py"),
+        site.join("gpu_thing").join("__init__.py"),
         "import ctypes\nctypes.CDLL('libcudart.so.99')\n",
     )
     .unwrap();
@@ -344,7 +386,7 @@ fn verify_reports_broken_packages_and_missing_cuda() {
     dist_info("nvidia-cuda-runtime-cu99", "");
     // A script copied from somewhere else.
     fs::write(
-        dir.join(".venv/bin/stale"),
+        dir.join(".venv").join(BIN).join("stale"),
         "#!/nonexistent/.venv/bin/python\nprint(1)\n",
     )
     .unwrap();
@@ -363,9 +405,10 @@ fn verify_reports_broken_packages_and_missing_cuda() {
     let stdout = stdout_of(&out);
     assert_eq!(out.status.code(), Some(1), "{stdout}");
     assert!(
-        stdout.contains("ERR  gpu-thing: import gpu_thing failed: OSError: libcudart.so.99"),
+        stdout.contains("ERR  gpu-thing: import gpu_thing failed:"),
         "{stdout}"
     );
+    assert!(stdout.contains("libcudart.so.99"), "{stdout}");
     assert!(
         stdout.contains("ERR  CUDA: environment contains CUDA packages (nvidia-cuda-runtime-cu99) but no NVIDIA driver"),
         "{stdout}"
@@ -382,4 +425,67 @@ fn verify_reports_broken_packages_and_missing_cuda() {
     assert!(stdout.contains("2 errors, 1 warnings"), "{stdout}");
 
     fails_with(&tmp.0, &["verify", "nowhere"], "no environment found");
+}
+
+#[test]
+fn a_directory_index_url_is_an_offline_wheelhouse() {
+    let tmp = TempDir::new("wheelhouse");
+    let dir = &tmp.0;
+    init(dir);
+
+    // Hand-roll a minimal wheel with the env's own Python; no network involved.
+    let wheelhouse = tmp.0.join("wheelhouse");
+    fs::create_dir_all(&wheelhouse).unwrap();
+    let whl = wheelhouse.join("minipkg-1.0-py3-none-any.whl");
+    let script = format!(
+        "import zipfile\n\
+         with zipfile.ZipFile({:?}, 'w') as z:\n\
+         \x20   z.writestr('minipkg/__init__.py', 'VALUE = 42\\n')\n\
+         \x20   z.writestr('minipkg-1.0.dist-info/METADATA', 'Metadata-Version: 2.1\\nName: minipkg\\nVersion: 1.0\\n')\n\
+         \x20   z.writestr('minipkg-1.0.dist-info/WHEEL', 'Wheel-Version: 1.0\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n')\n\
+         \x20   z.writestr('minipkg-1.0.dist-info/RECORD', '')\n",
+        whl.to_str().unwrap()
+    );
+    ok(dir, &["run", "python", "-c", &script]);
+
+    let path = dir.join("pyproject.toml");
+    let pyproject = read(&path).replace(
+        "deny = []",
+        &format!("deny = []\nindex-url = {:?}", wheelhouse.to_str().unwrap()),
+    );
+    fs::write(&path, pyproject).unwrap();
+
+    // Fresh cache and no network: the wheel can only have come from the directory.
+    let offline = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_vivar"))
+            .current_dir(dir)
+            .env("UV_OFFLINE", "1")
+            .env("UV_NO_CACHE", "1")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let out = offline(&["add", "minipkg"]);
+    assert!(
+        out.status.success(),
+        "add from wheelhouse failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = ok(
+        dir,
+        &[
+            "run",
+            "python",
+            "-c",
+            "import minipkg; print(minipkg.VALUE)",
+        ],
+    );
+    assert_eq!(stdout_of(&out).trim(), "42");
+
+    // Nothing outside the wheelhouse is reachable, not even PyPI.
+    let out = offline(&["add", "six"]);
+    assert!(
+        !out.status.success(),
+        "six came from outside the wheelhouse"
+    );
 }

@@ -1,6 +1,6 @@
 # Runs inside the environment being verified (python -I - [flags]).
 # Checks that every installed package is actually usable on this machine.
-import ctypes, importlib, importlib.metadata as md, os, re, signal, subprocess, sys, sysconfig
+import ctypes, importlib, importlib.metadata as md, os, platform, re, signal, subprocess, sys, sysconfig
 
 VERBOSE = "--verbose" in sys.argv
 ALLOW_MISSING_GPU = "--allow-missing-gpu" in sys.argv
@@ -98,7 +98,7 @@ def native_libs():
 
 
 def cuda_problem():
-    lib = os.environ.get("VIVAR_CUDA_LIB", "libcuda.so.1")
+    lib = os.environ.get("VIVAR_CUDA_LIB", "nvcuda.dll" if sys.platform == "win32" else "libcuda.so.1")
     try:
         cuda = ctypes.CDLL(lib)
     except OSError:
@@ -114,7 +114,7 @@ def cuda_problem():
 def main():
     global ok_count
     venv = sys.prefix
-    print(f"vivar verify: {venv} (Python {sys.version.split()[0]}, {sys.platform}-{os.uname().machine if hasattr(os, 'uname') else ''})")
+    print(f"vivar verify: {venv} (Python {sys.version.split()[0]}, {sys.platform}-{platform.machine()})")
 
     # 1. Every package imports.
     dists = sorted(md.distributions(), key=lambda d: d.metadata["Name"].lower())
@@ -158,7 +158,7 @@ def main():
             first = fh.readline(512)
         if first.startswith(b"#!"):
             interp = first[2:].strip().split(b" ")[0].decode(errors="replace")
-            if interp.startswith("/") and not os.path.exists(interp):
+            if re.match(r"/|[A-Za-z]:\\", interp) and not os.path.exists(interp):
                 report("ERR", entry, f"shebang points at missing {interp} (moved without `vivar unpack`?)")
 
     print(f"summary: {len(dists)} packages, {ok_count} ok, {len(errors)} errors, {len(warnings)} warnings")

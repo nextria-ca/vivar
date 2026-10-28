@@ -1,0 +1,103 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+env:
+  # Pinned so the offline bundles ship the same uv the workflow resolves Python downloads with.
+  UV_VERSION: "0.13.6"
+  PYTHON: "3.12"
+  COPYFILE_DISABLE: "1"
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,     target: x86_64-unknown-linux-musl,  python: "linux x86_64 gnu" }
+          - { os: ubuntu-24.04-arm,  target: aarch64-unknown-linux-musl, python: "linux aarch64 gnu" }
+          - { os: macos-latest,      target: aarch64-apple-darwin,       python: "macos aarch64 none" }
+          - { os: macos-latest,      target: x86_64-apple-darwin,        python: "macos x86_64 none" }
+          - { os: windows-latest,    target: x86_64-pc-windows-msvc,     python: "windows x86_64 none" }
+          - { os: windows-latest,    target: aarch64-pc-windows-msvc,    python: "windows aarch64 none" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          set -eu
+          name=vivar-${{ matrix.target }}
+          mkdir -p dist/$name
+          cp README.md THIRD_PARTY_LICENSES.md dist/$name/
+          if [ "${{ runner.os }}" = Windows ]; then
+            cp target/${{ matrix.target }}/release/vivar.exe dist/$name/
+            (cd dist && 7z a -tzip $name.zip $name > /dev/null)
+          else
+            cp target/${{ matrix.target }}/release/vivar dist/$name/
+            tar -C dist -czf dist/$name.tar.gz $name
+          fi
+          rm -r dist/$name
+      - name: Offline bundle
+        shell: bash
+        run: |
+          set -eu
+          t=${{ matrix.target }}
+          name=vivar-offline-$t
+          mkdir -p dist/$name/python
+          cp README.md THIRD_PARTY_LICENSES.md dist/$name/
+          # uv, the exact version this workflow runs, from its own release
+          uv_url=https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-$t
+          if [ "${{ runner.os }}" = Windows ]; then
+            curl -LsSf "$uv_url.zip" -o uv.zip
+            7z e -y uv.zip uv.exe -odist/$name > /dev/null
+            cp target/$t/release/vivar.exe install.ps1 dist/$name/
+          else
+            curl -LsSf "$uv_url.tar.gz" | tar -xz --strip-components=1 -C dist/$name uv-$t/uv
+            cp target/$t/release/vivar install.sh dist/$name/
+          fi
+          curl -LsSf https://raw.githubusercontent.com/astral-sh/uv/$UV_VERSION/LICENSE-MIT -o dist/$name/LICENSE-uv
+          # the CPython build uv itself would download for this target, laid out as uv keeps it
+          set -- ${{ matrix.python }}
+          uv python list --all-platforms --all-arches --only-downloads --output-format json "cpython@$PYTHON" \
+            | jq -r --arg os "$1" --arg arch "$2" --arg libc "$3" \
+              'first(.[] | select(.os == $os and .arch == $arch and .libc == $libc and .variant == "default")) | .key, .url' \
+            > python.txt
+          read -r key < python.txt; url=$(sed -n 2p python.txt)
+          echo "bundling $key from $url"
+          curl -LsSf "$url" -o python.tar.gz
+          tar -xzf python.tar.gz -C dist/$name/python
+          mv dist/$name/python/python dist/$name/python/$key
+          if [ "${{ runner.os }}" = Windows ]; then
+            (cd dist && 7z a -tzip $name.zip $name > /dev/null)
+          else
+            tar -C dist -czf dist/$name.tar.gz $name
+          fi
+          rm -r dist/$name
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes dist/*

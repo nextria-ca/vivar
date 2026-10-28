@@ -19,15 +19,75 @@ dependencies) behind the same CLI. See the roadmap in DESIGN.md.
 
 ## Install
 
-Prerequisites: a Rust toolchain (`rustup`) and `uv` on your PATH.
+Prebuilt binaries for Linux (x86_64, arm64), macOS (Apple Silicon, Intel) and
+Windows (x86_64, arm64) are attached to each [GitHub release](https://github.com/nextria-ca/vivar/releases).
+The installers also install `uv`, which vivar drives under the hood, if it's missing.
 
 ```sh
-curl -LsSf https://astral.sh/uv/install.sh | sh      # if you don't have uv
-cargo install --path .                              # installs ~/.cargo/bin/vivar
-vivar --version
+# Linux / macOS
+curl -LsSf https://raw.githubusercontent.com/nextria-ca/vivar/main/install.sh | sh
 ```
 
-Linux and WSL are tested. macOS should work unchanged; Windows is untested.
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/nextria-ca/vivar/main/install.ps1 | iex
+```
+
+While the repository is private, GitHub won't serve those URLs anonymously. Log in
+with the `gh` CLI once and use it to fetch the installer; it then downloads the
+release through your account:
+
+```sh
+gh api repos/nextria-ca/vivar/contents/install.sh -H "Accept: application/vnd.github.raw" | sh
+```
+
+```powershell
+gh api repos/nextria-ca/vivar/contents/install.ps1 -H "Accept: application/vnd.github.raw" | iex
+```
+
+Both installers take `VIVAR_VERSION`, `VIVAR_INSTALL_DIR`, `VIVAR_ARCHIVE`
+(install from a local file or internal URL instead of GitHub) and `VIVAR_SKIP_UV`.
+
+### Offline install
+
+Each release also carries `vivar-offline-<target>.tar.gz` / `.zip` bundles with
+everything a machine without internet needs: vivar, uv and a CPython 3.12 runtime.
+Copy one over (USB stick, file share), extract it, and run the installer inside it.
+It touches nothing on the network:
+
+```sh
+tar -xzf vivar-offline-x86_64-unknown-linux-musl.tar.gz
+sh vivar-offline-x86_64-unknown-linux-musl/install.sh
+```
+
+```powershell
+Expand-Archive vivar-offline-x86_64-pc-windows-msvc.zip -DestinationPath .
+powershell -ExecutionPolicy Bypass -File vivar-offline-x86_64-pc-windows-msvc\install.ps1
+```
+
+The runtime lands in uv's managed-Python directory, so `vivar init` and
+`vivar python list` find it right away. Packages come from one of two places:
+
+- **Whole environments**: `vivar pack` on a connected machine, `vivar unpack` on the
+  offline one. The bundle includes the interpreter and needs nothing else.
+- **A wheelhouse**: a directory of wheels. Set `index-url` in `[tool.vivar.policy]` to that
+  directory (absolute, or relative to the project) and vivar resolves from it alone,
+  never PyPI. Fill it on a connected machine with pip, for example
+  `uvx pip download -d wheelhouse numpy pandas` (add `--platform`/`--python-version`
+  `--only-binary=:all:` when the target machine differs).
+
+From source, with a Rust toolchain: `cargo install --git https://github.com/nextria-ca/vivar`.
+
+### Platforms
+
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| init / add / lock / sync / run / python | ✅ | ✅ | ✅ |
+| pack / unpack | ✅ | ✅ | ✅ (`tar.exe` ships with Windows 10+) |
+| verify | ✅ full | imports, CUDA, scripts (no `ldd` pass) | imports, CUDA (`nvcuda.dll`), scripts |
+
+CI runs the full test suite on all three. A bundle only unpacks on the OS and
+CPU architecture it was packed on.
 
 ## Quick start
 
@@ -64,7 +124,9 @@ The archive holds the synced `.venv`, `pyproject.toml`, `uv.lock`,
 `.python-version`, and the exact standalone Python the venv uses, minus
 `__pycache__` and CPython's own test suite. `unpack` extracts it and rewrites
 the paths in `pyvenv.cfg`, the interpreter symlinks, console-script shebangs,
-and the activate scripts to the new location. Machine B needs neither `uv` nor
+and the activate scripts to the new location. On Windows the `.exe` launchers
+embed the interpreter path in a resource; `unpack` patches it to a relative
+path, which makes them location-independent from then on. Machine B needs neither `uv` nor
 network, only `tar` and the same OS and CPU architecture (`unpack` refuses a
 mismatch). It uses `tar.gz` rather than `.zip` because zip drops the symlinks
 and executable bits a venv relies on.
@@ -104,7 +166,7 @@ settings for later phases (channels, licenses) appear when they do something.
 ```toml
 [tool.vivar.policy]
 deny = []                         # packages vivar refuses to add, lock, sync, or run with
-# index-url = "https://pypi.internal.example/simple"   # use an internal mirror instead of PyPI
+# index-url = "https://pypi.internal.example/simple"   # internal mirror instead of PyPI, or a wheelhouse directory
 ```
 
 ### Policy behaviour
@@ -114,7 +176,8 @@ deny = []                         # packages vivar refuses to add, lock, sync, o
   packages up front. `vivar lock`, `sync` and `run` also check every dependency
   declared in `pyproject.toml` (`[project] dependencies`, optional dependencies,
   and dependency groups), so hand-editing the file doesn't bypass the policy.
-- **`index-url`**: when set, all resolution goes through that index instead of PyPI.
+- **`index-url`**: when set, all resolution goes through that index instead of PyPI. A
+  local directory of wheels works too and is then the only source (see Offline install).
 - Policy is read from the nearest `pyproject.toml` above the current directory.
 
 Existing `[tool.vivar]` sections are never overwritten by `vivar init`.

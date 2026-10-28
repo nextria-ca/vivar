@@ -186,3 +186,200 @@ fn index_url_is_passed_to_uv() {
         "uv did not use the mirror:\n{stderr}"
     );
 }
+
+#[test]
+fn pack_and_unpack_produce_a_self_contained_env() {
+    let tmp = TempDir::new("bundle");
+    let src = tmp.0.join("src-machine");
+    fs::create_dir_all(&src).unwrap();
+    init(&src);
+    // pycodestyle ships a console script, so its shebang must survive the move.
+    ok(&src, &["add", "six", "pycodestyle"]);
+
+    let archive = tmp.0.join("demo.tar.gz");
+    ok(&src, &["pack", "--output", archive.to_str().unwrap()]);
+    assert!(archive.is_file());
+
+    let listing = Command::new("tar")
+        .args(["-tzf", archive.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&listing.stdout);
+    assert!(listing.contains("vivar-bundle.toml"), "{listing}");
+    assert!(listing.contains(".venv/bin/activate"), "{listing}");
+    assert!(
+        !listing.contains("__pycache__"),
+        "pycache should be excluded"
+    );
+    assert!(
+        !listing.contains("/lib/python3.12/test/"),
+        "stdlib tests should be excluded"
+    );
+
+    // "Other machine": a different directory, and the source project is gone.
+    let dest = tmp.0.join("dest-machine").join("app");
+    ok(
+        &tmp.0,
+        &["unpack", archive.to_str().unwrap(), dest.to_str().unwrap()],
+    );
+    fs::remove_dir_all(&src).unwrap();
+
+    let python = dest.join(".venv").join("bin").join("python");
+    let out = Command::new(&python)
+        .args([
+            "-c",
+            "import six, sys; print(sys.prefix); print(sys.base_prefix)",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let dest_str = dest.canonicalize().unwrap().to_string_lossy().into_owned();
+    for line in stdout.lines() {
+        assert!(
+            line.starts_with(&dest_str),
+            "{line} is outside the unpacked bundle"
+        );
+    }
+
+    // Console script shebang points at the new venv.
+    let out = Command::new(dest.join(".venv/bin/pycodestyle"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Activation works in a plain POSIX shell.
+    let script = format!(
+        ". '{0}/.venv/bin/activate' && printf '%s\\n' \"$VIRTUAL_ENV\" && command -v python && python -c 'import six'",
+        dest.display()
+    );
+    let out = Command::new("sh").args(["-c", &script]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut lines = stdout.lines();
+    assert_eq!(lines.next().unwrap(), format!("{}/.venv", dest.display()));
+    assert!(lines.next().unwrap().starts_with(dest.to_str().unwrap()));
+
+    fails_with(
+        &tmp.0,
+        &["unpack", archive.to_str().unwrap(), dest.to_str().unwrap()],
+        "already contains",
+    );
+
+    // verify works on the bundle with no uv anywhere on PATH.
+    let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
+        .current_dir(&tmp.0)
+        .env("PATH", "/usr/bin:/bin")
+        .args(["verify", dest.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stdout = stdout_of(&out);
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("0 errors"), "{stdout}");
+}
+
+fn stdout_of(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn verify_reports_broken_packages_and_missing_cuda() {
+    let tmp = TempDir::new("verify");
+    let dir = &tmp.0;
+    init(dir);
+    ok(dir, &["add", "six", "pycodestyle"]);
+
+    let out = ok(dir, &["verify", "--verbose"]);
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("ok   six"), "{stdout}");
+    assert!(stdout.contains("0 errors"), "{stdout}");
+
+    let site = fs::read_dir(dir.join(".venv/lib"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("python")
+        })
+        .unwrap()
+        .join("site-packages");
+    let dist_info = |name: &str, top_level: &str| {
+        let info = site.join(format!("{}-1.0.dist-info", name.replace('-', "_")));
+        fs::create_dir_all(&info).unwrap();
+        fs::write(
+            info.join("METADATA"),
+            format!("Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n"),
+        )
+        .unwrap();
+        fs::write(info.join("top_level.txt"), top_level).unwrap();
+    };
+    // A package whose native dependency is missing on this machine.
+    dist_info("gpu-thing", "gpu_thing\n");
+    fs::create_dir_all(site.join("gpu_thing")).unwrap();
+    fs::write(
+        site.join("gpu_thing/__init__.py"),
+        "import ctypes\nctypes.CDLL('libcudart.so.99')\n",
+    )
+    .unwrap();
+    // An environment that declares CUDA packages.
+    dist_info("nvidia-cuda-runtime-cu99", "");
+    // A script copied from somewhere else.
+    fs::write(
+        dir.join(".venv/bin/stale"),
+        "#!/nonexistent/.venv/bin/python\nprint(1)\n",
+    )
+    .unwrap();
+
+    let run = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_vivar"))
+            .current_dir(dir)
+            .env("VIVAR_CUDA_LIB", "libvivar_no_such_driver.so")
+            .arg("verify")
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+
+    let out = run(&[]);
+    let stdout = stdout_of(&out);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("ERR  gpu-thing: import gpu_thing failed: OSError: libcudart.so.99"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("ERR  CUDA: environment contains CUDA packages (nvidia-cuda-runtime-cu99) but no NVIDIA driver"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("ERR  stale: shebang points at missing /nonexistent/.venv/bin/python"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("3 errors"), "{stdout}");
+
+    let out = run(&["--allow-missing-gpu"]);
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("WARN CUDA"), "{stdout}");
+    assert!(stdout.contains("2 errors, 1 warnings"), "{stdout}");
+
+    fails_with(&tmp.0, &["verify", "nowhere"], "no environment found");
+}

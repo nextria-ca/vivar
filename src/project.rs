@@ -57,6 +57,21 @@ impl Project {
         })
     }
 
+    /// `[project] name`, falling back to the directory name.
+    pub fn name(&self) -> String {
+        self.doc
+            .get("project")
+            .and_then(|p| p.get("name"))
+            .and_then(Item::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                self.root
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "project".to_owned())
+    }
+
     pub fn policy(&self) -> Policy {
         let table = self
             .doc

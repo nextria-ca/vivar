@@ -48,6 +48,54 @@ vivar python list
 Commands can be run from any subdirectory of the project. `vivar run` keeps
 relative paths relative to where you ran it.
 
+## Moving an environment to another machine
+
+A venv is not portable on its own: it hardcodes absolute paths and depends on a
+Python install outside itself. `vivar pack` fixes both.
+
+```sh
+vivar pack                                   # on machine A -> my-app-linux-x86_64.tar.gz (~35 MB)
+scp my-app-linux-x86_64.tar.gz machine-b:
+vivar unpack my-app-linux-x86_64.tar.gz      # on machine B -> ./my-app-linux-x86_64/
+source my-app-linux-x86_64/.venv/bin/activate
+```
+
+The archive holds the synced `.venv`, `pyproject.toml`, `uv.lock`,
+`.python-version`, and the exact standalone Python the venv uses, minus
+`__pycache__` and CPython's own test suite. `unpack` extracts it and rewrites
+the paths in `pyvenv.cfg`, the interpreter symlinks, console-script shebangs,
+and the activate scripts to the new location. Machine B needs neither `uv` nor
+network, only `tar` and the same OS and CPU architecture (`unpack` refuses a
+mismatch). It uses `tar.gz` rather than `.zip` because zip drops the symlinks
+and executable bits a venv relies on.
+
+## Verifying an environment works on this machine
+
+```sh
+vivar verify            # current project
+vivar verify ./my-app   # an unpacked bundle, or a .venv directly
+```
+
+`verify` runs inside the environment's own Python, so it needs no `uv` and works
+on an unpacked bundle. It exits non-zero if anything is broken:
+
+- **Imports**: every top-level module of every installed package is imported in
+  an isolated child process. A wheel built against a library the host lacks
+  fails here with the loader's message, e.g. `libcudart.so.12: cannot open shared object file`.
+  Crashes and hangs are contained and reported per package.
+- **Native libraries** (Linux): every extension module in site-packages is run
+  through `ldd`; a needed library that exists neither on the system nor inside
+  the environment is an error.
+- **CUDA**: if the environment contains CUDA packages (`nvidia-*` or anything
+  linked against the CUDA runtime), the host must have a working NVIDIA driver
+  and at least one GPU. Missing driver is an error; `--allow-missing-gpu`
+  downgrades it to a warning for CPU-only CI.
+- **Scripts**: console scripts whose shebang points at an interpreter that no
+  longer exists (a venv copied by hand instead of `vivar unpack`).
+
+`--verbose` also lists what passed. `VIVAR_CUDA_LIB` overrides the driver
+library name if yours isn't `libcuda.so.1`.
+
 ## Configuration
 
 Everything lives in `pyproject.toml`. `vivar init` writes only an empty deny list;
@@ -97,4 +145,6 @@ Layout:
 - `src/main.rs`: CLI (clap) and command wiring.
 - `src/project.rs`: project discovery, `[tool.vivar]` defaults, policy parsing and checks.
 - `src/backend.rs`: the `Backend` trait and the phase 0 `UvBackend`.
+- `src/bundle.rs`: `pack`/`unpack` portable bundles (shells out to `tar`).
+- `src/verify.rs` + `src/verify.py`: `verify`, a Python driver run by the env's own interpreter.
 - `tests/cli.rs`: end-to-end tests against the built binary.

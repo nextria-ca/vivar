@@ -1,10 +1,13 @@
 mod backend;
+mod bundle;
 mod project;
+mod verify;
 
 use anyhow::Result;
 use backend::{Backend, UvBackend};
 use clap::{Parser, Subcommand};
 use project::Project;
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
@@ -51,6 +54,30 @@ enum Command {
     Run {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Archive the synced environment plus its Python for another machine
+    Pack {
+        /// Output file (default: <name>-<os>-<arch>.tar.gz in the current directory)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Extract a bundle made by `vivar pack` and make it activatable here
+    Unpack {
+        archive: PathBuf,
+        /// Directory to unpack into (default: the archive name without .tar.gz)
+        dest: Option<PathBuf>,
+    },
+    /// Check every installed package imports and its native libraries, CUDA
+    /// driver, and scripts work on this machine
+    Verify {
+        /// Project, bundle, or .venv directory (default: the current project)
+        path: Option<PathBuf>,
+        /// Report a missing GPU/driver as a warning instead of an error
+        #[arg(long)]
+        allow_missing_gpu: bool,
+        /// Also list the packages that passed
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Manage Python installations
     Python {
@@ -116,6 +143,42 @@ fn main() -> Result<()> {
                 project.check_declared()?;
             }
             std::process::exit(backend.run(&cwd, &args)?);
+        }
+        Command::Pack { output } => {
+            let project = require(project, &cwd)?;
+            project.check_declared()?;
+            backend.sync(&cwd)?;
+            let archive = bundle::pack(&project.root, &project.name(), output.as_deref())?;
+            let size = std::fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
+            println!(
+                "Packed {} ({:.1} MB). Unpack elsewhere with `vivar unpack {}`",
+                archive.display(),
+                size as f64 / 1e6,
+                archive.file_name().unwrap_or_default().to_string_lossy()
+            );
+        }
+        Command::Unpack { archive, dest } => {
+            let dest = dest.unwrap_or_else(|| {
+                let stem = archive.file_name().unwrap_or_default().to_string_lossy();
+                PathBuf::from(stem.trim_end_matches(".tar.gz").trim_end_matches(".tgz"))
+            });
+            let dest = bundle::unpack(&archive, &dest)?;
+            println!(
+                "Unpacked to {0}\n  activate:  source {0}/.venv/bin/activate\n  or run:    {0}/.venv/bin/python",
+                dest.display()
+            );
+        }
+        Command::Verify {
+            path,
+            allow_missing_gpu,
+            verbose,
+        } => {
+            let base = match path {
+                Some(p) => p,
+                None => project.as_ref().map(|p| p.root.clone()).unwrap_or(cwd),
+            };
+            let venv = verify::find_venv(&base)?;
+            std::process::exit(verify::run(&venv, allow_missing_gpu, verbose)?);
         }
         Command::Python { command } => match command {
             PythonCommand::Install { version } => backend.python_install(&version)?,

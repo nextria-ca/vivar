@@ -22,6 +22,7 @@ Existing tools each solve part of the problem (see [python_env_managers.md](pyth
 6. **Standards-first**: PEP 621 `pyproject.toml`, a normal `.venv`, PEP 723 inline scripts. No lock-in: a project still works with plain pip/uv.
 7. **Policy built in**: license allowlist, package deny list, vulnerability audit, internal/offline mirror.
 8. **Zero shell magic**: no rc-file edits, no auto-activated `base`. `vivar run` just works.
+9. **Portable**: a synced environment can be packed, copied to another machine of the same OS/arch, unpacked, and activated with no network and no uv.
 
 ## 3. Non-goals (for now)
 
@@ -55,6 +56,9 @@ vivar remove pandas
 vivar lock                    # write vivar.lock
 vivar sync                    # make .venv match the lock exactly
 vivar run python app.py       # sync if needed, then run (no activation)
+vivar pack                    # .venv + its Python -> <name>-<os>-<arch>.tar.gz
+vivar unpack app.tar.gz dir   # extract on another machine, rewrite paths, activate
+vivar verify                  # every installed package imports; native libs, CUDA driver, scripts OK here
 vivar python install 3.12     # prebuilt standalone Python
 vivar python list
 vivar tool run ruff check     # throwaway tool envs (later)
@@ -162,6 +166,13 @@ Phase 0 is done (`src/`, 14 tests, CI in `.github/workflows/ci.yml`):
 - Deny list enforced on `add` **and** on every dependency declared in `pyproject.toml`
   at `lock`/`sync`/`run`, so hand edits can't bypass it. Project discovery walks up
   from the current directory like uv does.
+- `pack`/`unpack`: tarball of `.venv` + project files + the exact python-build-standalone
+  install (minus `__pycache__` and the stdlib test suite, ~35 MB for a small app). `unpack`
+  relinks `bin/python*`, rewrites `pyvenv.cfg`, shebangs and activate scripts, and refuses
+  a different OS/arch. Target machine needs only `tar`.
+- `verify`: a Python script embedded in the binary runs with the env's interpreter (no uv):
+  imports every package in a forked child, `ldd`s every extension, requires an NVIDIA driver
+  when CUDA packages are present (`--allow-missing-gpu` to warn), checks script shebangs.
 - `[tool.vivar.policy] index-url` already works (pulled forward from phase 3): it
   replaces PyPI as the default index.
 - `channels`/`blocked-channels` are not written until the native backend can enforce them (phase 2).

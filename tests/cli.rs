@@ -293,10 +293,12 @@ fn init_and_run_work_without_uv() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // Compared canonically: macOS reports the cwd under /private/var.
     let stdout = stdout_of(&out);
-    let mut lines = stdout.lines().map(str::trim);
-    assert_eq!(lines.next().unwrap(), venv.to_string_lossy());
-    assert_eq!(lines.next().unwrap(), venv.to_string_lossy());
+    let venv = fs::canonicalize(&venv).unwrap();
+    for line in stdout.lines().take(2) {
+        assert_eq!(fs::canonicalize(line.trim()).unwrap(), venv, "{stdout}");
+    }
 
     // uv can take over the same env later.
     ok(dir, &["add", "six"]);

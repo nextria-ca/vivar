@@ -101,7 +101,12 @@ pub fn ensure(
         )?;
         return Ok(env);
     }
-    let previously_linked = links_of(&env);
+    // Only commands that are still ours get re-linked after the rebuild.
+    let bin = dirs::bin()?;
+    let previously_linked: Vec<String> = links_of(&env)
+        .into_iter()
+        .filter(|f| is_tool_link(&bin.join(f)).unwrap_or(false))
+        .collect();
     if env.exists() {
         remove_links(&env);
         fs::remove_dir_all(&env)?;
@@ -333,12 +338,21 @@ fn commands_of(env: &Path) -> Result<Vec<Cmd>> {
     Ok(scripts)
 }
 
+/// Linked command files. Manifests written before file names were recorded
+/// hold bare command names; those map onto the file the env actually has.
 fn links_of(env: &Path) -> Vec<String> {
+    let bin = env.join(venv::BIN);
     fs::read_to_string(env.join(LINKS))
         .map(|t| {
             t.lines()
-                .map(str::to_owned)
                 .filter(|l| !l.is_empty())
+                .map(|l| {
+                    if !bin.join(l).exists() && bin.join(exe(l)).exists() {
+                        exe(l)
+                    } else {
+                        l.to_owned()
+                    }
+                })
                 .collect()
         })
         .unwrap_or_default()

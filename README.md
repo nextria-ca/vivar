@@ -33,7 +33,7 @@ Linux and WSL are tested. macOS should work unchanged; Windows is untested.
 
 ```sh
 mkdir my-app && cd my-app
-vivar init --python 3.12        # pyproject.toml, .python-version, .venv, uv.lock, [tool.vivar] defaults
+vivar init --python 3.12        # pyproject.toml, .python-version, .venv, uv.lock; nothing else
 vivar add numpy "pandas>=2"     # checked against policy, then added + installed
 vivar add --group dev pytest    # dependency groups
 vivar run python app.py         # runs in the project env; no activation
@@ -50,13 +50,10 @@ relative paths relative to where you ran it.
 
 ## Configuration
 
-Everything lives in `pyproject.toml`. `vivar init` writes these defaults:
+Everything lives in `pyproject.toml`. `vivar init` writes only an empty deny list;
+settings for later phases (channels, licenses) appear when they do something.
 
 ```toml
-[tool.vivar]
-channels = ["conda-forge"]        # native dep sources (phase 2)
-blocked-channels = ["defaults"]   # Anaconda licensing guardrail (enforced in phase 2)
-
 [tool.vivar.policy]
 deny = []                         # packages vivar refuses to add, lock, sync, or run with
 # index-url = "https://pypi.internal.example/simple"   # use an internal mirror instead of PyPI
@@ -73,6 +70,12 @@ deny = []                         # packages vivar refuses to add, lock, sync, o
 - Policy is read from the nearest `pyproject.toml` above the current directory.
 
 Existing `[tool.vivar]` sections are never overwritten by `vivar init`.
+
+## Footprint
+
+Three direct dependencies (`clap` with minimal features, `toml_edit`, `anyhow`),
+a release build under 1 MB, and no runtime beyond the `uv` binary it drives.
+`vivar init` creates no sample code, README, or git repo.
 
 ## Development
 

@@ -128,8 +128,9 @@ impl Project {
     }
 }
 
-/// Adds the default `[tool.vivar]` table (license-safe channels, empty deny list)
-/// unless the project already has one.
+/// Adds an empty `[tool.vivar.policy]` deny list unless the project already
+/// has a `[tool.vivar]` table. Settings for later phases are added when they
+/// actually do something.
 pub fn write_defaults(root: &Path) -> Result<()> {
     let path = root.join(PYPROJECT);
     let mut project = Project::load(root)?;
@@ -147,8 +148,7 @@ pub fn write_defaults(root: &Path) -> Result<()> {
     }
 
     let mut vivar = Table::new();
-    vivar["channels"] = value(Array::from_iter(["conda-forge"]));
-    vivar["blocked-channels"] = value(Array::from_iter(["defaults"]));
+    vivar.set_implicit(true);
     let mut policy = Table::new();
     policy["deny"] = value(Array::new());
     vivar["policy"] = Item::Table(policy);
@@ -296,8 +296,7 @@ lint = ["ruff"]
         fs::write(tmp.0.join(PYPROJECT), "[project]\nname = \"t\"\n").unwrap();
         write_defaults(&tmp.0).unwrap();
         let first = fs::read_to_string(tmp.0.join(PYPROJECT)).unwrap();
-        assert!(first.contains("[tool.vivar]"));
-        assert!(first.contains("blocked-channels = [\"defaults\"]"));
+        assert!(first.contains("[tool.vivar.policy]\ndeny = []"), "{first}");
 
         write_defaults(&tmp.0).unwrap();
         assert_eq!(fs::read_to_string(tmp.0.join(PYPROJECT)).unwrap(), first);

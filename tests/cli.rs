@@ -73,10 +73,14 @@ fn init_add_run_remove_roundtrip() {
         assert!(dir.join(file).is_file(), "{file} missing after init");
     }
     assert!(dir.join(".venv").is_dir(), ".venv missing after init");
+    for junk in ["main.py", "README.md", ".git", "src"] {
+        assert!(!dir.join(junk).exists(), "init should not create {junk}");
+    }
     let pyproject = read(&dir.join("pyproject.toml"));
-    assert!(pyproject.contains("[tool.vivar]"), "{pyproject}");
-    assert!(pyproject.contains("blocked-channels = [\"defaults\"]"));
-    assert!(pyproject.contains("[tool.vivar.policy]"));
+    assert!(
+        pyproject.contains("[tool.vivar.policy]\ndeny = []"),
+        "{pyproject}"
+    );
 
     ok(dir, &["add", "six"]);
     assert!(read(&dir.join("pyproject.toml")).contains("\"six"));

@@ -68,7 +68,9 @@ impl UvBackend {
 impl Backend for UvBackend {
     fn init(&self, dir: &Path, name: Option<&str>, python: Option<&str>) -> Result<()> {
         let mut cmd = self.uv(Some(dir));
-        cmd.args(["init", "--app"]);
+        // `--bare` skips the sample main.py, README, src/ tree and git init;
+        // `--pin-python` still writes `.python-version`.
+        cmd.args(["init", "--bare", "--pin-python"]);
         if let Some(name) = name {
             cmd.args(["--name", name]);
         }

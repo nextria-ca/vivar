@@ -75,16 +75,18 @@ dependencies = ["numpy", "pandas>=2"]
 [dependency-groups]
 dev = ["pytest"]
 
-[tool.vivar]
-channels = ["conda-forge"]          # native dep sources (v2)
-blocked-channels = ["defaults"]     # licensing guardrail
-native-dependencies = { cuda-toolkit = "12.*", gdal = "*" }   # v2
-
 [tool.vivar.policy]
-deny = ["some-banned-package"]      # refused by `vivar add`
+deny = ["some-banned-package"]      # refused by `vivar add`/`lock`/`sync`/`run`
+index-url = "https://pypi.internal.example/simple"        # mirror (phase 0)
+
+[tool.vivar]                        # phase 2, not written until then
+channels = ["conda-forge"]          # native dep sources
+blocked-channels = ["defaults"]     # licensing guardrail
+native-dependencies = { cuda-toolkit = "12.*", gdal = "*" }
 allowed-licenses = ["MIT", "BSD-3-Clause", "Apache-2.0"]  # v3
-index-url = "https://pypi.internal.example/simple"        # v3 mirror
 ```
+
+`vivar init` only writes keys that are enforced today. No placeholder config.
 
 An org-wide policy file (from a git repo or URL) can be layered on top of project settings (v3).
 
@@ -156,16 +158,16 @@ We never write our own SAT/PubGrub resolver or wheel/conda package parsers. Thos
 Phase 0 is done (`src/`, 14 tests, CI in `.github/workflows/ci.yml`):
 
 - `init`, `add [--group]`, `remove`, `lock`, `sync`, `run`, `python install|list` via `UvBackend`.
-- `init` writes `[tool.vivar]` defaults and creates `.venv` + `uv.lock` (`--no-sync` to skip).
+- `init` creates exactly `pyproject.toml`, `.python-version`, `.venv`, `uv.lock` (`--no-sync` skips the last two). No sample code, README or git init.
 - Deny list enforced on `add` **and** on every dependency declared in `pyproject.toml`
   at `lock`/`sync`/`run`, so hand edits can't bypass it. Project discovery walks up
   from the current directory like uv does.
 - `[tool.vivar.policy] index-url` already works (pulled forward from phase 3): it
   replaces PyPI as the default index.
-- `blocked-channels` is written but has nothing to enforce until the native backend (phase 2).
+- `channels`/`blocked-channels` are not written until the native backend can enforce them (phase 2).
 - Linux/WSL tested; macOS expected to work; Windows untested.
-- Third-party crates inventoried in `THIRD_PARTY_LICENSES.md` (all MIT/Apache-2.0/Unlicense),
-  checked in CI.
+- Three direct crates, minimal clap features, size-optimised release profile (<1 MB static binary).
+  Inventory in `THIRD_PARTY_LICENSES.md` (all MIT/Apache-2.0/Unlicense), checked in CI.
 
 ## 13. Open questions
 

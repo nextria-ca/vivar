@@ -243,6 +243,14 @@ impl Project {
         self.workspace.as_deref().map_or(&self.root, |w| &w.root)
     }
 
+    /// Whether `[dependency-groups]` declares `group`.
+    pub fn has_group(&self, group: &str) -> bool {
+        self.doc
+            .get("dependency-groups")
+            .and_then(Item::as_table_like)
+            .is_some_and(|t| t.contains_key(group))
+    }
+
     /// `[project] requires-python`, if declared.
     pub fn requires_python(&self) -> Option<String> {
         self.doc

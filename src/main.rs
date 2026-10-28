@@ -272,8 +272,12 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                // Keep the group that was being added to installed, as before the add.
-                let _ = backend.sync_group(&cwd, group.as_deref());
+                // Keep the group that was being added to installed, as before the
+                // add; a group the add itself created no longer exists to sync.
+                let group = group
+                    .as_deref()
+                    .filter(|g| Project::load(&project.root).is_ok_and(|p| p.has_group(g)));
+                let _ = backend.sync_group(&cwd, group);
                 return Err(e);
             }
         }

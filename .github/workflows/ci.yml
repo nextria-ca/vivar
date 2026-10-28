@@ -10,6 +10,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      # Runners ship a system Python 3.12; pack needs the relocatable uv-managed one.
+      UV_MANAGED_PYTHON: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -17,8 +20,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v5
-        with:
-          python-version: "3.12"
+      - run: uv python install 3.12
       - run: cargo fmt --check
         if: runner.os == 'Linux'
       - run: cargo clippy --all-targets -- -D warnings

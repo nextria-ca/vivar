@@ -119,6 +119,38 @@ vivar python install 3.13       # prebuilt standalone Python, no compiling
 vivar python list               # --all adds what can be downloaded
 ```
 
+More, all from the same binary:
+
+```sh
+vivar run test                  # a [tool.vivar.scripts] task; extra args are appended
+vivar run tool.py               # a PEP 723 script: its inline deps get a cached env of their own
+vivar tool run ruff check .     # tools in isolated envs (pipx-style); `tool install` links them into ~/.local/bin
+vivar tree                      # dependency tree from the lockfile
+vivar why urllib3               # every chain that pulls a package in
+vivar outdated                  # what a re-resolve would upgrade
+vivar upgrade-deps [pkg…]       # upgrade within the declared constraints, then sync
+vivar licenses                  # every installed package with its license
+vivar audit                     # known vulnerabilities (OSV) for the locked packages
+vivar build                     # sdist + wheel into dist/
+vivar export docker             # a Dockerfile that installs exactly what uv.lock pins
+vivar diff a.tar.gz b.tar.gz    # what changed between two bundles
+vivar doctor                    # what's installed, configured, broken
+vivar env list / vivar clean    # what vivar keeps on disk; drop script envs and caches
+vivar completions zsh           # shell completion (bash, zsh, fish, powershell, elvish)
+vivar upgrade                   # vivar itself
+```
+
+Tasks live in `pyproject.toml`:
+
+```toml
+[tool.vivar.scripts]
+test = "pytest -x"
+lint = "ruff check ."
+```
+
+Workspaces (`[tool.uv.workspace]`) work as in uv: members share the root `.venv`
+and inherit the root's policy.
+
 Commands can be run from any subdirectory of the project. `vivar run` keeps
 relative paths relative to where you ran it.
 
@@ -133,6 +165,10 @@ scp my-app-linux-x86_64.tar.gz machine-b:
 vivar unpack my-app-linux-x86_64.tar.gz      # on machine B -> ./my-app-linux-x86_64/
 source my-app-linux-x86_64/.venv/bin/activate
 ```
+
+Every bundle carries a SHA-256 list of its files. `unpack` refuses an archive whose
+contents don't match it, and `vivar verify` on an unpacked bundle reports any file
+changed since packing. `vivar diff` compares two bundles' Python, platform and packages.
 
 The archive holds the synced `.venv`, `pyproject.toml`, `uv.lock`,
 `.python-version`, and the exact standalone Python the venv uses, minus
@@ -193,6 +229,20 @@ deny = []                         # packages vivar refuses to add, lock, sync, o
   and dependency groups), so hand-editing the file doesn't bypass the policy.
 - **`index-url`**: when set, all resolution goes through that index instead of PyPI. A
   local directory of wheels works too and is then the only source (see Offline install).
+- **`allow-licenses`**: SPDX identifiers (e.g. `["MIT", "Apache-2.0", "BSD-3-Clause"]`).
+  After every install, each package's declared license (`License-Expression`, else its
+  classifiers) must satisfy the list; `OR` needs one side allowed, `AND` needs both. A
+  package that fails, or declares nothing, fails the command, and `vivar add` rolls the
+  addition back. `license-exceptions = ["name"]` waives it per package.
+- **`require-hashes = true`**: every locked package must be a hashed artifact from a
+  registry, and from `index-url` when one is set. Git, URL and path sources are refused.
+
+An **org-wide policy** applies on top of every project: `VIVAR_POLICY=/path/policy.toml`,
+else `~/.config/vivar/policy.toml` (`%APPDATA%\vivar\policy.toml` on Windows), else
+`/etc/vivar/policy.toml`. Same keys under a `[policy]` table. Deny lists add up,
+`require-hashes` sticks, license allowlists intersect, and a project may still point
+`index-url` at a wheelhouse. Ship it inside the offline bundle or by configuration
+management; `vivar doctor` shows which file is in effect.
 - Policy is read from the nearest `pyproject.toml` above the current directory.
 
 Existing `[tool.vivar]` sections are never overwritten by `vivar init`.

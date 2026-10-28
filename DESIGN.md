@@ -154,8 +154,8 @@ We never write our own SAT/PubGrub resolver or wheel/conda package parsers. Thos
 | **0: MVP** ✅ | CLI + `[tool.vivar]` defaults + deny policy, `UvBackend` for init/add/remove/lock/sync/run/python | Team can use it daily for pure-Python projects |
 | **1: Own the core** | In-process resolver + installer, `vivar.lock`, global cache (venvs, Python downloads, run ✅) | No `uv` binary needed, speed on par with uv |
 | **2: Native deps** | rattler integration, `--native`, unified conda-forge + PyPI solve | GPU/GDAL project fully reproducible from the lock |
-| **3: Policy** | License allowlist, vulnerability audit (OSV), mirrors/offline, org policy file, `export docker` | `vivar audit` runs in CI and passes |
-| **4: Polish** | Workspaces, PEP 723 scripts, `tool run`, tasks (installers ✅) | — |
+| **3: Policy** ✅ | License allowlist, vulnerability audit (OSV), mirrors/offline, org policy file, `export docker`, `require-hashes` | `vivar audit` runs in CI and passes |
+| **4: Polish** ✅ | Workspaces, PEP 723 scripts, `tool run`, tasks, installers, `tree`/`why`, `outdated`, `doctor`, completions, bundle integrity + `diff` | — |
 
 ## 12. Implementation status
 
@@ -189,6 +189,31 @@ Phase 0 is done (`src/`, 14 tests, CI in `.github/workflows/ci.yml`):
   `gh`/`curl`, or from a local archive/bundle/URL for offline machines.
 - Three direct crates, minimal clap features, size-optimised release profile (<1 MB static binary).
   Inventory in `THIRD_PARTY_LICENSES.md` (all MIT/Apache-2.0/Unlicense), checked in CI.
+
+### Phase 3/4 delivery plan (2026-10-28)
+
+Everything below is in, pure Rust on the existing three crates plus `clap_complete`:
+
+| Area | Commands / settings | Where |
+|---|---|---|
+| Tasks | `[tool.vivar.scripts]`, `vivar run <task> [args]` | `project.rs`, `main.rs` |
+| Inline scripts | PEP 723 `# /// script` blocks, cached env per dependency set | `tool.rs` |
+| Tools | `tool run/install/uninstall/list`, console scripts linked into `~/.local/bin` | `tool.rs` |
+| Workspaces | members share the root `.venv`; root policy applies to members | `project.rs` |
+| Graph | `tree`, `why`, from `uv.lock` | `lock.rs` |
+| Upgrades | `outdated` (dry-run re-resolve), `upgrade-deps`, `build` | `backend.rs` |
+| Integrity | `vivar-bundle.sha256` written by `pack`, checked by `unpack` and `verify`; `diff` | `bundle.rs`, `sha256.rs` |
+| Deploy | `export docker` | `export.rs` |
+| Licenses | `allow-licenses`, `license-exceptions`, `licenses` | `licenses.rs` |
+| Vulnerabilities | `audit` via OSV querybatch (`VIVAR_OSV_URL` for a mirror) | `audit.rs`, `json.rs` |
+| Org policy | `VIVAR_POLICY` / config dir / `/etc/vivar/policy.toml`, merged | `project.rs` |
+| Provenance | `require-hashes` | `main.rs` |
+| Ops | `doctor`, `env list`, `clean`, `completions` | `doctor.rs`, `envs.rs` |
+
+Deferred, in order: native dependencies via conda-forge (phase 2), GPU-aware
+resolution (`add torch --cuda`), SHA-256 verification of Python downloads against
+python-build-standalone's `SHA256SUMS`, fish/csh activate scripts, and the in-process
+resolver that removes the `uv` binary.
 
 ## 13. Open questions
 

@@ -16,6 +16,7 @@ cargo metadata --format-version 1 > /tmp/meta.json && python3 scripts/licenses.p
 | anyhow | 1.0.104 | MIT OR Apache-2.0 | https://github.com/dtolnay/anyhow |
 | clap | 4.6.7 | MIT OR Apache-2.0 | https://github.com/clap-rs/clap |
 | clap_builder | 4.6.7 | MIT OR Apache-2.0 | https://github.com/clap-rs/clap |
+| clap_complete | 4.6.11 | MIT OR Apache-2.0 | https://github.com/clap-rs/clap |
 | clap_derive | 4.6.7 | MIT OR Apache-2.0 | https://github.com/clap-rs/clap |
 | clap_lex | 1.1.1 | MIT OR Apache-2.0 | https://github.com/clap-rs/clap |
 | equivalent | 1.0.3 | Apache-2.0 OR MIT | https://github.com/indexmap-rs/equivalent |

@@ -11,6 +11,233 @@ use toml_edit::{value, DocumentMut};
 
 pub const MANIFEST: &str = "vivar-bundle.toml";
 pub use crate::venv::BIN as VENV_BIN;
+/// `sha256  path` for every file whose bytes must survive the trip. Files that
+/// `unpack` rewrites for the new location are left out.
+pub const CHECKSUMS: &str = "vivar-bundle.sha256";
+
+/// Mirrors the tar excludes in `pack` so the checksum list and the archive agree.
+fn excluded(rel: &Path, python_dir: &str, mm: &str) -> bool {
+    let parts: Vec<&str> = rel.iter().filter_map(|c| c.to_str()).collect();
+    let name = parts.last().copied().unwrap_or("");
+    if parts.iter().any(|p| {
+        matches!(
+            *p,
+            "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".ruff_cache" | ".hypothesis"
+        )
+    }) || name.ends_with(".pyc")
+        || name.ends_with(".pyo")
+    {
+        return true;
+    }
+    if parts.first() == Some(&".venv") {
+        return parts.len() == 2 && matches!(parts[1], "CACHEDIR.TAG" | ".gitignore" | ".lock");
+    }
+    if parts.first() == Some(&python_dir) {
+        let unix = format!("python{mm}");
+        let stdlib = parts.len() > 3 && parts[1] == "lib" && parts[2] == unix;
+        let windows = parts.len() > 2 && parts[1] == "Lib";
+        let dir = if stdlib {
+            parts[3]
+        } else if windows {
+            parts[2]
+        } else {
+            ""
+        };
+        if matches!(dir, "test" | "site-packages" | "ensurepip" | "idlelib") {
+            return true;
+        }
+        if parts.len() > 3 && matches!(parts[1], "lib" | "tcl") && parts[3] == "demos" {
+            return true;
+        }
+        if parts.len() > 2 && parts[1] == "share" && parts[2] == "man" {
+            return true;
+        }
+    }
+    false
+}
+
+/// Files `unpack` relocates by rewriting: never hashed.
+fn relocated(rel: &Path) -> bool {
+    let parts: Vec<&str> = rel.iter().filter_map(|c| c.to_str()).collect();
+    parts.first() == Some(&".venv")
+        && (parts.get(1) == Some(&"pyvenv.cfg")
+            || (parts.get(1) == Some(&VENV_BIN) && parts.len() == 3))
+}
+
+fn walk(base: &Path, rel: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(base.join(rel))?.flatten() {
+        let child = rel.join(entry.file_name());
+        let meta = entry.metadata()?;
+        if meta.is_symlink() {
+            continue;
+        } else if meta.is_dir() {
+            walk(base, &child, out)?;
+        } else {
+            out.push(child);
+        }
+    }
+    Ok(())
+}
+
+/// Checksum list for everything `pack` archives, as members would appear.
+fn checksums(root: &Path, python_root: &Path, python_dir: &str, mm: &str) -> Result<String> {
+    let mut files = Vec::new();
+    walk(root, Path::new(".venv"), &mut files)?;
+    for file in ["pyproject.toml", "uv.lock", ".python-version"] {
+        if root.join(file).is_file() {
+            files.push(PathBuf::from(file));
+        }
+    }
+    let python_parent = python_root.parent().unwrap_or(python_root);
+    walk(python_parent, Path::new(python_dir), &mut files)?;
+
+    let mut out = String::new();
+    for rel in files {
+        if excluded(&rel, python_dir, mm) || relocated(&rel) {
+            continue;
+        }
+        let base = if rel.starts_with(python_dir) {
+            python_parent
+        } else {
+            root
+        };
+        let digest = crate::sha256::file(&base.join(&rel))
+            .with_context(|| format!("hashing {}", rel.display()))?;
+        let member = rel.to_string_lossy().replace('\\', "/");
+        out.push_str(&format!("{digest}  {member}\n"));
+    }
+    Ok(out)
+}
+
+/// Checks every file in a bundle directory against its checksum list. Returns
+/// the mismatching or missing members; unlisted regular files count too.
+pub fn verify_checksums(dir: &Path) -> Result<Vec<String>> {
+    let list = fs::read_to_string(dir.join(CHECKSUMS))
+        .with_context(|| format!("{} has no {CHECKSUMS}", dir.display()))?;
+    let mut bad = Vec::new();
+    let mut listed = std::collections::BTreeSet::new();
+    for line in list.lines() {
+        let Some((digest, member)) = line.split_once("  ") else {
+            continue;
+        };
+        listed.insert(member.to_owned());
+        match crate::sha256::file(&dir.join(member)) {
+            Ok(actual) if actual == digest => {}
+            Ok(_) => bad.push(format!("{member} (modified)")),
+            Err(_) => bad.push(format!("{member} (missing)")),
+        }
+    }
+    let manifest: DocumentMut = fs::read_to_string(dir.join(MANIFEST))?.parse()?;
+    let python_dir = manifest
+        .get("python-dir")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let mm = major_minor(
+        manifest
+            .get("python")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+    );
+    let mut files = Vec::new();
+    walk(dir, Path::new(".venv"), &mut files)?;
+    if !python_dir.is_empty() && dir.join(python_dir).is_dir() {
+        walk(dir, Path::new(python_dir), &mut files)?;
+    }
+    for rel in files {
+        let member = rel.to_string_lossy().replace('\\', "/");
+        if !listed.contains(&member) && !excluded(&rel, python_dir, &mm) && !relocated(&rel) {
+            bad.push(format!("{member} (not in the bundle)"));
+        }
+    }
+    Ok(bad)
+}
+
+/// `vivar diff`: what changed between two bundles (archives or unpacked/project dirs).
+pub fn diff(a: &Path, b: &Path) -> Result<String> {
+    let tmp = std::env::temp_dir().join(format!("vivar-diff-{}", std::process::id()));
+    let result = (|| {
+        let (ma, la) = metadata_of(a, &tmp.join("a"))?;
+        let (mb, lb) = metadata_of(b, &tmp.join("b"))?;
+        let mut out = String::new();
+        for key in ["python", "platform"] {
+            let (va, vb) = (
+                ma.get(key).cloned().unwrap_or_default(),
+                mb.get(key).cloned().unwrap_or_default(),
+            );
+            if va != vb {
+                out.push_str(&format!("{key}: {va} -> {vb}\n"));
+            }
+        }
+        let va: std::collections::BTreeMap<&str, &str> = la
+            .packages
+            .iter()
+            .map(|p| (p.name.as_str(), p.version.as_str()))
+            .collect();
+        let vb: std::collections::BTreeMap<&str, &str> = lb
+            .packages
+            .iter()
+            .map(|p| (p.name.as_str(), p.version.as_str()))
+            .collect();
+        for (name, version) in &vb {
+            match va.get(name) {
+                None => out.push_str(&format!("+ {name} {version}\n")),
+                Some(old) if old != version => {
+                    out.push_str(&format!("~ {name} {old} -> {version}\n"))
+                }
+                _ => {}
+            }
+        }
+        for (name, version) in &va {
+            if !vb.contains_key(name) {
+                out.push_str(&format!("- {name} {version}\n"));
+            }
+        }
+        Ok(out)
+    })();
+    let _ = fs::remove_dir_all(&tmp);
+    result
+}
+
+/// Manifest fields and lockfile of a bundle archive or a directory.
+fn metadata_of(
+    path: &Path,
+    scratch: &Path,
+) -> Result<(
+    std::collections::BTreeMap<String, String>,
+    crate::lock::Lock,
+)> {
+    let dir = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        fs::create_dir_all(scratch)?;
+        let status = Command::new("tar")
+            .arg("-xzf")
+            .arg(path)
+            .arg("-C")
+            .arg(scratch)
+            .args([MANIFEST, crate::lock::LOCKFILE])
+            .status()
+            .context("failed to run `tar`")?;
+        if !status.success() {
+            bail!("{} is not a vivar bundle", path.display());
+        }
+        scratch.to_path_buf()
+    };
+    let mut fields = std::collections::BTreeMap::new();
+    if let Ok(text) = fs::read_to_string(dir.join(MANIFEST)) {
+        let doc: DocumentMut = text.parse().context("parsing bundle manifest")?;
+        for (k, v) in doc.iter() {
+            if let Some(v) = v.as_str() {
+                fields.insert(k.to_owned(), v.to_owned());
+            }
+        }
+    } else if let Ok(version) = pyvenv_cfg(&dir.join(".venv"), "version_info") {
+        fields.insert("python".to_owned(), version);
+        fields.insert("platform".to_owned(), platform());
+    }
+    let lock = crate::lock::Lock::read(&dir)?;
+    Ok((fields, lock))
+}
 
 fn platform() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
@@ -96,8 +323,12 @@ pub fn pack(root: &Path, name: &str, output: Option<&Path>) -> Result<PathBuf> {
     let staging = std::env::temp_dir().join(format!("vivar-pack-{}", std::process::id()));
     fs::create_dir_all(&staging)?;
     fs::write(staging.join(MANIFEST), manifest.to_string())?;
-
     let mm = major_minor(&version);
+    fs::write(
+        staging.join(CHECKSUMS),
+        checksums(root, &python_root, &python_dir, &mm)?,
+    )?;
+
     let mut tar = Command::new("tar");
     tar.arg("-czf").arg(&output);
     // A bundle is a frozen environment: no bytecode caches, tool caches, or the
@@ -131,6 +362,7 @@ pub fn pack(root: &Path, name: &str, output: Option<&Path>) -> Result<PathBuf> {
         .arg("-C")
         .arg(&staging)
         .arg(MANIFEST)
+        .arg(CHECKSUMS)
         .arg("-C")
         .arg(root)
         .arg(".venv");
@@ -190,6 +422,20 @@ pub fn unpack(archive: &Path, dest: &Path) -> Result<PathBuf> {
             .map(str::to_owned)
             .ok_or_else(|| anyhow!("bundle manifest is missing `{key}`"))
     };
+
+    let bad = verify_checksums(&dest)?;
+    if !bad.is_empty() {
+        bail!(
+            "{} failed its integrity check; {} file(s) differ from when it was packed:\n  {}",
+            archive.display(),
+            bad.len(),
+            bad.iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        );
+    }
 
     let bundle_platform = field("platform")?;
     if bundle_platform != platform() {

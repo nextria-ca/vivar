@@ -111,14 +111,43 @@ pub fn interpreter(request: Option<&str>) -> Result<Installed> {
     }
 }
 
-/// Runs `args` with the env's bin directory first on PATH. On Unix this execs,
-/// so the command owns the terminal and signals; Windows waits for it.
+/// The env's interpreter.
+pub fn python(venv: &Path) -> PathBuf {
+    let bin = venv.join(BIN);
+    if cfg!(windows) {
+        bin.join("python.exe")
+    } else {
+        bin.join("python")
+    }
+}
+
+/// The env's `site-packages` directory.
+pub fn site_packages(venv: &Path) -> Result<PathBuf> {
+    if cfg!(windows) {
+        return Ok(venv.join("Lib").join("site-packages"));
+    }
+    let lib = venv.join("lib");
+    for entry in fs::read_dir(&lib)?.flatten() {
+        if entry.file_name().to_string_lossy().starts_with("python") {
+            return Ok(entry.path().join("site-packages"));
+        }
+    }
+    bail!("no site-packages under {}", lib.display())
+}
+
+/// Runs `args` in the project's `.venv`.
 pub fn run(root: &Path, args: &[String]) -> Result<i32> {
     let venv = root.join(".venv");
-    let bin = venv.join(BIN);
     if !venv.join("pyvenv.cfg").exists() {
         bail!("{} has no .venv yet; run `vivar sync`", root.display());
     }
+    exec(&venv, args)
+}
+
+/// Runs `args` with the env's bin directory first on PATH. On Unix this execs,
+/// so the command owns the terminal and signals; Windows waits for it.
+pub fn exec(venv: &Path, args: &[String]) -> Result<i32> {
+    let bin = venv.join(BIN);
     let (program, rest) = args
         .split_first()
         .ok_or_else(|| anyhow!("nothing to run"))?;
@@ -134,7 +163,7 @@ pub fn run(root: &Path, args: &[String]) -> Result<i32> {
         .unwrap_or_else(|| PathBuf::from(program));
     let mut cmd = Command::new(&exe);
     cmd.args(rest)
-        .env("VIRTUAL_ENV", &venv)
+        .env("VIRTUAL_ENV", venv)
         .env("PATH", path)
         .env_remove("PYTHONHOME");
 

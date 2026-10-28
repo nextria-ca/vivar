@@ -16,6 +16,13 @@ pub trait Backend {
     fn remove(&self, dir: &Path, packages: &[String]) -> Result<()>;
     fn lock(&self, dir: &Path) -> Result<()>;
     fn sync(&self, dir: &Path) -> Result<()>;
+    /// Re-resolves `packages` (all when empty) to their newest allowed versions;
+    /// `dry_run` only reports what would change.
+    fn upgrade(&self, dir: &Path, packages: &[String], dry_run: bool) -> Result<()>;
+    /// Builds the project's sdist and wheel into `dist/`.
+    fn build(&self, dir: &Path) -> Result<()>;
+    /// Installs requirement specs into the environment whose interpreter is `python`.
+    fn install(&self, python: &Path, specs: &[String]) -> Result<()>;
 }
 
 const UV_INSTALL_HINT: &str = "install it with `curl -LsSf https://astral.sh/uv/install.sh | sh`";
@@ -99,6 +106,36 @@ impl Backend for UvBackend {
     fn sync(&self, dir: &Path) -> Result<()> {
         let mut cmd = self.uv(dir);
         cmd.arg("sync");
+        Self::check(cmd)
+    }
+
+    fn upgrade(&self, dir: &Path, packages: &[String], dry_run: bool) -> Result<()> {
+        let mut cmd = self.uv(dir);
+        cmd.arg("lock");
+        if packages.is_empty() {
+            cmd.arg("--upgrade");
+        }
+        for p in packages {
+            cmd.args(["--upgrade-package", p]);
+        }
+        if dry_run {
+            cmd.arg("--dry-run");
+        }
+        Self::check(cmd)
+    }
+
+    fn build(&self, dir: &Path) -> Result<()> {
+        let mut cmd = self.uv(dir);
+        cmd.arg("build");
+        Self::check(cmd)
+    }
+
+    fn install(&self, python: &Path, specs: &[String]) -> Result<()> {
+        let dir = python.parent().unwrap_or(python);
+        let mut cmd = self.uv(dir);
+        cmd.args(["pip", "install", "--python"])
+            .arg(python)
+            .args(specs);
         Self::check(cmd)
     }
 }

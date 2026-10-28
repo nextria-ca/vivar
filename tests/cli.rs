@@ -661,3 +661,395 @@ fn upgrade_installs_from_a_local_archive_or_bundle_dir() {
         .unwrap();
     assert!(!out.status.success());
 }
+
+/// uv's managed-Python directory for the real user, for tests that move HOME.
+fn real_python_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("UV_PYTHON_INSTALL_DIR") {
+        return PathBuf::from(d);
+    }
+    if cfg!(windows) {
+        return PathBuf::from(std::env::var_os("APPDATA").unwrap())
+            .join("uv")
+            .join("python");
+    }
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap())
+                .join(".local")
+                .join("share")
+        })
+        .join("uv")
+        .join("python")
+}
+
+/// A hand-rolled pure-Python wheel `minipkg` exposing `VALUE = 42`.
+fn make_wheel(dir: &Path, into: &Path) -> PathBuf {
+    fs::create_dir_all(into).unwrap();
+    let whl = into.join("minipkg-1.0-py3-none-any.whl");
+    let script = format!(
+        "import zipfile\n\
+         with zipfile.ZipFile({:?}, 'w') as z:\n\
+         \x20   z.writestr('minipkg/__init__.py', 'VALUE = 42\\n')\n\
+         \x20   z.writestr('minipkg-1.0.dist-info/METADATA', 'Metadata-Version: 2.1\\nName: minipkg\\nVersion: 1.0\\nLicense-Expression: MIT\\n')\n\
+         \x20   z.writestr('minipkg-1.0.dist-info/WHEEL', 'Wheel-Version: 1.0\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n')\n\
+         \x20   z.writestr('minipkg-1.0.dist-info/RECORD', '')\n",
+        whl.to_str().unwrap()
+    );
+    ok(dir, &["run", "python", "-c", &script]);
+    whl
+}
+
+fn append_policy(dir: &Path, extra: &str) {
+    let path = dir.join("pyproject.toml");
+    let text = read(&path).replace("deny = []", &format!("deny = []\n{extra}"));
+    fs::write(&path, text).unwrap();
+}
+
+#[test]
+fn tasks_and_inline_scripts_run_in_the_right_env() {
+    let tmp = TempDir::new("tasks");
+    let dir = &tmp.0;
+    init(dir);
+    let path = dir.join("pyproject.toml");
+    let text = read(&path)
+        + "\n[tool.vivar.scripts]\nwhere = \"python -c 'import sys; print(\\\"at\\\", sys.prefix)'\"\ncalc = \"python -c\"\n";
+    fs::write(&path, text).unwrap();
+
+    let out = ok(dir, &["run", "where"]);
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.starts_with("at ") && stdout.contains(".venv"),
+        "{stdout}"
+    );
+    // Extra arguments append to the task's command line.
+    let out = ok(dir, &["run", "calc", "print(1 + 1)"]);
+    assert_eq!(stdout_of(&out).trim(), "2");
+
+    // A PEP 723 script gets its own cached environment, outside the project.
+    let script = dir.join("tool.py");
+    fs::write(
+        &script,
+        "# /// script\n# dependencies = [\"six\"]\n# ///\nimport six, sys\nprint(six.__version__, sys.argv[1:], '.venv' in sys.prefix)\n",
+    )
+    .unwrap();
+    let cache = dir.join("cache");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_vivar"))
+            .current_dir(dir)
+            .env("VIVAR_CACHE_DIR", &cache)
+            .env("UV_CACHE_DIR", dir.join("uv-cache"))
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let out = run(&["run", "tool.py", "--flag"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("['--flag'] False"), "{stdout}");
+    assert!(cache.join("scripts").is_dir());
+
+    let out = run(&["env", "list"]);
+    assert!(stdout_of(&out).contains("scripts"), "{}", stdout_of(&out));
+    let out = run(&["clean"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!cache.join("scripts").exists());
+}
+
+#[test]
+fn tools_get_their_own_env_and_linked_commands() {
+    let tmp = TempDir::new("tools");
+    let home = tmp.0.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let run = |args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_vivar"));
+        cmd.current_dir(&tmp.0)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("APPDATA", &home)
+            .env("XDG_DATA_HOME", home.join("data"))
+            .env("UV_CACHE_DIR", home.join("uv-cache"))
+            .env("UV_PYTHON_INSTALL_DIR", real_python_dir())
+            .args(args);
+        cmd.output().unwrap()
+    };
+    let out = run(&["tool", "run", "pycodestyle", "--version"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout_of(&out).trim().starts_with('2'),
+        "{}",
+        stdout_of(&out)
+    );
+
+    let out = run(&["tool", "install", "pycodestyle"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let link = home.join(".local").join("bin").join(exe("pycodestyle"));
+    assert!(link.exists(), "no linked command at {}", link.display());
+    let out = Command::new(&link).arg("--version").output().unwrap();
+    assert!(out.status.success());
+
+    let out = run(&["tool", "list"]);
+    assert!(
+        stdout_of(&out).contains("pycodestyle"),
+        "{}",
+        stdout_of(&out)
+    );
+    let out = run(&["tool", "uninstall", "pycodestyle"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!link.exists());
+    assert!(!run(&["tool", "uninstall", "pycodestyle"]).status.success());
+}
+
+#[test]
+fn tree_why_outdated_upgrade_and_build() {
+    let tmp = TempDir::new("tree");
+    let dir = &tmp.0;
+    init(dir);
+    ok(dir, &["add", "pytest"]);
+
+    let tree = stdout_of(&ok(dir, &["tree"]));
+    assert!(
+        tree.contains("pytest v") && tree.contains("pluggy v"),
+        "{tree}"
+    );
+    assert!(tree.starts_with("demo v0.1.0"), "{tree}");
+    let why = stdout_of(&ok(dir, &["why", "pluggy"]));
+    assert!(
+        why.contains("demo v0.1.0 -> pytest v") && why.ends_with("pluggy v1.6.0\n")
+            || why.contains("-> pluggy v"),
+        "{why}"
+    );
+    fails_with(dir, &["why", "nope"], "not in the lockfile");
+
+    let out = ok(dir, &["outdated"]);
+    let text = format!(
+        "{}{}",
+        stdout_of(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text.contains("No lockfile changes") || text.contains("Would"),
+        "{text}"
+    );
+    ok(dir, &["upgrade-deps", "pytest"]);
+    ok(dir, &["upgrade-deps"]);
+
+    // Building needs a backend; hatchling is the smallest.
+    let path = dir.join("pyproject.toml");
+    let text = read(&path)
+        + "\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n";
+    fs::write(&path, text).unwrap();
+    fs::create_dir_all(dir.join("src").join("demo")).unwrap();
+    fs::write(dir.join("src").join("demo").join("__init__.py"), "").unwrap();
+    ok(dir, &["build"]);
+    let wheels: Vec<_> = fs::read_dir(dir.join("dist"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "whl"))
+        .collect();
+    assert_eq!(wheels.len(), 1);
+}
+
+#[test]
+fn license_policy_blocks_and_rolls_back() {
+    let tmp = TempDir::new("licenses");
+    let dir = &tmp.0;
+    init(dir);
+    append_policy(dir, "allow-licenses = [\"MIT\"]");
+
+    ok(dir, &["add", "six"]);
+    // colorama is BSD: refused, and the add is undone.
+    fails_with(dir, &["add", "colorama"], "licenses outside");
+    assert!(!read(&dir.join("pyproject.toml")).contains("colorama"));
+    let listing = stdout_of(&ok(dir, &["licenses"]));
+    assert!(
+        listing.contains("six") && listing.contains("MIT"),
+        "{listing}"
+    );
+    assert!(!listing.contains("colorama"), "{listing}");
+
+    append_policy(dir, "license-exceptions = [\"colorama\"]");
+    ok(dir, &["add", "colorama"]);
+    assert!(stdout_of(&ok(dir, &["licenses"])).contains("BSD"));
+}
+
+#[test]
+fn org_policy_and_require_hashes() {
+    let tmp = TempDir::new("orgpolicy");
+    let dir = &tmp.0;
+    init(dir);
+    let org = tmp.0.join("org-policy.toml");
+    fs::write(&org, "[policy]\ndeny = [\"six\"]\nrequire-hashes = true\n").unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_vivar"))
+            .current_dir(dir)
+            .env("VIVAR_POLICY", &org)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let out = run(&["add", "six"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("deny list"));
+    let out = run(&["add", "pycodestyle"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A wheel from disk is not a hashed registry artifact: refused and rolled back.
+    let whl = make_wheel(dir, &tmp.0.join("wheels"));
+    let out = run(&["add", whl.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("require-hashes"), "{stderr}");
+    assert!(!read(&dir.join("pyproject.toml")).contains("minipkg"));
+
+    let doctor = stdout_of(&ok(dir, &["doctor"]));
+    assert!(doctor.contains("org policy"), "{doctor}");
+}
+
+#[test]
+fn bundle_integrity_and_diff() {
+    let tmp = TempDir::new("integrity");
+    let dir = &tmp.0;
+    init(dir);
+    ok(dir, &["add", "six"]);
+    let a = tmp.0.join("a.tar.gz");
+    ok(dir, &["pack", "-o", a.to_str().unwrap()]);
+    ok(dir, &["add", "pycodestyle"]);
+    let b = tmp.0.join("b.tar.gz");
+    ok(dir, &["pack", "-o", b.to_str().unwrap()]);
+
+    let diff = stdout_of(&ok(
+        &tmp.0,
+        &["diff", a.to_str().unwrap(), b.to_str().unwrap()],
+    ));
+    assert!(diff.contains("+ pycodestyle"), "{diff}");
+    assert!(!diff.contains("six"), "{diff}");
+    assert_eq!(
+        stdout_of(&ok(
+            &tmp.0,
+            &["diff", a.to_str().unwrap(), a.to_str().unwrap()]
+        ))
+        .trim(),
+        "no differences"
+    );
+
+    // A clean unpack verifies; a tampered one is caught at unpack and by verify.
+    let good = tmp.0.join("good");
+    ok(
+        &tmp.0,
+        &["unpack", a.to_str().unwrap(), good.to_str().unwrap()],
+    );
+    assert!(stdout_of(&ok(&good, &["verify"])).contains("integrity: all bundled files match"));
+    let six = site_packages(&good).join("six.py");
+    let mut text = read(&six);
+    text.push_str("\n# tampered\n");
+    fs::write(&six, text).unwrap();
+    let out = vivar(&good, &["verify"]);
+    assert!(!out.status.success());
+    assert!(
+        stdout_of(&out).contains("six.py (modified)"),
+        "{}",
+        stdout_of(&out)
+    );
+
+    let status = Command::new("tar")
+        .current_dir(&good)
+        .args(["-czf", tmp.0.join("tampered.tar.gz").to_str().unwrap(), "."])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    fails_with(
+        &tmp.0,
+        &[
+            "unpack",
+            tmp.0.join("tampered.tar.gz").to_str().unwrap(),
+            tmp.0.join("bad").to_str().unwrap(),
+        ],
+        "integrity check",
+    );
+}
+
+#[test]
+fn doctor_env_completions_and_docker_export() {
+    let tmp = TempDir::new("misc");
+    let dir = &tmp.0;
+    init(dir);
+    assert!(stdout_of(&ok(dir, &["completions", "bash"])).contains("vivar"));
+    assert!(stdout_of(&ok(dir, &["completions", "powershell"])).contains("vivar"));
+    let doctor = stdout_of(&ok(dir, &["doctor"]));
+    assert!(
+        doctor.contains("project `demo`") && doctor.contains(".venv interpreter runs"),
+        "{doctor}"
+    );
+    let envs = stdout_of(&ok(dir, &["env", "list"]));
+    assert!(
+        envs.contains("python") && envs.contains("project"),
+        "{envs}"
+    );
+    let docker = stdout_of(&ok(dir, &["export", "docker", "-o", "-"]));
+    assert!(
+        docker.starts_with("# Generated")
+            && docker.contains("FROM python:3.12-slim")
+            && docker.contains("uv sync"),
+        "{docker}"
+    );
+    ok(dir, &["export", "docker"]);
+    assert!(dir.join("Dockerfile").is_file());
+}
+
+#[test]
+fn workspace_members_share_the_root_env() {
+    let tmp = TempDir::new("workspace");
+    let root = &tmp.0;
+    fs::write(
+        root.join("pyproject.toml"),
+        "[project]\nname = \"ws\"\nversion = \"0.1.0\"\nrequires-python = \">=3.12\"\ndependencies = []\n\n[tool.uv.workspace]\nmembers = [\"pkgs/*\"]\n\n[tool.vivar.policy]\ndeny = [\"left-pad\"]\n",
+    )
+    .unwrap();
+    fs::write(root.join(".python-version"), "3.12\n").unwrap();
+    let member = root.join("pkgs").join("a");
+    fs::create_dir_all(member.join("src").join("a")).unwrap();
+    fs::write(member.join("src").join("a").join("__init__.py"), "").unwrap();
+    fs::write(
+        member.join("pyproject.toml"),
+        "[project]\nname = \"a\"\nversion = \"0.1.0\"\nrequires-python = \">=3.12\"\ndependencies = [\"six\"]\n\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n",
+    )
+    .unwrap();
+
+    ok(&member, &["sync"]);
+    assert!(root.join(".venv").join("pyvenv.cfg").is_file());
+    assert!(!member.join(".venv").exists());
+    let out = ok(
+        &member,
+        &["run", "python", "-c", "import six, a; print('ok')"],
+    );
+    assert_eq!(stdout_of(&out).trim(), "ok");
+    assert!(stdout_of(&ok(&member, &["tree"])).contains("six v"));
+    // The root's policy reaches members.
+    fails_with(&member, &["add", "left-pad"], "deny list");
+}

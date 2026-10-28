@@ -152,7 +152,7 @@ We never write our own SAT/PubGrub resolver or wheel/conda package parsers. Thos
 | Phase | Scope | Exit criteria |
 |---|---|---|
 | **0: MVP** ✅ | CLI + `[tool.vivar]` defaults + deny policy, `UvBackend` for init/add/remove/lock/sync/run/python | Team can use it daily for pure-Python projects |
-| **1: Own the core** | In-process resolver + installer + Python downloads, `vivar.lock`, global cache | No `uv` binary needed, speed on par with uv |
+| **1: Own the core** | In-process resolver + installer, `vivar.lock`, global cache (venvs, Python downloads, run ✅) | No `uv` binary needed, speed on par with uv |
 | **2: Native deps** | rattler integration, `--native`, unified conda-forge + PyPI solve | GPU/GDAL project fully reproducible from the lock |
 | **3: Policy** | License allowlist, vulnerability audit (OSV), mirrors/offline, org policy file, `export docker` | `vivar audit` runs in CI and passes |
 | **4: Polish** | Workspaces, PEP 723 scripts, `tool run`, tasks (installers ✅) | — |
@@ -161,7 +161,12 @@ We never write our own SAT/PubGrub resolver or wheel/conda package parsers. Thos
 
 Phase 0 is done (`src/`, 14 tests, CI in `.github/workflows/ci.yml`):
 
-- `init`, `add [--group]`, `remove`, `lock`, `sync`, `run`, `python install|list` via `UvBackend`.
+- `init`, `run`, `python install|list` and `.venv` creation are vivar's own: projects are
+  written with `toml_edit`, venvs are built by hand on uv-compatible managed CPython builds
+  (python-build-standalone, downloaded via the release's `SHA256SUMS` list), `run` execs
+  with the env first on PATH. Only system Pythons are never used, so every env is relocatable.
+- `add [--group]`, `remove`, `lock`, `sync` via `UvBackend`; `init` falls back gracefully
+  when uv is absent (no lockfile until the first `add`).
 - `init` creates exactly `pyproject.toml`, `.python-version`, `.venv`, `uv.lock` (`--no-sync` skips the last two). No sample code, README or git init.
 - Deny list enforced on `add` **and** on every dependency declared in `pyproject.toml`
   at `lock`/`sync`/`run`, so hand edits can't bypass it. Project discovery walks up

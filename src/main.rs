@@ -1,10 +1,12 @@
 mod backend;
 mod bundle;
 mod project;
+mod python;
 mod upgrade;
+mod venv;
 mod verify;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use backend::{Backend, UvBackend};
 use clap::{Parser, Subcommand};
 use project::Project;
@@ -100,8 +102,11 @@ enum Command {
 enum PythonCommand {
     /// Install a Python version
     Install { version: String },
-    /// List installed and available Python versions
-    List,
+    /// List installed Python versions (`--all` adds the available downloads)
+    List {
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -121,22 +126,37 @@ fn main() -> Result<()> {
             python,
             no_sync,
         } => {
-            backend.init(&cwd, name.as_deref(), python.as_deref())?;
-            project::write_defaults(&cwd)?;
+            if cwd.join(project::PYPROJECT).exists() {
+                bail!(
+                    "{} already exists; this is already a project",
+                    cwd.display()
+                );
+            }
+            let interpreter = venv::interpreter(python.as_deref())?;
+            let name = name.unwrap_or_else(|| project::default_name(&cwd));
+            project::init_files(&cwd, &name, interpreter.version)?;
+            println!(
+                "Initialized project `{name}` on CPython {}",
+                interpreter.version_string()
+            );
             if !no_sync {
-                // Reload: init may have run in a directory with no project before.
-                let project = Project::require(&cwd)?;
-                let backend = UvBackend::new(&project.policy());
-                backend.sync(&cwd)?;
+                venv::ensure(&cwd, &name)?;
+                if backend::uv_available() {
+                    backend.lock(&cwd)?;
+                } else {
+                    println!("note: uv is not installed; uv.lock will be written on the first `vivar add`");
+                }
             }
         }
         Command::Add { packages, group } => {
             let project = require(project, &cwd)?;
             project.check_requirements(&packages)?;
+            venv::ensure(&project.root, &project.name())?;
             backend.add(&cwd, &packages, group.as_deref())?;
         }
         Command::Remove { packages } => {
-            require(project, &cwd)?;
+            let project = require(project, &cwd)?;
+            venv::ensure(&project.root, &project.name())?;
             backend.remove(&cwd, &packages)?;
         }
         Command::Lock => {
@@ -144,20 +164,20 @@ fn main() -> Result<()> {
             backend.lock(&cwd)?;
         }
         Command::Sync => {
-            require(project, &cwd)?.check_declared()?;
+            let project = require(project, &cwd)?;
+            project.check_declared()?;
+            venv::ensure(&project.root, &project.name())?;
             backend.sync(&cwd)?;
         }
         Command::Run { args } => {
-            // `run` also works outside a project (uv falls back to a plain
-            // interpreter), so the policy check only applies when there is one.
-            if let Some(project) = &project {
-                project.check_declared()?;
-            }
-            std::process::exit(backend.run(&cwd, &args)?);
+            let project = require(project, &cwd)?;
+            project.check_declared()?;
+            std::process::exit(venv::run(&project.root, &args)?);
         }
         Command::Pack { output } => {
             let project = require(project, &cwd)?;
             project.check_declared()?;
+            venv::ensure(&project.root, &project.name())?;
             backend.sync(&cwd)?;
             let archive = bundle::pack(&project.root, &project.name(), output.as_deref())?;
             let size = std::fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
@@ -174,7 +194,7 @@ fn main() -> Result<()> {
                 PathBuf::from(stem.trim_end_matches(".tar.gz").trim_end_matches(".tgz"))
             });
             let dest = bundle::unpack(&archive, &dest)?;
-            let bin = dest.join(".venv").join(bundle::VENV_BIN);
+            let bin = dest.join(".venv").join(venv::BIN);
             if cfg!(windows) {
                 println!(
                     "Unpacked to {}\n  activate:  {}\n  or run:    {}",
@@ -205,8 +225,10 @@ fn main() -> Result<()> {
         }
         Command::Upgrade { version, from } => upgrade::run(version.as_deref(), from.as_deref())?,
         Command::Python { command } => match command {
-            PythonCommand::Install { version } => backend.python_install(&version)?,
-            PythonCommand::List => backend.python_list()?,
+            PythonCommand::Install { version } => {
+                python::install(&version)?;
+            }
+            PythonCommand::List { all } => python::list(all)?,
         },
     }
     Ok(())

@@ -1,27 +1,33 @@
 //! Engines that do the actual resolving/installing.
 //!
-//! Phase 0 delegates to the `uv` binary. Later phases add an in-process
-//! backend (pubgrub + rattler) behind the same trait, so the CLI doesn't change.
+//! Phase 0 delegates to the `uv` binary for add/remove/lock/sync. Later phases
+//! add an in-process backend (pubgrub + rattler) behind the same trait.
 
 use crate::project::Policy;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use std::io::ErrorKind;
 use std::path::Path;
 use std::process::Command;
 
+/// Dependency resolution and installation. Everything else (projects, venvs,
+/// Python builds, running, bundles) is vivar's own.
 pub trait Backend {
-    fn init(&self, dir: &Path, name: Option<&str>, python: Option<&str>) -> Result<()>;
     fn add(&self, dir: &Path, packages: &[String], group: Option<&str>) -> Result<()>;
     fn remove(&self, dir: &Path, packages: &[String]) -> Result<()>;
     fn lock(&self, dir: &Path) -> Result<()>;
     fn sync(&self, dir: &Path) -> Result<()>;
-    /// Returns the child's exit code.
-    fn run(&self, dir: &Path, args: &[String]) -> Result<i32>;
-    fn python_install(&self, version: &str) -> Result<()>;
-    fn python_list(&self) -> Result<()>;
 }
 
 const UV_INSTALL_HINT: &str = "install it with `curl -LsSf https://astral.sh/uv/install.sh | sh`";
+
+/// Whether the `uv` binary is reachable on PATH.
+pub fn uv_available() -> bool {
+    Command::new("uv")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
 
 pub struct UvBackend {
     /// Replaces PyPI when set (`[tool.vivar.policy] index-url`): a mirror URL, or a
@@ -36,11 +42,9 @@ impl UvBackend {
         }
     }
 
-    fn uv(&self, dir: Option<&Path>) -> Command {
+    fn uv(&self, dir: &Path) -> Command {
         let mut cmd = Command::new("uv");
-        if let Some(dir) = dir {
-            cmd.current_dir(dir);
-        }
+        cmd.current_dir(dir);
         match &self.index_url {
             // A directory of wheels (an offline wheelhouse) is the only package source.
             Some(dir) if Path::new(dir).is_dir() => {
@@ -54,19 +58,15 @@ impl UvBackend {
         cmd
     }
 
-    fn exec(mut cmd: Command) -> Result<i32> {
+    fn check(mut cmd: Command) -> Result<()> {
         let status = cmd.status().map_err(|e| {
             if e.kind() == ErrorKind::NotFound {
-                anyhow!("`uv` was not found on PATH; vivar currently delegates to it. {UV_INSTALL_HINT}")
+                anyhow!("`uv` was not found on PATH; vivar currently delegates dependency resolution to it. {UV_INSTALL_HINT}")
             } else {
                 anyhow!(e).context("failed to run `uv`")
             }
         })?;
-        Ok(status.code().unwrap_or(1))
-    }
-
-    fn check(cmd: Command) -> Result<()> {
-        match Self::exec(cmd)? {
+        match status.code().unwrap_or(1) {
             0 => Ok(()),
             code => bail!("uv exited with status {code}"),
         }
@@ -74,22 +74,8 @@ impl UvBackend {
 }
 
 impl Backend for UvBackend {
-    fn init(&self, dir: &Path, name: Option<&str>, python: Option<&str>) -> Result<()> {
-        let mut cmd = self.uv(Some(dir));
-        // `--bare` skips the sample main.py, README, src/ tree and git init;
-        // `--pin-python` still writes `.python-version`.
-        cmd.args(["init", "--bare", "--pin-python"]);
-        if let Some(name) = name {
-            cmd.args(["--name", name]);
-        }
-        if let Some(python) = python {
-            cmd.args(["--python", python]);
-        }
-        Self::check(cmd).context("`vivar init` failed")
-    }
-
     fn add(&self, dir: &Path, packages: &[String], group: Option<&str>) -> Result<()> {
-        let mut cmd = self.uv(Some(dir));
+        let mut cmd = self.uv(dir);
         cmd.arg("add");
         if let Some(group) = group {
             cmd.args(["--group", group]);
@@ -99,38 +85,20 @@ impl Backend for UvBackend {
     }
 
     fn remove(&self, dir: &Path, packages: &[String]) -> Result<()> {
-        let mut cmd = self.uv(Some(dir));
+        let mut cmd = self.uv(dir);
         cmd.arg("remove").args(packages);
         Self::check(cmd)
     }
 
     fn lock(&self, dir: &Path) -> Result<()> {
-        let mut cmd = self.uv(Some(dir));
+        let mut cmd = self.uv(dir);
         cmd.arg("lock");
         Self::check(cmd)
     }
 
     fn sync(&self, dir: &Path) -> Result<()> {
-        let mut cmd = self.uv(Some(dir));
+        let mut cmd = self.uv(dir);
         cmd.arg("sync");
-        Self::check(cmd)
-    }
-
-    fn run(&self, dir: &Path, args: &[String]) -> Result<i32> {
-        let mut cmd = self.uv(Some(dir));
-        cmd.args(["run", "--"]).args(args);
-        Self::exec(cmd)
-    }
-
-    fn python_install(&self, version: &str) -> Result<()> {
-        let mut cmd = self.uv(None);
-        cmd.args(["python", "install", version]);
-        Self::check(cmd)
-    }
-
-    fn python_list(&self) -> Result<()> {
-        let mut cmd = self.uv(None);
-        cmd.args(["python", "list"]);
         Self::check(cmd)
     }
 }

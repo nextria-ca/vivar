@@ -97,8 +97,18 @@ fn upgrade(current: &Path, version: Option<&str>, from: Option<&str>, tmp: &Path
     Ok(())
 }
 
-/// GETs a URL through `gh api` (logged in) or `curl` (+ `GITHUB_TOKEN`).
-fn fetch(url: &str, accept: Option<&str>) -> Result<Vec<u8>> {
+/// GETs a URL through `gh api` (logged in, api.github.com only) or `curl` (+ `GITHUB_TOKEN`).
+pub fn fetch(url: &str, accept: Option<&str>) -> Result<Vec<u8>> {
+    Ok(fetcher(url, accept, None)?.stdout)
+}
+
+/// GETs a URL straight to a file (large downloads).
+pub fn fetch_to(url: &str, path: &Path) -> Result<()> {
+    fetcher(url, None, Some(path))?;
+    Ok(())
+}
+
+fn fetcher(url: &str, accept: Option<&str>, output: Option<&Path>) -> Result<std::process::Output> {
     let gh_ok = Command::new("gh")
         .args(["auth", "status"])
         .output()
@@ -112,9 +122,15 @@ fn fetch(url: &str, accept: Option<&str>) -> Result<Vec<u8>> {
             cmd.args(["-H", &format!("Accept: {accept}")]);
         }
         cmd.arg(url);
+        if let Some(path) = output {
+            cmd.arg("--output").arg(path);
+        }
     } else {
         cmd = Command::new("curl");
         cmd.args(["-LsSf", url]);
+        if let Some(path) = output {
+            cmd.arg("-o").arg(path);
+        }
         if let Some(accept) = accept {
             cmd.args(["-H", &format!("Accept: {accept}")]);
         }
@@ -134,7 +150,7 @@ fn fetch(url: &str, accept: Option<&str>) -> Result<Vec<u8>> {
         };
         bail!("fetching {url} failed: {err}{hint}");
     }
-    Ok(out.stdout)
+    Ok(out)
 }
 
 /// Value of the first `"key": "value"` in a JSON document (no escapes needed

@@ -10,8 +10,7 @@ use std::process::Command;
 use toml_edit::{value, DocumentMut};
 
 pub const MANIFEST: &str = "vivar-bundle.toml";
-/// Where a venv keeps its interpreter and scripts.
-pub const VENV_BIN: &str = if cfg!(windows) { "Scripts" } else { "bin" };
+pub use crate::venv::BIN as VENV_BIN;
 
 fn platform() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
@@ -19,7 +18,7 @@ fn platform() -> String {
 
 /// Absolute path without symlink resolution and without Windows' `\\?\`
 /// prefix, which Python and activate scripts don't cope with.
-fn absolute(path: &Path) -> Result<PathBuf> {
+pub fn absolute(path: &Path) -> Result<PathBuf> {
     Ok(strip_verbatim(std::path::absolute(path)?))
 }
 

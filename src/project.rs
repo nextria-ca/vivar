@@ -7,6 +7,45 @@ use toml_edit::{value, Array, DocumentMut, Item, Table};
 
 pub const PYPROJECT: &str = "pyproject.toml";
 
+/// Writes `pyproject.toml`, `.python-version` and the vivar defaults for a new project.
+pub fn init_files(root: &Path, name: &str, version: [u32; 3]) -> Result<()> {
+    let [major, minor, _] = version;
+    let mut doc = DocumentMut::new();
+    let mut project = Table::new();
+    project["name"] = value(name);
+    project["version"] = value("0.1.0");
+    project["requires-python"] = value(format!(">={major}.{minor}"));
+    project["dependencies"] = value(Array::new());
+    doc["project"] = Item::Table(project);
+    fs::write(root.join(PYPROJECT), doc.to_string())?;
+    fs::write(root.join(".python-version"), format!("{major}.{minor}\n"))?;
+    write_defaults(root)
+}
+
+/// A valid project name derived from the directory name.
+pub fn default_name(root: &Path) -> String {
+    let raw = root
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let name: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let name = name.trim_matches(|c| c == '-' || c == '.');
+    if name.is_empty() {
+        "project".to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+
 /// Settings read from `[tool.vivar.policy]`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Policy {

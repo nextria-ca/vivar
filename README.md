@@ -9,10 +9,13 @@ See [DESIGN.md](DESIGN.md) for the why and the roadmap, and
 
 ## Status
 
-Phase 0 (MVP) is implemented and tested. Under the hood it delegates to
-[`uv`](https://docs.astral.sh/uv/), so a vivar project is a plain, standards-based
-Python project: `pyproject.toml` (PEP 621), `.python-version`, a normal `.venv`,
-and `uv.lock`. Anyone without vivar can still use it with `uv` or `pip`.
+Phase 0 (MVP) is implemented and tested. Projects, virtual environments, Python
+builds, running, bundles, verification and upgrades are vivar's own code; only
+dependency resolution and installation (`add`, `remove`, `lock`, `sync`) are
+delegated to [`uv`](https://docs.astral.sh/uv/) for now. A vivar project is a
+plain, standards-based Python project: `pyproject.toml` (PEP 621),
+`.python-version`, a normal `.venv`, and `uv.lock`. Anyone without vivar can
+still use it with `uv` or `pip`.
 
 Later phases swap `uv` out for an in-process engine (and add conda-forge native
 dependencies) behind the same CLI. See the roadmap in DESIGN.md.
@@ -93,6 +96,7 @@ From source, with a Rust toolchain: `cargo install --git https://github.com/next
 | | Linux | macOS | Windows |
 |---|---|---|---|
 | init / add / lock / sync / run / python | ✅ | ✅ | ✅ |
+| activate scripts | sh/bash/zsh, PowerShell | sh/bash/zsh, PowerShell | cmd, PowerShell |
 | pack / unpack | ✅ | ✅ | ✅ (`tar.exe` ships with Windows 10+) |
 | verify | ✅ full | imports, CUDA, scripts (no `ldd` pass) | imports, CUDA (`nvcuda.dll`), scripts |
 
@@ -112,7 +116,7 @@ vivar remove pandas
 vivar lock                      # re-resolve and write the lockfile
 vivar sync                      # make .venv match the lockfile exactly
 vivar python install 3.13       # prebuilt standalone Python, no compiling
-vivar python list
+vivar python list               # --all adds what can be downloaded
 ```
 
 Commands can be run from any subdirectory of the project. `vivar run` keeps

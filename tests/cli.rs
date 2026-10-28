@@ -200,6 +200,117 @@ fn project_commands_outside_a_project_explain_themselves() {
     fails_with(dir, &["add", "six"], "run `vivar init`");
     fails_with(dir, &["sync"], "run `vivar init`");
     fails_with(dir, &["lock"], "run `vivar init`");
+    fails_with(dir, &["run", "python", "-c", "pass"], "run `vivar init`");
+}
+
+#[test]
+fn init_and_run_work_without_uv() {
+    let tmp = TempDir::new("nouv");
+    let dir = &tmp.0;
+    let no_uv = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_vivar"))
+            .current_dir(dir)
+            .env("PATH", bare_path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let out = no_uv(&["init", "demo", "--python", "3.12"]);
+    assert!(
+        out.status.success(),
+        "init without uv failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout_of(&out).contains("uv.lock will be written"));
+    assert!(dir.join("pyproject.toml").is_file());
+    assert_eq!(read(&dir.join(".python-version")).trim(), "3.12");
+    let cfg = read(&dir.join(".venv").join("pyvenv.cfg"));
+    assert!(cfg.contains("created-by = vivar"), "{cfg}");
+    assert!(!dir.join("uv.lock").exists());
+
+    // The env is a real one: its interpreter is the pinned managed build and
+    // sees the venv as its prefix.
+    let out = no_uv(&[
+        "run",
+        "python",
+        "-c",
+        "import sys; print(sys.version_info[:2] == (3, 12), sys.prefix)",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = stdout_of(&out);
+    assert!(stdout.starts_with("True "), "{stdout}");
+    assert!(
+        stdout.contains(".venv"),
+        "sys.prefix is not the venv: {stdout}"
+    );
+
+    // Exit codes come straight through; a missing program is an error, not a panic.
+    assert_eq!(
+        no_uv(&["run", "python", "-c", "raise SystemExit(3)"])
+            .status
+            .code(),
+        Some(3)
+    );
+    let out = no_uv(&["run", "definitely-not-a-program"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("definitely-not-a-program"));
+
+    // Activation in the platform's plain shell sets VIRTUAL_ENV and finds python.
+    let venv = dir.join(".venv");
+    #[cfg(unix)]
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            ". '{}/bin/activate' && printf '%s\\n' \"$VIRTUAL_ENV\" && python -c 'import sys; print(sys.prefix)' && deactivate && [ -z \"$VIRTUAL_ENV\" ]",
+            venv.display()
+        ))
+        .output()
+        .unwrap();
+    #[cfg(windows)]
+    let out = {
+        let script = dir.join("activate-check.cmd");
+        fs::write(
+            &script,
+            format!(
+                "@echo off\r\ncall \"{v}\\Scripts\\activate.bat\"\r\necho %VIRTUAL_ENV%\r\npython -c \"import sys; print(sys.prefix)\"\r\ncall deactivate.bat\r\nif defined VIRTUAL_ENV exit /b 9\r\n",
+                v = venv.display()
+            ),
+        )
+        .unwrap();
+        Command::new("cmd")
+            .args(["/C", script.to_str().unwrap()])
+            .env("PATH", bare_path())
+            .output()
+            .unwrap()
+    };
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = stdout_of(&out);
+    let mut lines = stdout.lines().map(str::trim);
+    assert_eq!(lines.next().unwrap(), venv.to_string_lossy());
+    assert_eq!(lines.next().unwrap(), venv.to_string_lossy());
+
+    // uv can take over the same env later.
+    ok(dir, &["add", "six"]);
+    assert!(dir.join("uv.lock").is_file());
+    ok(dir, &["run", "python", "-c", "import six"]);
+}
+
+#[test]
+fn python_list_shows_managed_builds() {
+    let tmp = TempDir::new("pylist");
+    let out = ok(&tmp.0, &["python", "list"]);
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("cpython-3.12."), "{stdout}");
+    assert!(stdout.contains("cpython-3.12.") && !stdout.contains("download available"));
 }
 
 #[test]

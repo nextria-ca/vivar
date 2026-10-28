@@ -310,11 +310,18 @@ fn pack_and_unpack_produce_a_self_contained_env() {
         .unwrap();
     #[cfg(windows)]
     let out = {
-        use std::os::windows::process::CommandExt;
+        // Separate lines: cmd expands %VIRTUAL_ENV% when it parses a line, so it
+        // must be read on a line after the one that calls activate.bat.
+        let script = tmp.0.join("activate-check.cmd");
+        fs::write(
+            &script,
+            format!(
+                "@echo off\r\ncall \"{venv_s}\\Scripts\\activate.bat\"\r\necho %VIRTUAL_ENV%\r\npython -c \"import six, sys; print(sys.executable)\"\r\n"
+            ),
+        )
+        .unwrap();
         Command::new("cmd")
-            .raw_arg(format!(
-                "/C \"call \"{venv_s}\\Scripts\\activate.bat\" && echo %VIRTUAL_ENV% && python -c \"import six, sys; print(sys.executable)\"\""
-            ))
+            .args(["/C", script.to_str().unwrap()])
             .output()
             .unwrap()
     };

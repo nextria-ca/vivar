@@ -100,12 +100,35 @@ pub fn pack(root: &Path, name: &str, output: Option<&Path>) -> Result<PathBuf> {
 
     let mm = major_minor(&version);
     let mut tar = Command::new("tar");
-    tar.arg("-czf")
-        .arg(&output)
-        .arg("--exclude=__pycache__")
-        // CPython's own test suite: ~25 MB nobody runs from a bundle.
-        .arg(format!("--exclude={python_dir}/lib/python{mm}/test"))
-        .arg(format!("--exclude={python_dir}/Lib/test"))
+    tar.arg("-czf").arg(&output);
+    // A bundle is a frozen environment: no bytecode caches, tool caches, or the
+    // runtime's own installer/IDE/test baggage. `lib/pythonX.Y` is the Unix
+    // layout, `Lib` the Windows one.
+    let junk = [
+        "__pycache__",
+        "*.pyc",
+        "*.pyo",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".hypothesis",
+        ".venv/CACHEDIR.TAG",
+        ".venv/.gitignore",
+        ".venv/.lock",
+    ];
+    for pattern in junk {
+        tar.arg(format!("--exclude={pattern}"));
+    }
+    for stdlib in [format!("lib/python{mm}"), "Lib".to_owned()] {
+        // test suite (~25 MB), pip/ensurepip (a uv venv never uses them), IDLE
+        for dir in ["test", "site-packages", "ensurepip", "idlelib"] {
+            tar.arg(format!("--exclude={python_dir}/{stdlib}/{dir}"));
+        }
+    }
+    for demos in ["lib/*/demos", "tcl/*/demos"] {
+        tar.arg(format!("--exclude={python_dir}/{demos}"));
+    }
+    tar.arg(format!("--exclude={python_dir}/share/man"))
         .arg("-C")
         .arg(&staging)
         .arg(MANIFEST)

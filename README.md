@@ -122,7 +122,8 @@ source my-app-linux-x86_64/.venv/bin/activate
 
 The archive holds the synced `.venv`, `pyproject.toml`, `uv.lock`,
 `.python-version`, and the exact standalone Python the venv uses, minus
-`__pycache__` and CPython's own test suite. `unpack` extracts it and rewrites
+everything a frozen environment doesn't need: bytecode and tool caches, uv's venv
+marker files, and the runtime's own test suite, pip/ensurepip, IDLE and Tk demos. `unpack` extracts it and rewrites
 the paths in `pyvenv.cfg`, the interpreter symlinks, console-script shebangs,
 and the activate scripts to the new location. On Windows the `.exe` launchers
 embed the interpreter path in a resource; `unpack` patches it to a relative

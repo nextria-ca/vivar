@@ -167,7 +167,8 @@ Phase 0 is done (`src/`, 14 tests, CI in `.github/workflows/ci.yml`):
   at `lock`/`sync`/`run`, so hand edits can't bypass it. Project discovery walks up
   from the current directory like uv does.
 - `pack`/`unpack`: tarball of `.venv` + project files + the exact python-build-standalone
-  install (minus `__pycache__` and the stdlib test suite, ~35 MB for a small app). `unpack`
+  install, pruned of caches (`__pycache__`, `*.pyc`, pytest/mypy/ruff caches, venv marker
+  files) and runtime baggage (stdlib tests, pip/ensurepip, IDLE, Tk demos; ~35 MB for a small app). `unpack`
   relinks `bin/python*`, rewrites `pyvenv.cfg`, shebangs and activate scripts, and refuses
   a different OS/arch. Target machine needs only `tar`.
 - `verify`: a Python script embedded in the binary runs with the env's interpreter (no uv):

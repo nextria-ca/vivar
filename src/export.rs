@@ -31,12 +31,18 @@ fn python_series(project: &Project) -> String {
                     .map(|v| v.trim_start_matches([' ', '=']).trim().to_owned())
             })
         });
-    let version = from_pin
-        .or(from_requires)
-        .or(from_env)
-        .unwrap_or_else(|| "3.12".to_owned());
-    // Only major.minor names an official image tag.
-    version.split('.').take(2).collect::<Vec<_>>().join(".")
+    // An exact pin names an exact image tag (python:3.12.4-slim exists); a
+    // floor from requires-python or the env only fixes the series.
+    match from_pin {
+        Some(pin) => pin.split('.').take(3).collect::<Vec<_>>().join("."),
+        None => from_requires
+            .or(from_env)
+            .unwrap_or_else(|| "3.12".to_owned())
+            .split('.')
+            .take(2)
+            .collect::<Vec<_>>()
+            .join("."),
+    }
 }
 
 pub fn dockerfile(project: &Project, policy: &Policy) -> Result<String> {

@@ -10,7 +10,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Commands this env linked into `~/.local/bin`, one per line.
+/// Command files this env linked into `~/.local/bin`, one per line.
 const LINKS: &str = "vivar-links.txt";
 /// The requirement and Python request the env was built from.
 const SPEC: &str = "vivar-tool.txt";
@@ -19,8 +19,31 @@ pub fn tools_dir() -> Result<PathBuf> {
     Ok(dirs::data()?.join("tools"))
 }
 
+/// A tool's env directory. Only bare package names make keys: a path or URL
+/// requirement must say which package it is (`name @ ./path`).
 fn tool_env(name: &str) -> Result<PathBuf> {
-    Ok(tools_dir()?.join(project::normalize(name)))
+    let name = project::normalize(name);
+    let plain = !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'));
+    if !plain {
+        bail!("cannot name a tool after {name:?}; use `--from \"<name> @ <path-or-url>\"`");
+    }
+    let dir = tools_dir()?;
+    let env = dir.join(&name);
+    if !env.starts_with(&dir) {
+        bail!("refusing to use {} as a tool environment", env.display());
+    }
+    Ok(env)
+}
+
+/// A command an env provides: how it's shown, and the file in its bin directory.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Cmd {
+    name: String,
+    file: String,
 }
 
 /// Builds `env` on `interpreter` and installs `specs` into it, under `policy`.
@@ -59,8 +82,12 @@ pub fn ensure(
     package: &str,
     python_request: Option<&str>,
 ) -> Result<PathBuf> {
-    let name = project::normalize(project::requirement_name(package));
-    let env = tool_env(&name)?;
+    let env = tool_env(project::requirement_name(package))?;
+    let name = env
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
     let wanted = format!("{package}\n{}\n", python_request.unwrap_or(""));
     if env.join("pyvenv.cfg").exists()
         && fs::read_to_string(env.join(SPEC)).ok() == Some(wanted.clone())
@@ -74,6 +101,7 @@ pub fn ensure(
         )?;
         return Ok(env);
     }
+    let previously_linked = links_of(&env);
     if env.exists() {
         remove_links(&env);
         fs::remove_dir_all(&env)?;
@@ -88,6 +116,14 @@ pub fn ensure(
         &[package.to_owned()],
     )?;
     fs::write(env.join(SPEC), wanted)?;
+    if !previously_linked.is_empty() {
+        // An installed tool stays installed when a run rebuilds its env.
+        let commands: Vec<Cmd> = commands_of(&env)?
+            .into_iter()
+            .filter(|c| previously_linked.contains(&c.file))
+            .collect();
+        link_commands(&env, &commands)?;
+    }
     Ok(env)
 }
 
@@ -99,33 +135,21 @@ pub fn install(
     python: Option<&str>,
 ) -> Result<()> {
     let env = ensure(backend, policy, package, python)?;
-    let bin = dirs::bin()?;
-    fs::create_dir_all(&bin)?;
-    let scripts = commands_of(&env)?;
-    if scripts.is_empty() {
+    let commands = commands_of(&env)?;
+    if commands.is_empty() {
         println!(
             "installed {package} into {} (it provides no commands)",
             env.display()
         );
         return Ok(());
     }
-    let mine = links_of(&env);
-    for script in &scripts {
-        let link = bin.join(exe(script));
-        if link.exists() && !mine.contains(script) && !owned_by_a_tool(script)? {
-            bail!(
-                "refusing to replace {}: it was not installed by vivar",
-                link.display()
-            );
-        }
-        let _ = fs::remove_file(&link);
-        link_or_copy(&env.join(venv::BIN).join(exe(script)), &link)?;
-    }
-    fs::write(env.join(LINKS), scripts.join("\n") + "\n")?;
+    link_commands(&env, &commands)?;
+    let bin = dirs::bin()?;
+    let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
     println!(
         "installed {}: {} in {}",
         package,
-        scripts.join(", "),
+        names.join(", "),
         bin.display()
     );
     if !std::env::var_os("PATH")
@@ -137,15 +161,67 @@ pub fn install(
     Ok(())
 }
 
+/// Links `commands` from `env` into `~/.local/bin`. Every collision is checked
+/// before anything is touched, and the ownership manifest is written last.
+fn link_commands(env: &Path, commands: &[Cmd]) -> Result<()> {
+    let bin = dirs::bin()?;
+    fs::create_dir_all(&bin)?;
+    for c in commands {
+        let link = bin.join(&c.file);
+        if link.symlink_metadata().is_ok() && !is_tool_link(&link)? {
+            bail!(
+                "refusing to replace {}: it was not installed by vivar",
+                link.display()
+            );
+        }
+    }
+    for c in commands {
+        let link = bin.join(&c.file);
+        let _ = fs::remove_file(&link);
+        link_or_copy(&env.join(venv::BIN).join(&c.file), &link)?;
+    }
+    let files: Vec<&str> = commands.iter().map(|c| c.file.as_str()).collect();
+    fs::write(env.join(LINKS), files.join("\n") + "\n")?;
+    Ok(())
+}
+
+/// Whether a file in `~/.local/bin` points into (Unix) or is a copy of a
+/// command in (Windows) one of vivar's tool environments.
+fn is_tool_link(link: &Path) -> Result<bool> {
+    let tools = tools_dir()?;
+    #[cfg(unix)]
+    {
+        Ok(fs::read_link(link)
+            .map(|target| target.starts_with(&tools))
+            .unwrap_or(false))
+    }
+    #[cfg(windows)]
+    {
+        let Some(name) = link.file_name() else {
+            return Ok(false);
+        };
+        let Ok(mine) = fs::read(link) else {
+            return Ok(false);
+        };
+        let Ok(entries) = fs::read_dir(&tools) else {
+            return Ok(false);
+        };
+        Ok(entries.flatten().any(|e| {
+            fs::read(e.path().join(venv::BIN).join(name))
+                .map(|theirs| theirs == mine)
+                .unwrap_or(false)
+        }))
+    }
+}
+
 pub fn uninstall(package: &str) -> Result<()> {
-    let name = project::normalize(package);
-    let env = tool_env(&name)?;
+    let env = tool_env(package)?;
     if !env.exists() {
-        bail!("tool {name} is not installed");
+        bail!("tool {} is not installed", project::normalize(package));
     }
     remove_links(&env);
     fs::remove_dir_all(&env)?;
-    println!("uninstalled {name}");
+    println!("uninstalled {}", project::normalize(package));
     Ok(())
 }
 
@@ -170,10 +246,10 @@ pub fn list() -> Result<()> {
         let shown: Vec<String> = commands
             .iter()
             .map(|c| {
-                if linked.contains(c) {
-                    format!("{c} (linked)")
+                if linked.contains(&c.file) {
+                    format!("{} (linked)", c.name)
                 } else {
-                    c.clone()
+                    c.name.clone()
                 }
             })
             .collect();
@@ -198,11 +274,11 @@ pub fn run(
 }
 
 /// Commands an env provides: `[console_scripts]` entry points plus any
-/// executables wheels dropped straight into the bin directory (recorded in RECORD).
-fn commands_of(env: &Path) -> Result<Vec<String>> {
+/// executables wheels dropped straight into the bin directory (per RECORD).
+fn commands_of(env: &Path) -> Result<Vec<Cmd>> {
     let site = venv::site_packages(env)?;
     let bin = fs::canonicalize(env.join(venv::BIN))?;
-    let mut scripts = Vec::new();
+    let mut scripts: Vec<Cmd> = Vec::new();
     for entry in fs::read_dir(&site)?.flatten() {
         let path = entry.path();
         if !path.extension().is_some_and(|e| e == "dist-info") {
@@ -215,7 +291,11 @@ fn commands_of(env: &Path) -> Result<Vec<String>> {
                     in_console = line == "[console_scripts]";
                 } else if in_console {
                     if let Some((name, _)) = line.split_once('=') {
-                        scripts.push(name.trim().to_owned());
+                        let name = name.trim().to_owned();
+                        scripts.push(Cmd {
+                            file: exe(&name),
+                            name,
+                        });
                     }
                 }
             }
@@ -231,14 +311,18 @@ fn commands_of(env: &Path) -> Result<Vec<String>> {
                 let Ok(full) = fs::canonicalize(site.join(file)) else {
                     continue;
                 };
-                if full.parent() == Some(bin.as_path()) {
-                    if let Some(name) = full.file_name().and_then(|n| n.to_str()) {
-                        let name = name
-                            .strip_suffix(std::env::consts::EXE_SUFFIX)
-                            .unwrap_or(name);
-                        if !name.starts_with("python") && !name.starts_with("activate") {
-                            scripts.push(name.to_owned());
-                        }
+                if full.parent() != Some(bin.as_path()) {
+                    continue;
+                }
+                if let Some(file) = full.file_name().and_then(|n| n.to_str()) {
+                    let name = file
+                        .strip_suffix(std::env::consts::EXE_SUFFIX)
+                        .unwrap_or(file);
+                    if !name.starts_with("python") && !name.starts_with("activate") {
+                        scripts.push(Cmd {
+                            name: name.to_owned(),
+                            file: file.to_owned(),
+                        });
                     }
                 }
             }
@@ -260,21 +344,14 @@ fn links_of(env: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Whether some tool env (not necessarily this one) linked `command`.
-fn owned_by_a_tool(command: &str) -> Result<bool> {
-    let Ok(entries) = fs::read_dir(tools_dir()?) else {
-        return Ok(false);
-    };
-    Ok(entries
-        .flatten()
-        .any(|e| links_of(&e.path()).iter().any(|l| l == command)))
-}
-
-/// Removes the commands this env linked, and only those.
+/// Removes the commands this env linked, and only those that still belong to it.
 pub fn remove_links(env: &Path) {
     let Ok(bin) = dirs::bin() else { return };
-    for command in links_of(env) {
-        let _ = fs::remove_file(bin.join(exe(&command)));
+    for file in links_of(env) {
+        let link = bin.join(&file);
+        if is_tool_link(&link).unwrap_or(false) {
+            let _ = fs::remove_file(&link);
+        }
     }
     let _ = fs::remove_file(env.join(LINKS));
 }
@@ -396,6 +473,17 @@ pub fn run_script(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_names_must_be_plain() {
+        assert!(tool_env("Ruff").is_ok());
+        assert!(tool_env("my_tool.cli").is_ok());
+        assert!(tool_env("/tmp/my-tool").is_err());
+        assert!(tool_env("../x").is_err());
+        assert!(tool_env("C:\\tools\\x").is_err());
+        assert!(tool_env("").is_err());
+        assert!(tool_env("git+https://x/y").is_err());
+    }
 
     #[test]
     fn parses_inline_metadata() {

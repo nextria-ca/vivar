@@ -808,6 +808,25 @@ fn tools_get_their_own_env_and_linked_commands() {
     assert_eq!(read(&link), "someone else's");
     fs::remove_file(&link).unwrap();
 
+    // A link into a tool env from before ownership was recorded is still ours.
+    #[cfg(unix)]
+    {
+        let env_bin = home
+            .join("data")
+            .join("vivar")
+            .join("tools")
+            .join("pycodestyle")
+            .join("bin")
+            .join("pycodestyle");
+        std::os::unix::fs::symlink(&env_bin, &link).unwrap();
+        let out = run(&["tool", "install", "pycodestyle"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     let out = run(&["tool", "install", "pycodestyle"]);
     assert!(
         out.status.success(),
@@ -1050,6 +1069,14 @@ fn doctor_env_completions_and_docker_export() {
     );
     ok(dir, &["export", "docker"]);
     assert!(dir.join("Dockerfile").is_file());
+
+    // An exact pin names an exact image; no pin falls back to requires-python.
+    fs::write(dir.join(".python-version"), "3.12.4\n").unwrap();
+    assert!(
+        stdout_of(&ok(dir, &["export", "docker", "-o", "-"])).contains("FROM python:3.12.4-slim")
+    );
+    fs::remove_file(dir.join(".python-version")).unwrap();
+    assert!(stdout_of(&ok(dir, &["export", "docker", "-o", "-"])).contains("FROM python:3.12-slim"));
 }
 
 #[test]

@@ -16,6 +16,8 @@ pub trait Backend {
     fn remove(&self, dir: &Path, packages: &[String]) -> Result<()>;
     fn lock(&self, dir: &Path) -> Result<()>;
     fn sync(&self, dir: &Path) -> Result<()>;
+    /// Like `sync`, also installing the named dependency group.
+    fn sync_group(&self, dir: &Path, group: Option<&str>) -> Result<()>;
     /// Re-resolves `packages` (all when empty) to their newest allowed versions;
     /// `dry_run` only reports what would change.
     fn upgrade(&self, dir: &Path, packages: &[String], dry_run: bool) -> Result<()>;
@@ -104,8 +106,15 @@ impl Backend for UvBackend {
     }
 
     fn sync(&self, dir: &Path) -> Result<()> {
+        self.sync_group(dir, None)
+    }
+
+    fn sync_group(&self, dir: &Path, group: Option<&str>) -> Result<()> {
         let mut cmd = self.uv(dir);
         cmd.arg("sync");
+        if let Some(group) = group {
+            cmd.args(["--group", group]);
+        }
         Self::check(cmd)
     }
 

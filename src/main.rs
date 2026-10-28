@@ -272,7 +272,8 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                let _ = backend.sync(&cwd);
+                // Keep the group that was being added to installed, as before the add.
+                let _ = backend.sync_group(&cwd, group.as_deref());
                 return Err(e);
             }
         }

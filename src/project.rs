@@ -394,30 +394,57 @@ pub fn write_defaults(root: &Path) -> Result<()> {
     fs::write(&path, project.doc.to_string()).with_context(|| format!("writing {}", path.display()))
 }
 
-/// uv-style workspace globs: `*` within one path segment, `**` across segments.
+/// uv-style workspace globs: `*` and `?` within one path segment, `[...]`
+/// classes (with `!` negation and ranges), `**` across segments. Matched by
+/// character, so non-ASCII segments are fine.
 pub fn glob_match(pattern: &str, path: &str) -> bool {
     fn segments(s: &str) -> Vec<&str> {
         s.split('/')
             .filter(|p| !p.is_empty() && *p != ".")
             .collect()
     }
-    fn seg_match(p: &str, s: &str) -> bool {
-        match p.split_once('*') {
-            None => p == s,
-            Some((head, tail)) => {
-                s.starts_with(head)
-                    && (0..=s.len() - head.len().min(s.len())).any(|i| {
-                        let rest = &s[head.len().min(s.len()) + i..];
-                        s.len() >= head.len() && seg_match(tail, rest)
-                    })
+    fn class_match(class: &[char], c: char) -> bool {
+        let (negate, body) = match class.first() {
+            Some('!') | Some('^') => (true, &class[1..]),
+            _ => (false, class),
+        };
+        let mut i = 0;
+        let mut hit = false;
+        while i < body.len() {
+            if i + 2 < body.len() && body[i + 1] == '-' {
+                hit |= body[i] <= c && c <= body[i + 2];
+                i += 3;
+            } else {
+                hit |= body[i] == c;
+                i += 1;
             }
+        }
+        hit != negate
+    }
+    fn seg_match(p: &[char], s: &[char]) -> bool {
+        match p.first() {
+            None => s.is_empty(),
+            Some('*') => (0..=s.len()).any(|i| seg_match(&p[1..], &s[i..])),
+            Some('?') => !s.is_empty() && seg_match(&p[1..], &s[1..]),
+            Some('[') => {
+                let Some(close) = p.iter().position(|c| *c == ']') else {
+                    return !s.is_empty() && s[0] == '[' && seg_match(&p[1..], &s[1..]);
+                };
+                !s.is_empty()
+                    && class_match(&p[1..close], s[0])
+                    && seg_match(&p[close + 1..], &s[1..])
+            }
+            Some(c) => !s.is_empty() && s[0] == *c && seg_match(&p[1..], &s[1..]),
         }
     }
     fn go(p: &[&str], s: &[&str]) -> bool {
         match (p.first(), s.first()) {
             (None, None) => true,
             (Some(&"**"), _) => go(&p[1..], s) || (!s.is_empty() && go(p, &s[1..])),
-            (Some(pp), Some(ss)) => seg_match(pp, ss) && go(&p[1..], &s[1..]),
+            (Some(pp), Some(ss)) => {
+                let (pc, sc): (Vec<char>, Vec<char>) = (pp.chars().collect(), ss.chars().collect());
+                seg_match(&pc, &sc) && go(&p[1..], &s[1..])
+            }
             _ => false,
         }
     }
@@ -625,6 +652,15 @@ lint = ["ruff"]
         assert!(glob_match("exact/path", "exact/path"));
         assert!(!glob_match("other/*", "pkgs/a"));
         assert!(glob_match("*", "a"));
+        assert!(glob_match("pkgs/[ab]", "pkgs/a"));
+        assert!(!glob_match("pkgs/[ab]", "pkgs/c"));
+        assert!(glob_match("pkgs/[!ab]", "pkgs/c"));
+        assert!(glob_match("pkgs/lib-[0-9]", "pkgs/lib-7"));
+        assert!(glob_match("pkgs/a?", "pkgs/ab"));
+        assert!(!glob_match("pkgs/a?", "pkgs/a"));
+        assert!(glob_match("pkgs/*", "pkgs/café"));
+        assert!(glob_match("pkgs/caf?", "pkgs/café"));
+        assert!(glob_match("**/tests", "a/b/tests"));
     }
 
     #[test]

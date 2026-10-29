@@ -184,21 +184,13 @@ fn link_commands(env: &Path, commands: &[Cmd]) -> Result<()> {
         let link = bin.join(&c.file);
         let _ = fs::remove_file(&link);
         let target = env.join(venv::BIN).join(&c.file);
-        if cfg!(windows) && c.file.ends_with(".cmd") {
-            // A shim resolves python relative to itself; the copy in ~/.local/bin
-            // names the tool env outright instead.
-            let scripts = env.join(venv::BIN);
-            fs::write(
-                &link,
-                format!(
-                    "@echo off\r\n\"{}\" \"{}\" %*\r\n",
-                    scripts.join("python.exe").display(),
-                    scripts.join(format!("{}-script.py", c.name)).display()
-                ),
-            )
-            .with_context(|| format!("writing {}", link.display()))?;
-        } else {
-            link_or_copy(&target, &link)?;
+        match native_shim(env, &c.name, &c.file) {
+            // vivar's own shim resolves python relative to itself; the one in
+            // ~/.local/bin names the tool env outright instead.
+            Some(text) => {
+                fs::write(&link, text).with_context(|| format!("writing {}", link.display()))?
+            }
+            None => link_or_copy(&target, &link)?,
         }
     }
     let files: Vec<&str> = commands.iter().map(|c| c.file.as_str()).collect();
@@ -228,14 +220,16 @@ fn is_tool_link(link: &Path) -> Result<bool> {
             return Ok(false);
         };
         // A copied launcher matches a tool env's byte for byte; a shim vivar
-        // wrote names the tool env's directory.
-        let names_a_tool = String::from_utf8_lossy(&mine).contains(&tools.display().to_string());
-        Ok(names_a_tool
-            || entries.flatten().any(|e| {
-                fs::read(e.path().join(venv::BIN).join(name))
-                    .map(|theirs| theirs == mine)
-                    .unwrap_or(false)
-            }))
+        // wrote is exactly what it would write for that env again.
+        let file = name.to_string_lossy();
+        let stem = file.strip_suffix(".cmd").unwrap_or(&file);
+        Ok(entries.flatten().any(|e| {
+            let env = e.path();
+            fs::read(env.join(venv::BIN).join(name))
+                .map(|theirs| theirs == mine)
+                .unwrap_or(false)
+                || native_shim(&env, stem, &file).is_some_and(|text| text.as_bytes() == mine)
+        }))
     }
 }
 
@@ -348,8 +342,11 @@ fn commands_of(env: &Path) -> Result<Vec<Cmd>> {
                     continue;
                 }
                 if let Some(file) = full.file_name().and_then(|n| n.to_str()) {
-                    if file.ends_with("-script.py") {
-                        continue; // the body behind a `.cmd` shim, not a command
+                    if let Some(stem) = file.strip_suffix("-script.py") {
+                        // The body behind one of vivar's `.cmd` shims, not a command.
+                        if cfg!(windows) && bin.join(format!("{stem}.cmd")).exists() {
+                            continue;
+                        }
                     }
                     let name = file
                         .strip_suffix(std::env::consts::EXE_SUFFIX)
@@ -400,6 +397,25 @@ pub fn remove_links(env: &Path) {
         }
     }
     let _ = fs::remove_file(env.join(LINKS));
+}
+
+/// The `~/.local/bin` shim for a command that vivar's installer made as a
+/// `name.cmd` + `name-script.py` pair in `env` (Windows); `None` for uv's
+/// launchers and for batch files a wheel ships itself, which are copied.
+fn native_shim(env: &Path, name: &str, file: &str) -> Option<String> {
+    if !cfg!(windows) || !file.ends_with(".cmd") {
+        return None;
+    }
+    let scripts = env.join(venv::BIN);
+    let body = scripts.join(format!("{name}-script.py"));
+    if !body.is_file() {
+        return None;
+    }
+    Some(format!(
+        "@echo off\r\n\"{}\" \"{}\" %*\r\n",
+        scripts.join("python.exe").display(),
+        body.display()
+    ))
 }
 
 fn exe(name: &str) -> String {

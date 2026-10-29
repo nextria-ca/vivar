@@ -176,6 +176,15 @@ impl Index {
                 }
                 Ok(text)
             }
+            // An index that has never heard of the name answers 404: that is an
+            // empty listing, not a failure to fall back from.
+            Err(e) if format!("{e:#}").contains(" 404") => {
+                if ttl > 0 {
+                    let _ = fs::create_dir_all(&cache);
+                    let _ = fs::write(&path, format!("{now}\n"));
+                }
+                Ok(String::new())
+            }
             Err(e) => match cached {
                 Some((stamp, body)) if ttl > 0 => {
                     eprintln!(

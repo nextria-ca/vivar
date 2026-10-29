@@ -42,8 +42,9 @@ Python project: `pyproject.toml` (PEP 621), `.python-version`, a normal `.venv`,
 
 Without uv, direct references (`pkg @ https://…/pkg.whl`, a `.tar.gz`, or
 `git+https://…@rev`) and packages that ship only a source distribution are built by
-vivar's own PEP 517 driver and cached; extra indexes, per-package sources and profiles
-(`cpu` / `cu124` / `rocm6.2`) resolve natively too, so the GPU story does not need uv. Not yet: native (conda-forge) dependencies, and
+vivar's own PEP 517 driver and cached; extra indexes, per-package sources, profiles
+(`cpu` / `cu124` / `rocm6.2`) and workspaces resolve natively too, so nothing in the
+day-to-day flow needs uv. Not yet: native (conda-forge) dependencies, and
 model-weight management (out of scope by decision).
 
 ## Install

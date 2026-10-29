@@ -80,6 +80,9 @@ impl Artifact {
 pub struct Dep {
     pub name: String,
     pub version: Option<String>,
+    /// The variant's source (a registry URL, say) when several packages share
+    /// the name and version.
+    pub source: Option<String>,
     /// PEP 508 marker gating this edge, when the lock has one.
     pub marker: Option<String>,
     /// Extras requested of the dependency.
@@ -129,6 +132,12 @@ impl Lock {
                                 version: t
                                     .get("version")
                                     .and_then(|v| v.as_str())
+                                    .map(str::to_owned),
+                                source: t
+                                    .get("source")
+                                    .and_then(|v| v.as_inline_table())
+                                    .and_then(|s| s.iter().next())
+                                    .and_then(|(_, v)| v.as_str())
                                     .map(str::to_owned),
                                 marker: t.get("marker").and_then(|v| v.as_str()).map(str::to_owned),
                                 extras: t
@@ -230,10 +239,11 @@ impl Lock {
     /// The package an edge points at: the pinned variant, else the only one.
     fn resolve(&self, dep: &Dep) -> Option<&Package> {
         match &dep.version {
-            Some(v) => self
-                .packages
-                .iter()
-                .find(|p| p.name == dep.name && &p.version == v),
+            Some(v) => self.packages.iter().find(|p| {
+                p.name == dep.name
+                    && &p.version == v
+                    && dep.source.as_ref().is_none_or(|s| *s == p.source)
+            }),
             None => self.get(&dep.name),
         }
     }

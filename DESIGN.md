@@ -245,9 +245,13 @@ would split a minor at a patch level is reported, not guessed), checks artifacts
 every environment a dependency applies to, treats a
 wheelhouse `index-url` as the whole index (never PyPI behind it), honours
 `[[tool.uv.index]]` and `[tool.uv.sources]` (a package routed to an index, per group when
-asked), and resolves profiles (`tool.uv.conflicts` over groups) as a base plus one
-resolution per group merged into a lock whose variants are told apart by pinned edges.
-Workspaces are still refused rather than resolved differently.
+asked; a `default = true` index replaces PyPI; a policy wheelhouse overrides them all),
+and resolves profiles (`tool.uv.conflicts` over groups) as a base plus one resolution
+per group merged into a lock whose variants are told apart by pinned edges (version and,
+when needed, source); a merge the lock cannot express (a shared package whose pins
+differ by profile) is reported. Workspaces resolve as one: every member is a root of
+the lock (`[manifest] members`), installed editable, and a member requiring another is
+met by the workspace (`{ workspace = true }` sources).
 Bundle signatures moved from HMAC to Ed25519 (`sha512.rs`, `ed25519.rs`, RFC 8032
 vectors): `key generate` writes `bundle.key` + `bundle.pub`, verifiers trust
 `trusted-keys` in policy, `VIVAR_TRUSTED_KEYS`, or their own keys.

@@ -2806,6 +2806,68 @@ fn native_backend_syncs_from_the_lock_without_uv() {
     assert!(!native(dir, &["run", "python", "-c", "import variant"])
         .status
         .success());
+    // A workspace resolves natively: the lock covers the root and every member,
+    // a member depending on another is met by the workspace, and both are
+    // installed editable into the shared environment.
+    let ws = tmp.0.join("ws");
+    fs::create_dir_all(ws.join("pkgs").join("core").join("src").join("core")).unwrap();
+    fs::create_dir_all(ws.join("pkgs").join("app").join("src").join("app")).unwrap();
+    fs::write(
+        ws.join("pyproject.toml"),
+        "[project]\nname = \"ws\"\nversion = \"0.1.0\"\nrequires-python = \">=3.12\"\ndependencies = []\n\n[tool.uv.workspace]\nmembers = [\"pkgs/*\"]\n\n[tool.uv.sources]\ncore = { workspace = true }\n",
+    )
+    .unwrap();
+    fs::write(ws.join(".python-version"), "3.12\n").unwrap();
+    fs::write(
+        ws.join("pkgs").join("core").join("pyproject.toml"),
+        "[project]\nname = \"core\"\nversion = \"0.1.0\"\nrequires-python = \">=3.12\"\ndependencies = [\"six\"]\n\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n",
+    )
+    .unwrap();
+    fs::write(
+        ws.join("pkgs")
+            .join("core")
+            .join("src")
+            .join("core")
+            .join("__init__.py"),
+        "import six\nVALUE = 1\n",
+    )
+    .unwrap();
+    fs::write(
+        ws.join("pkgs").join("app").join("pyproject.toml"),
+        "[project]\nname = \"app\"\nversion = \"0.1.0\"\nrequires-python = \">=3.12\"\ndependencies = [\"core\"]\n\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n",
+    )
+    .unwrap();
+    fs::write(
+        ws.join("pkgs")
+            .join("app")
+            .join("src")
+            .join("app")
+            .join("__init__.py"),
+        "from core import VALUE\n",
+    )
+    .unwrap();
+    let app = ws.join("pkgs").join("app");
+    okn(&app, &["sync"]);
+    let lock = read(&ws.join("uv.lock"));
+    assert!(
+        lock.contains("[manifest]\nmembers = [\"app\", \"core\", \"ws\"]"),
+        "{lock}"
+    );
+    assert!(
+        lock.contains("source = { editable = \"pkgs/core\" }"),
+        "{lock}"
+    );
+    assert!(lock.contains("name = \"six\""), "{lock}");
+    assert!(ws.join(".venv").join("pyvenv.cfg").is_file() && !app.join(".venv").exists());
+    okn(
+        &app,
+        &[
+            "run",
+            "python",
+            "-c",
+            "import app, core, six; assert core.VALUE == 1",
+        ],
+    );
     // Building is native too: hatchling comes from the index into a throwaway env.
     let path = dir.join("pyproject.toml");
     let text = read(&path)

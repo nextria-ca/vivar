@@ -657,6 +657,33 @@ pub type Sections = (
     std::collections::BTreeMap<String, Vec<String>>,
 );
 
+/// One `[[tool.uv.index]]` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UvIndex {
+    pub name: Option<String>,
+    pub url: String,
+    /// Only packages routed to it by `[tool.uv.sources]` come from it.
+    pub explicit: bool,
+    /// Replaces PyPI as the index of last resort.
+    pub default: bool,
+}
+
+/// A `[tool.uv.sources]` value as a list of tables: one inline table, a
+/// `[tool.uv.sources.pkg]` table, or an array of inline tables. `None` for
+/// anything else.
+fn source_entries(item: &Item) -> Option<Vec<toml_edit::InlineTable>> {
+    if let Some(t) = item.as_table() {
+        return Some(vec![t.clone().into_inline_table()]);
+    }
+    if let Some(t) = item.as_inline_table() {
+        return Some(vec![t.clone()]);
+    }
+    if let Some(a) = item.as_array() {
+        return a.iter().map(|v| v.as_inline_table().cloned()).collect();
+    }
+    None
+}
+
 /// A project rooted at the directory containing `pyproject.toml`. In a uv
 /// workspace, `workspace` is the root project: that is where `.venv` lives.
 pub struct Project {
@@ -848,25 +875,29 @@ impl Project {
     /// rather than silently resolving something else.
     pub fn uv_only_features(&self) -> Vec<&'static str> {
         let mut v = Vec::new();
-        if self.workspace.is_some() || self.is_workspace_root() {
-            v.push("workspaces");
-        }
         let uv = self.doc.get("tool").and_then(|t| t.get("uv"));
-        // Sources are supported when they name an index; git/path/url
-        // sources and conflicts over extras are uv's alone.
+        // Sources are supported when they name an index or a workspace member,
+        // unconditionally; git/path/url sources, marker or extra selectors,
+        // and conflicts over extras are uv's alone.
         if let Some(t) = uv
             .and_then(|u| u.get("sources"))
             .and_then(Item::as_table_like)
         {
-            let entries = t.iter().flat_map(|(_, item)| match item.as_array() {
-                Some(a) => a.iter().cloned().collect::<Vec<_>>(),
-                None => item.as_value().cloned().into_iter().collect(),
-            });
-            if entries.into_iter().any(|e| {
-                e.as_inline_table()
-                    .is_none_or(|t| t.get("index").and_then(|i| i.as_str()).is_none())
-            }) {
-                v.push("sources other than an index (tool.uv.sources with git/path/url)");
+            for (_, item) in t.iter() {
+                let Some(entries) = source_entries(item) else {
+                    v.push("sources in a form other than a table (tool.uv.sources)");
+                    break;
+                };
+                let unsupported = entries.iter().any(|e| {
+                    let index = e.get("index").and_then(|i| i.as_str()).is_some();
+                    let workspace = e.get("workspace").and_then(|w| w.as_bool()) == Some(true);
+                    let selector = e.get("marker").is_some() || e.get("extra").is_some();
+                    !(index || workspace) || selector
+                });
+                if unsupported {
+                    v.push("sources other than a plain index or workspace member (tool.uv.sources with git/path/url, marker or extra)");
+                    break;
+                }
             }
         }
         if let Some(a) = uv.and_then(|u| u.get("conflicts")).and_then(Item::as_array) {
@@ -884,8 +915,43 @@ impl Project {
         v
     }
 
-    /// `[[tool.uv.index]]` entries: `(name, url, explicit)`.
-    pub fn uv_indexes(&self) -> Vec<(String, String, bool)> {
+    /// The workspace's member projects (directories under the root matching
+    /// `tool.uv.workspace.members` and holding a pyproject.toml), for a root.
+    pub fn members(&self) -> Result<Vec<Project>> {
+        if !self.is_workspace_root() {
+            return Ok(Vec::new());
+        }
+        let mut found = Vec::new();
+        let mut stack = vec![(self.root.clone(), 0usize)];
+        while let Some((dir, depth)) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.')
+                    || matches!(name.as_str(), "node_modules" | "target" | "dist" | "build")
+                {
+                    continue;
+                }
+                if path.join(PYPROJECT).is_file() && self.has_member(&path) {
+                    found.push(path.clone());
+                }
+                if depth < 4 {
+                    stack.push((path, depth + 1));
+                }
+            }
+        }
+        found.sort();
+        found.into_iter().map(|p| Self::load(&p)).collect()
+    }
+
+    /// `[[tool.uv.index]]` entries, in declaration order.
+    pub fn uv_indexes(&self) -> Vec<UvIndex> {
         self.doc
             .get("tool")
             .and_then(|t| t.get("uv"))
@@ -894,11 +960,12 @@ impl Project {
             .map(|a| {
                 a.iter()
                     .filter_map(|t| {
-                        Some((
-                            t.get("name").and_then(Item::as_str)?.to_owned(),
-                            t.get("url").and_then(Item::as_str)?.to_owned(),
-                            t.get("explicit").and_then(Item::as_bool).unwrap_or(false),
-                        ))
+                        Some(UvIndex {
+                            name: t.get("name").and_then(Item::as_str).map(str::to_owned),
+                            url: t.get("url").and_then(Item::as_str)?.to_owned(),
+                            explicit: t.get("explicit").and_then(Item::as_bool).unwrap_or(false),
+                            default: t.get("default").and_then(Item::as_bool).unwrap_or(false),
+                        })
                     })
                     .collect()
             })
@@ -906,7 +973,8 @@ impl Project {
     }
 
     /// `[tool.uv.sources]` entries that name an index: normalized package →
-    /// `(index name, group)` list.
+    /// `(index name, group)` list. Workspace sources are not listed; the
+    /// resolver knows the members.
     pub fn uv_sources(&self) -> std::collections::BTreeMap<String, Vec<(String, Option<String>)>> {
         let mut out = std::collections::BTreeMap::new();
         let Some(t) = self
@@ -919,17 +987,13 @@ impl Project {
             return out;
         };
         for (pkg, item) in t.iter() {
-            let values: Vec<toml_edit::Value> = match item.as_array() {
-                Some(a) => a.iter().cloned().collect(),
-                None => item.as_value().cloned().into_iter().collect(),
-            };
-            let entries: Vec<(String, Option<String>)> = values
+            let entries: Vec<(String, Option<String>)> = source_entries(item)
+                .unwrap_or_default()
                 .iter()
-                .filter_map(|v| {
-                    let t = v.as_inline_table()?;
+                .filter_map(|e| {
                     Some((
-                        t.get("index")?.as_str()?.to_owned(),
-                        t.get("group").and_then(|g| g.as_str()).map(str::to_owned),
+                        e.get("index")?.as_str()?.to_owned(),
+                        e.get("group").and_then(|g| g.as_str()).map(str::to_owned),
                     ))
                 })
                 .collect();

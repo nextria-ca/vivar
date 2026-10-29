@@ -24,6 +24,53 @@ pub struct Roots {
     /// The project is a package (it has a build system): the lock installs
     /// it editable, as uv does, instead of treating it as a virtual root.
     pub editable: bool,
+    /// Workspace members, each a root of its own: resolved together, laid
+    /// out in the lock beside the root, installed editable from `path`.
+    pub members: Vec<Member>,
+}
+
+/// A workspace member: its requirements and where it lives under the root.
+#[derive(Debug, Clone, Default)]
+pub struct Member {
+    pub roots: Roots,
+    /// Relative to the lock's root, forward slashes.
+    pub path: String,
+}
+
+impl Roots {
+    /// Every requirement of the project and its members, with the root
+    /// package that declares it.
+    fn all_reqs(&self) -> Vec<(String, &Requirement)> {
+        let mut out: Vec<(String, &Requirement)> = Vec::new();
+        let name = crate::project::normalize(&self.name);
+        for r in self
+            .dependencies
+            .iter()
+            .chain(self.extras.values().flatten())
+            .chain(self.groups.values().flatten())
+        {
+            out.push((name.clone(), r));
+        }
+        for m in &self.members {
+            out.extend(m.roots.all_reqs());
+        }
+        out
+    }
+
+    /// Names (normalized) of the root and its members: requirements on these
+    /// are met by the workspace itself, not an index.
+    fn local_names(&self) -> BTreeMap<String, Version> {
+        let mut out = BTreeMap::new();
+        if self.editable {
+            if let Ok(v) = Version::parse(&self.version) {
+                out.insert(crate::project::normalize(&self.name), v);
+            }
+        }
+        for m in &self.members {
+            out.extend(m.roots.local_names());
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -34,9 +81,16 @@ pub struct ResolvedPackage {
     /// Dependencies with the markers they carry, as they go into the lock.
     pub dependencies: Vec<Requirement>,
     pub source: Source,
-    /// The version each dependency resolved to alongside this package, so a
-    /// lock holding several variants of a name can pin the edge.
-    pub resolved: BTreeMap<String, Version>,
+    /// What each dependency resolved to alongside this package, so a lock
+    /// holding several variants of a name can pin the edge.
+    pub resolved: BTreeMap<String, Pin>,
+}
+
+/// One chosen variant of a package: its version and where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pin {
+    pub version: Version,
+    pub source: Source,
 }
 
 /// Where a resolved package comes from: the lock's `source` table.
@@ -75,6 +129,8 @@ pub struct Resolution {
     pub packages: Vec<ResolvedPackage>,
     /// Every assigned version, by name.
     pub assigned: BTreeMap<String, Version>,
+    /// Every assignment with its source, by name.
+    pub pins: BTreeMap<String, Pin>,
 }
 
 /// What goes into a lock: one resolution, or a base plus one per profile
@@ -84,31 +140,35 @@ pub struct Lockable {
     pub packages: Vec<ResolvedPackage>,
     /// Pins for the root's edges: `None` for its dependencies and extras,
     /// `Some(group)` for a dependency group resolved on its own.
-    pub root_pins: BTreeMap<Option<String>, BTreeMap<String, Version>>,
+    pub root_pins: BTreeMap<Option<String>, BTreeMap<String, Pin>>,
 }
 
 impl Lockable {
     pub fn single(r: Resolution) -> Lockable {
         Lockable {
             packages: r.packages,
-            root_pins: BTreeMap::from([(None, r.assigned)]),
+            root_pins: BTreeMap::from([(None, r.pins)]),
         }
     }
 
     /// Merges a base resolution with the resolutions of conflicting groups.
-    /// Packages identical in name, version and source collapse into one.
-    pub fn merge(base: Resolution, profiles: Vec<(String, Resolution)>) -> Lockable {
+    /// Packages identical in name, version and source collapse into one. The
+    /// lock pins each edge once, so a shared package whose dependencies, or a
+    /// base dependency whose version, differ between profiles cannot be
+    /// written and is reported (uv's forks can express it).
+    pub fn merge(base: Resolution, profiles: Vec<(String, Resolution)>) -> Result<Lockable> {
         let mut packages: Vec<ResolvedPackage> = Vec::new();
         let mut root_pins = BTreeMap::new();
-        root_pins.insert(None, base.assigned);
-        let mut add = |rs: Vec<ResolvedPackage>| {
+        let base_pins = base.pins.clone();
+        root_pins.insert(None, base.pins);
+        let mut add = |rs: Vec<ResolvedPackage>, group: &str| -> Result<()> {
             for p in rs {
                 if let Some(existing) = packages
                     .iter_mut()
                     .find(|q| q.name == p.name && q.version == p.version && q.source == p.source)
                 {
                     // The same release seen from another profile: keep every
-                    // edge and pin it saw.
+                    // edge it saw, and insist its pins agree.
                     for d in p.dependencies {
                         if !existing.dependencies.iter().any(|e| {
                             e.name == d.name && e.extras == d.extras && e.marker == d.marker
@@ -116,22 +176,56 @@ impl Lockable {
                             existing.dependencies.push(d);
                         }
                     }
-                    existing.resolved.extend(p.resolved);
+                    for (dep, pin) in p.resolved {
+                        match existing.resolved.get(&dep) {
+                            Some(prev) if *prev != pin => bail!(
+                                "{} {} needs {dep} {} in profile {group} but {} elsewhere; one lock cannot hold both (uv can fork it)",
+                                p.name,
+                                p.version,
+                                pin.version,
+                                prev.version
+                            ),
+                            _ => {
+                                existing.resolved.insert(dep, pin);
+                            }
+                        }
+                    }
                 } else {
                     packages.push(p);
                 }
             }
+            Ok(())
         };
-        add(base.packages);
+        add(base.packages, "the base")?;
         for (group, r) in profiles {
-            root_pins.insert(Some(group), r.assigned);
-            add(r.packages);
+            for (name, pin) in &base_pins {
+                if let Some(other) = r.pins.get(name) {
+                    if other != pin {
+                        bail!(
+                            "{name} resolves to {} with profile {group} but {} without; a base dependency must agree across profiles (uv can fork it)",
+                            other.version,
+                            pin.version
+                        );
+                    }
+                }
+            }
+            add(r.packages, &group)?;
+            root_pins.insert(Some(group), r.pins);
         }
         packages.sort_by(|a, b| (&a.name, &a.version).cmp(&(&b.name, &b.version)));
-        Lockable {
+        Ok(Lockable {
             packages,
             root_pins,
-        }
+        })
+    }
+
+    /// Whether several packages share this name and version (from different
+    /// sources), so an edge must also say which source.
+    fn same_version_variants(&self, name: &str, version: &Version) -> usize {
+        self.packages
+            .iter()
+            .filter(|p| p.name == name && p.version == *version)
+            .count()
     }
 
     fn variants(&self, name: &str) -> usize {
@@ -255,15 +349,19 @@ impl<'a> Resolver<'a> {
     }
 
     /// The index `name` comes from: its route, else the first default index
-    /// that lists it, else the main one.
-    fn index_of(&self, name: &str) -> &Index {
+    /// that lists it, else the main one. A default index that cannot be
+    /// asked is an error, not a reason to look further (that could hand a
+    /// private name to a public index).
+    fn index_of(&self, name: &str) -> Result<&Index> {
         if let Some((_, i)) = self.routes.iter().find(|(n, _)| n == name) {
-            return i;
+            return Ok(i);
         }
-        self.defaults
-            .iter()
-            .find(|i| i.files(name).map(|f| !f.is_empty()).unwrap_or(false))
-            .unwrap_or(self.index)
+        for i in &self.defaults {
+            if !i.files(name)?.is_empty() {
+                return Ok(i);
+            }
+        }
+        Ok(self.index)
     }
 
     fn set_envs(&mut self, floor: [u32; 3], machine: [u32; 3]) {
@@ -505,7 +603,7 @@ impl<'a> Resolver<'a> {
                 Vec::new()
             });
         }
-        let files = self.index_of(name).files(name)?;
+        let files = self.index_of(name)?.files(name)?;
         let mut by_version: BTreeMap<Version, Vec<&File>> = BTreeMap::new();
         for f in &files {
             if let Some(v) = f.version(name) {
@@ -580,7 +678,7 @@ impl<'a> Resolver<'a> {
         if let Some(m) = self.cache.get(&key) {
             return Ok(m.clone());
         }
-        let files = self.index_of(name).files(name)?;
+        let files = self.index_of(name)?.files(name)?;
         let wheels: Vec<&File> = files
             .iter()
             .filter(|f| f.is_wheel() && f.version(name).as_ref() == Some(version))
@@ -592,7 +690,7 @@ impl<'a> Resolver<'a> {
             .or(wheels.first())
             .copied();
         let m = match file {
-            Some(file) => self.index_of(name).metadata(file)?,
+            Some(file) => self.index_of(name)?.metadata(file)?,
             None => {
                 // No wheel at all: build the source distribution once and read
                 // its metadata, unless builds are ruled out.
@@ -622,14 +720,10 @@ impl<'a> Resolver<'a> {
 
     pub fn resolve(mut self, roots: &Roots) -> Result<Resolution> {
         let mut state = State::default();
-        let root_name = crate::project::normalize(&roots.name);
+        let locals = roots.local_names();
         let all = self.all_envs();
-        let root_reqs: Vec<&Requirement> = roots
-            .dependencies
-            .iter()
-            .chain(roots.extras.values().flatten())
-            .chain(roots.groups.values().flatten())
-            .collect();
+        let all_reqs = roots.all_reqs();
+        let root_reqs: Vec<&Requirement> = all_reqs.iter().map(|(_, r)| *r).collect();
         let mut root_envs = Vec::with_capacity(root_reqs.len());
         for r in &root_reqs {
             // A root requirement has no alternative: a split here is final.
@@ -651,14 +745,14 @@ impl<'a> Resolver<'a> {
         }
         // Direct references go first: a URL settles a package's version before
         // anything else can pick one from the index.
-        let mut ordered: Vec<(&Requirement, BTreeSet<usize>)> =
-            root_reqs.iter().copied().zip(root_envs).collect();
-        ordered.sort_by_key(|(r, _)| r.url.is_none());
-        for (r, envs) in ordered {
+        let mut ordered: Vec<((String, &Requirement), BTreeSet<usize>)> =
+            all_reqs.into_iter().zip(root_envs).collect();
+        ordered.sort_by_key(|((_, r), _)| r.url.is_none());
+        for ((from, r), envs) in ordered {
             if envs.is_empty() {
                 continue;
             }
-            state.edges.push((root_name.clone(), r.clone()));
+            state.edges.push((from, r.clone()));
             state.pending.push_back(Pending {
                 req: r.clone(),
                 envs,
@@ -674,6 +768,18 @@ impl<'a> Resolver<'a> {
             let Some(Pending { req, envs }) = state.pending.pop_front() else {
                 break; // everything satisfied
             };
+            // A requirement on the root or a member is met by the workspace
+            // itself; its version is checked, nothing is fetched.
+            if let Some(v) = locals.get(&req.name) {
+                if !req.specifier.matches_allowing_pre(v) {
+                    bail!(
+                        "{} is a workspace member at version {v}, which does not satisfy {}",
+                        req.name,
+                        req.specifier
+                    );
+                }
+                continue;
+            }
             // A direct reference is its own single candidate: fetched once,
             // then treated as an exact pin for every other requirement. The
             // selection lives in the state, the fetched artifact in a cache.
@@ -782,7 +888,7 @@ impl<'a> Resolver<'a> {
                             .collect::<Vec<_>>()
                             .join(" and "),
                         self.wheels_only,
-                        self.index_of(&req.name).url()
+                        self.index_of(&req.name)?.url()
                     );
                 }
                 state = self.backtrack(&mut frames, &req.name)?;
@@ -809,7 +915,7 @@ impl<'a> Resolver<'a> {
             let files: Vec<File> = if state.directs.contains_key(name) {
                 Vec::new()
             } else {
-                self.index_of(name)
+                self.index_of(name)?
                     .files(name)?
                     .into_iter()
                     .filter(|f| {
@@ -830,31 +936,44 @@ impl<'a> Resolver<'a> {
                 Some(d) => (d.files.clone(), d.source.clone()),
                 None => (
                     files,
-                    Source::Registry(self.index_of(name).url().to_owned()),
+                    Source::Registry(self.index_of(name)?.url().to_owned()),
                 ),
             };
-            let resolved = dependencies
-                .iter()
-                .filter_map(|d| {
-                    state
-                        .assigned
-                        .iter()
-                        .find(|(n, _)| *n == d.name)
-                        .map(|(n, v)| (n.clone(), v.clone()))
-                })
-                .collect();
             packages.push(ResolvedPackage {
                 name: name.clone(),
                 version: version.clone(),
                 files,
                 dependencies,
                 source,
-                resolved,
+                resolved: BTreeMap::new(),
             });
         }
         packages.sort_by(|a, b| a.name.cmp(&b.name));
+        let pins: BTreeMap<String, Pin> = packages
+            .iter()
+            .map(|p| {
+                (
+                    p.name.clone(),
+                    Pin {
+                        version: p.version.clone(),
+                        source: p.source.clone(),
+                    },
+                )
+            })
+            .collect();
+        for p in &mut packages {
+            p.resolved = p
+                .dependencies
+                .iter()
+                .filter_map(|d| pins.get(&d.name).map(|pin| (d.name.clone(), pin.clone())))
+                .collect();
+        }
         let assigned = state.assigned.iter().cloned().collect();
-        Ok(Resolution { packages, assigned })
+        Ok(Resolution {
+            packages,
+            assigned,
+            pins,
+        })
     }
 
     /// Two constraints that never apply on the same environment: the
@@ -1060,21 +1179,42 @@ pub fn write_lock(roots: &Roots, lock: &Lockable) -> String {
     use toml_edit::{value, Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table};
     // Root requirements that apply in no targeted environment were not
     // resolved; the graph leaves them out while the metadata keeps them.
-    let resolved: BTreeSet<&str> = lock.packages.iter().map(|p| p.name.as_str()).collect();
+    let mut resolved: BTreeSet<String> = lock.packages.iter().map(|p| p.name.clone()).collect();
+    resolved.insert(crate::project::normalize(&roots.name));
+    for m in &roots.members {
+        resolved.insert(crate::project::normalize(&m.roots.name));
+    }
     let mut doc = DocumentMut::new();
     doc["version"] = value(1);
     doc["revision"] = value(3);
     if let Some(rp) = &roots.requires_python {
         doc["requires-python"] = value(rp.as_str());
     }
-    // An edge into a name with several variants says which one.
+    // An edge into a name with several variants says which one: by version,
+    // and by source when the same version comes from two places.
     let dep_entry =
-        |r: &Requirement, marker: Option<&str>, pins: Option<&BTreeMap<String, Version>>| {
+        |r: &Requirement, marker: Option<&str>, pins: Option<&BTreeMap<String, Pin>>| {
             let mut t = InlineTable::new();
             t.insert("name", r.name.as_str().into());
             if lock.variants(&r.name) > 1 {
-                if let Some(v) = pins.and_then(|p| p.get(&r.name)) {
-                    t.insert("version", v.to_string().into());
+                if let Some(pin) = pins.and_then(|p| p.get(&r.name)) {
+                    t.insert("version", pin.version.to_string().into());
+                    if lock.same_version_variants(&r.name, &pin.version) > 1 {
+                        let mut src = InlineTable::new();
+                        match &pin.source {
+                            Source::Registry(u) => src.insert("registry", u.as_str().into()),
+                            Source::Url(u) => src.insert("url", u.as_str().into()),
+                            Source::Git { url, rev, commit } => src.insert(
+                                "git",
+                                match rev {
+                                    Some(r) => format!("{url}?rev={r}#{commit}"),
+                                    None => format!("{url}#{commit}"),
+                                }
+                                .into(),
+                            ),
+                        };
+                        t.insert("source", src.into());
+                    }
                 }
             }
             if !r.extras.is_empty() {
@@ -1089,9 +1229,9 @@ pub fn write_lock(roots: &Roots, lock: &Lockable) -> String {
             }
             t
         };
-    let dep_array = |reqs: &[Requirement], pins: Option<&BTreeMap<String, Version>>| {
+    let dep_array = |reqs: &[Requirement], pins: Option<&BTreeMap<String, Pin>>| {
         let mut a = Array::new();
-        for r in reqs.iter().filter(|r| resolved.contains(r.name.as_str())) {
+        for r in reqs.iter().filter(|r| resolved.contains(&r.name)) {
             a.push(dep_entry(r, r.marker.as_deref(), pins));
         }
         a
@@ -1136,62 +1276,78 @@ pub fn write_lock(roots: &Roots, lock: &Lockable) -> String {
     };
 
     let mut packages = ArrayOfTables::new();
-    // The project itself.
-    let mut root = Table::new();
-    root["name"] = value(crate::project::normalize(&roots.name));
-    root["version"] = value(roots.version.as_str());
-    let mut src = InlineTable::new();
-    src.insert(
-        if roots.editable {
-            "editable"
-        } else {
-            "virtual"
-        },
-        ".".into(),
-    );
-    root["source"] = value(src);
-    if !roots.dependencies.is_empty() {
-        root["dependencies"] = value(dep_array(&roots.dependencies, base_pins));
-    }
-    if !roots.extras.is_empty() {
-        let mut t = Table::new();
-        for (k, v) in &roots.extras {
-            t[k.as_str()] = value(dep_array(v, base_pins));
+    // The project itself, then each workspace member: all roots of the lock.
+    let mut root_table = |r: &Roots, path: &str| {
+        let mut root = Table::new();
+        root["name"] = value(crate::project::normalize(&r.name));
+        root["version"] = value(r.version.as_str());
+        let mut src = InlineTable::new();
+        src.insert(if r.editable { "editable" } else { "virtual" }, path.into());
+        root["source"] = value(src);
+        if !r.dependencies.is_empty() {
+            root["dependencies"] = value(dep_array(&r.dependencies, base_pins));
         }
-        root["optional-dependencies"] = Item::Table(t);
-    }
-    if !roots.groups.is_empty() {
-        let mut t = Table::new();
-        for (k, v) in &roots.groups {
-            let pins = lock.root_pins.get(&Some(k.clone())).or(base_pins);
-            t[k.as_str()] = value(dep_array(v, pins));
-        }
-        root["dev-dependencies"] = Item::Table(t);
-    }
-    let mut meta = Table::new();
-    let mut rd = Array::new();
-    for r in &roots.dependencies {
-        rd.push(spec_entry(r, None));
-    }
-    for (k, v) in &roots.extras {
-        for r in v {
-            rd.push(spec_entry(r, Some(k)));
-        }
-    }
-    meta["requires-dist"] = value(rd);
-    if !roots.groups.is_empty() {
-        let mut t = Table::new();
-        for (k, v) in &roots.groups {
-            let mut a = Array::new();
-            for r in v {
-                a.push(spec_entry(r, None));
+        if !r.extras.is_empty() {
+            let mut t = Table::new();
+            for (k, v) in &r.extras {
+                t[k.as_str()] = value(dep_array(v, base_pins));
             }
-            t[k.as_str()] = value(a);
+            root["optional-dependencies"] = Item::Table(t);
         }
-        meta["requires-dev"] = Item::Table(t);
+        if !r.groups.is_empty() {
+            let mut t = Table::new();
+            for (k, v) in &r.groups {
+                let pins = lock.root_pins.get(&Some(k.clone())).or(base_pins);
+                t[k.as_str()] = value(dep_array(v, pins));
+            }
+            root["dev-dependencies"] = Item::Table(t);
+        }
+        let mut meta = Table::new();
+        let mut rd = Array::new();
+        for d in &r.dependencies {
+            rd.push(spec_entry(d, None));
+        }
+        for (k, v) in &r.extras {
+            for d in v {
+                rd.push(spec_entry(d, Some(k)));
+            }
+        }
+        meta["requires-dist"] = value(rd);
+        if !r.groups.is_empty() {
+            let mut t = Table::new();
+            for (k, v) in &r.groups {
+                let mut a = Array::new();
+                for d in v {
+                    a.push(spec_entry(d, None));
+                }
+                t[k.as_str()] = value(a);
+            }
+            meta["requires-dev"] = Item::Table(t);
+        }
+        root["metadata"] = Item::Table(meta);
+        packages.push(root);
+    };
+    root_table(roots, ".");
+    for m in &roots.members {
+        root_table(&m.roots, &m.path);
     }
-    root["metadata"] = Item::Table(meta);
-    packages.push(root);
+    if !roots.members.is_empty() {
+        let mut names: Vec<String> = roots
+            .members
+            .iter()
+            .map(|m| crate::project::normalize(&m.roots.name))
+            .collect();
+        names.push(crate::project::normalize(&roots.name));
+        names.sort();
+        names.dedup();
+        let mut manifest = Table::new();
+        let mut a = Array::new();
+        for n in names {
+            a.push(n);
+        }
+        manifest["members"] = value(a);
+        doc["manifest"] = Item::Table(manifest);
+    }
 
     for p in &lock.packages {
         let mut t = Table::new();
@@ -1398,6 +1554,11 @@ mod tests {
 
     #[test]
     fn merged_profiles_pin_edges_into_variants() {
+        let reg = Source::Registry("https://pypi.org/simple".into());
+        let pin = |v: &str| Pin {
+            version: Version::parse(v).unwrap(),
+            source: reg.clone(),
+        };
         let pkg =
             |name: &str, version: &str, deps: &[&str], resolved: &[(&str, &str)]| ResolvedPackage {
                 name: name.into(),
@@ -1407,10 +1568,10 @@ mod tests {
                     .iter()
                     .map(|d| Requirement::parse(d).unwrap())
                     .collect(),
-                source: Source::Registry("https://pypi.org/simple".into()),
+                source: reg.clone(),
                 resolved: resolved
                     .iter()
-                    .map(|(n, v)| (n.to_string(), Version::parse(v).unwrap()))
+                    .map(|(n, v)| (n.to_string(), pin(v)))
                     .collect(),
             };
         let assigned = |pairs: &[(&str, &str)]| -> BTreeMap<String, Version> {
@@ -1419,9 +1580,13 @@ mod tests {
                 .map(|(n, v)| (n.to_string(), Version::parse(v).unwrap()))
                 .collect()
         };
+        let pins = |pairs: &[(&str, &str)]| -> BTreeMap<String, Pin> {
+            pairs.iter().map(|(n, v)| (n.to_string(), pin(v))).collect()
+        };
         let base = Resolution {
             packages: vec![pkg("numpy", "2.0", &[], &[])],
             assigned: assigned(&[("numpy", "2.0")]),
+            pins: pins(&[("numpy", "2.0")]),
         };
         let cpu = Resolution {
             packages: vec![
@@ -1429,6 +1594,7 @@ mod tests {
                 pkg("torch", "2.5.0+cpu", &["numpy"], &[("numpy", "2.0")]),
             ],
             assigned: assigned(&[("numpy", "2.0"), ("torch", "2.5.0+cpu")]),
+            pins: pins(&[("numpy", "2.0"), ("torch", "2.5.0+cpu")]),
         };
         let cu = Resolution {
             packages: vec![
@@ -1446,8 +1612,13 @@ mod tests {
                 ("torch", "2.5.0+cu124"),
                 ("nvidia-cublas", "12.4"),
             ]),
+            pins: pins(&[
+                ("numpy", "2.0"),
+                ("torch", "2.5.0+cu124"),
+                ("nvidia-cublas", "12.4"),
+            ]),
         };
-        let lock = Lockable::merge(base, vec![("cpu".into(), cpu), ("cu124".into(), cu)]);
+        let lock = Lockable::merge(base, vec![("cpu".into(), cpu), ("cu124".into(), cu)]).unwrap();
         assert_eq!(
             lock.packages.iter().filter(|p| p.name == "torch").count(),
             2
@@ -1566,6 +1737,7 @@ mod tests {
             &Lockable::single(Resolution {
                 packages: vec![direct],
                 assigned: BTreeMap::new(),
+                pins: BTreeMap::new(),
             }),
         );
         assert!(
@@ -1577,6 +1749,7 @@ mod tests {
             &Lockable::single(Resolution {
                 packages: vec![pkg],
                 assigned: BTreeMap::new(),
+                pins: BTreeMap::new(),
             }),
         );
         assert!(text.contains("source = { editable = \".\" }"), "{text}");

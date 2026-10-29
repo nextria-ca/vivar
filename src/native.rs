@@ -77,29 +77,33 @@ impl NativeBackend {
                 unsupported.join(" and ")
             );
         }
-        let root = project.venv_root();
-        let (deps, extras, groups) = project.requirement_sections();
-        let parse_all = |v: &[String]| -> Result<Vec<Requirement>> {
-            v.iter().map(|r| Requirement::parse(r)).collect()
+        let root = project.venv_root().to_path_buf();
+        // In a workspace the lock belongs to the root and covers every member.
+        let ws_root;
+        let project = match project.workspace.as_deref() {
+            Some(_) => {
+                ws_root = Project::require(&root)?;
+                &ws_root
+            }
+            None => project,
         };
-        let roots = Roots {
-            name: project.name(),
-            version: project.version().unwrap_or_else(|| "0.1.0".to_owned()),
-            requires_python: project.requires_python(),
-            dependencies: parse_all(&deps)?,
-            extras: extras
-                .iter()
-                .map(|(k, v)| Ok((k.clone(), parse_all(v)?)))
-                .collect::<Result<_>>()?,
-            groups: groups
-                .iter()
-                .map(|(k, v)| Ok((k.clone(), parse_all(v)?)))
-                .collect::<Result<_>>()?,
-            editable: project.is_package(),
-        };
+        let mut roots = roots_of(project)?;
+        for m in project.members()? {
+            let rel = m
+                .root
+                .strip_prefix(&project.root)
+                .unwrap_or(&m.root)
+                .display()
+                .to_string()
+                .replace('\\', "/");
+            roots.members.push(crate::resolve::Member {
+                roots: roots_of(&m)?,
+                path: rel,
+            });
+        }
         let machine = python_floor(project)?;
         let floor = declared_floor(project).unwrap_or(machine);
-        let old: BTreeMap<String, String> = Lock::read(root)
+        let old: BTreeMap<String, String> = Lock::read(&root)
             .map(|l| {
                 l.packages
                     .iter()
@@ -112,29 +116,69 @@ impl NativeBackend {
             .iter()
             .filter_map(|(n, v)| Version::parse(v).ok().map(|v| (n.clone(), v)))
             .collect();
-        let index = self.index();
+
+        // Indexes: a policy wheelhouse is the only source, full stop. Otherwise
+        // the policy index, else the project's `default = true` index, else
+        // PyPI is the index of last resort; non-explicit project indexes are
+        // searched before it; `[tool.uv.sources]` routes packages to one.
+        let wheelhouse = self.wheelhouse_dir().is_some();
+        let indexes = if wheelhouse {
+            Vec::new()
+        } else {
+            project.uv_indexes()
+        };
+        let main_url = self
+            .index_url
+            .clone()
+            .or_else(|| indexes.iter().find(|i| i.default).map(|i| i.url.clone()));
+        let index = Index::new(main_url.as_deref());
+        let mut index_urls = vec![index.url().to_owned()];
+        index_urls.extend(indexes.iter().map(|i| i.url.clone()));
         let builder = Builder {
             backend: self,
             series: format!("{}.{}", machine[0], machine[1]),
+            index_urls: index_urls.clone(),
         };
-        // `[[tool.uv.index]]` and `[tool.uv.sources]`: packages routed to an
-        // index of their own, possibly only inside one group.
-        let indexes = project.uv_indexes();
-        let sources = project.uv_sources();
+        let sources = if wheelhouse {
+            Default::default()
+        } else {
+            project.uv_sources()
+        };
         let index_url = |name: &str| -> Result<String> {
             indexes
                 .iter()
-                .find(|(n, _, _)| n == name)
-                .map(|(_, u, _)| u.clone())
+                .find(|i| i.name.as_deref() == Some(name))
+                .map(|i| i.url.clone())
                 .ok_or_else(|| anyhow!("[tool.uv.sources] names index {name:?}, which [[tool.uv.index]] does not declare"))
         };
+        let conflicts: Vec<Vec<String>> = project.conflict_groups();
+        let profile_groups: Vec<String> = conflicts.iter().flatten().cloned().collect();
+        // The route for a package when resolving `group` (None: the base or a
+        // single resolution). A group-specific entry applies inside its group,
+        // or on its own when it is the only one and nothing conflicts yet
+        // (the first profile, before a second declares the conflict).
         let routes_for = |group: Option<&str>| -> Result<Vec<(String, Index)>> {
             let mut out = Vec::new();
             for (pkg, entries) in &sources {
-                let pick = entries
+                let exact = entries
                     .iter()
-                    .find(|(_, g)| g.as_deref() == group && group.is_some())
-                    .or_else(|| entries.iter().find(|(_, g)| g.is_none()));
+                    .find(|(_, g)| g.is_some() && g.as_deref() == group);
+                let plain = entries.iter().find(|(_, g)| g.is_none());
+                let grouped: BTreeSet<&String> = entries
+                    .iter()
+                    .filter_map(|(i, g)| g.as_ref().map(|_| i))
+                    .collect();
+                let pick = match (exact, plain) {
+                    (Some(e), _) => Some(e),
+                    (None, Some(p)) => Some(p),
+                    (None, None) if group.is_none() && profile_groups.is_empty() => {
+                        if grouped.len() > 1 {
+                            bail!("{pkg} is routed to several indexes by group but no conflicts are declared between those groups; `vivar profile add` declares them");
+                        }
+                        entries.first()
+                    }
+                    (None, None) => None,
+                };
                 if let Some((idx, _)) = pick {
                     out.push((pkg.clone(), Index::new(Some(&index_url(idx)?))));
                 }
@@ -144,8 +188,8 @@ impl NativeBackend {
         let defaults = || -> Vec<Index> {
             indexes
                 .iter()
-                .filter(|(_, _, explicit)| !explicit)
-                .map(|(_, u, _)| Index::new(Some(u)))
+                .filter(|i| !i.explicit && !i.default)
+                .map(|i| Index::new(Some(&i.url)))
                 .collect()
         };
         let resolve = |roots: &Roots,
@@ -164,7 +208,6 @@ impl NativeBackend {
         };
         // Profiles (conflicting groups) resolve one at a time on top of the
         // base, each preferring what the base chose, and merge into one lock.
-        let profile_groups: Vec<String> = project.conflict_groups().into_iter().flatten().collect();
         let lockable = if profile_groups.is_empty() {
             Lockable::single(resolve(&roots, None, prefer)?)
         } else {
@@ -182,7 +225,7 @@ impl NativeBackend {
                 keep.extend(base.assigned.clone());
                 profiles.push((g.clone(), resolve(&pr, Some(g), keep)?));
             }
-            Lockable::merge(base, profiles)
+            Lockable::merge(base, profiles)?
         };
         let mut new: BTreeMap<String, String> = BTreeMap::new();
         for p in &lockable.packages {
@@ -203,6 +246,30 @@ impl NativeBackend {
         }
         Ok((old, new))
     }
+}
+
+/// A project's own requirements as resolver roots.
+fn roots_of(project: &Project) -> Result<Roots> {
+    let (deps, extras, groups) = project.requirement_sections();
+    let parse_all = |v: &[String]| -> Result<Vec<Requirement>> {
+        v.iter().map(|r| Requirement::parse(r)).collect()
+    };
+    Ok(Roots {
+        name: project.name(),
+        version: project.version().unwrap_or_else(|| "0.1.0".to_owned()),
+        requires_python: project.requires_python(),
+        dependencies: parse_all(&deps)?,
+        extras: extras
+            .iter()
+            .map(|(k, v)| Ok((k.clone(), parse_all(v)?)))
+            .collect::<Result<_>>()?,
+        groups: groups
+            .iter()
+            .map(|(k, v)| Ok((k.clone(), parse_all(v)?)))
+            .collect::<Result<_>>()?,
+        editable: project.is_package(),
+        members: Vec::new(),
+    })
 }
 
 /// The lowest Python the project declares (`requires-python = ">=3.10"`):
@@ -314,6 +381,7 @@ pub fn plan<'a>(lock: &'a Lock, env: &MarkerEnv, groups: &[&str]) -> Result<Vec<
                 .iter()
                 .filter(|p| p.name == dep.name)
                 .filter(|p| dep.version.as_ref().is_none_or(|v| *v == p.version))
+                .filter(|p| dep.source.as_ref().is_none_or(|s| *s == p.source))
                 .collect();
             let chosen = candidates
                 .iter()
@@ -378,6 +446,8 @@ struct Source<'a> {
 struct Builder<'a> {
     backend: &'a NativeBackend,
     series: String,
+    /// Every configured index: credentials go to these hosts only.
+    index_urls: Vec<String>,
 }
 
 /// Fetches the wheel for `pkg` on `target`, hash-checked, from the cache or
@@ -620,7 +690,7 @@ impl NativeBackend {
         let mut urls = vec![main.to_owned()];
         if let Ok(cwd) = std::env::current_dir() {
             if let Ok(project) = Project::require(&cwd) {
-                urls.extend(project.uv_indexes().into_iter().map(|(_, u, _)| u));
+                urls.extend(project.uv_indexes().into_iter().map(|i| i.url));
             }
         }
         urls
@@ -640,6 +710,7 @@ impl NativeBackend {
             builder: series.map(|s| Builder {
                 backend: self,
                 series: s.to_owned(),
+                index_urls: self.index_urls_with(index.url()),
             }),
         })
     }
@@ -826,7 +897,11 @@ impl Builder<'_> {
         let dest = dir.join(&file.filename);
         if !dest.is_file() {
             println!("downloading {}", file.filename);
-            let url = if crate::index::same_origin(&file.url, self.backend.index().url()) {
+            let url = if self
+                .index_urls
+                .iter()
+                .any(|u| crate::index::same_origin(&file.url, u))
+            {
                 crate::backend::with_credentials(&file.url)
             } else {
                 file.url.clone()
@@ -1181,6 +1256,11 @@ impl Backend for NativeBackend {
     fn sync_groups(&self, dir: &Path, groups: &[&str]) -> Result<()> {
         let project = crate::project::Project::require(dir)?;
         let root = project.venv_root().to_path_buf();
+        // Like `uv sync`: no lockfile, or one that no longer covers what the
+        // project declares, is resolved first.
+        if !root.join(crate::lock::LOCKFILE).is_file() || self.lock_check(dir).is_err() {
+            self.relock(&project, &[], false, false)?;
+        }
         let mut all: Vec<&str> = vec!["dev"];
         all.extend(groups.iter().copied().filter(|g| *g != "dev"));
         self.sync_into(&root, &root.join(".venv"), &all)
@@ -1242,6 +1322,7 @@ impl Backend for NativeBackend {
         let builder = Builder {
             backend: self,
             series: format!("{}.{}", version[0], version[1]),
+            index_urls: self.index_urls_with(index.url()),
         };
         let resolution = Resolver::new(&index, version, self.no_build)
             .fetch(&builder)

@@ -8,6 +8,7 @@ use std::fs;
 use std::path::Path;
 
 /// A machine to export for: `linux-x86_64`, `windows-aarch64`, `macos-arm64` …
+#[derive(Clone)]
 pub struct Target {
     os: String,
     arch: String,

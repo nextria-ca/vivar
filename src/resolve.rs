@@ -124,9 +124,20 @@ impl<'a> Resolver<'a> {
                     if let Ok(t) =
                         Target::new(Some(&format!("{os}-{arch}")), &format!("{maj}.{minor}"))
                     {
-                        // The floor keeps its patch level (`>=3.10.1`); later minors start at .0.
-                        let patch = if minor == min { floor[2] } else { 0 };
-                        envs.push((MarkerEnv::for_target(os, arch, [maj, minor, patch]), t));
+                        // Two samples per minor, its lowest patch (the floor keeps
+                        // its own, `>=3.10.1`) and a high one, so markers comparing
+                        // patch levels (`>= '3.12.1'`) land on one of them. The
+                        // project's requires-python filters them afterwards.
+                        let low = if minor == min { floor[2] } else { 0 };
+                        for patch in [low, 99] {
+                            if patch == low && low == 99 {
+                                continue;
+                            }
+                            envs.push((
+                                MarkerEnv::for_target(os, arch, [maj, minor, patch]),
+                                t.clone(),
+                            ));
+                        }
                     }
                 }
             }
@@ -243,11 +254,6 @@ impl<'a> Resolver<'a> {
         let Some(m) = marker else {
             return within.clone();
         };
-        // Environments sample one patch per minor; a marker comparing patch
-        // levels is tried at both ends of the minor so `>= '3.12.1'` is not
-        // lost on a 3.12.0 sample. Including a doubtful environment is safe
-        // (the dependency is then resolved); dropping one is not.
-        let patch_sensitive = m.contains("python_full_version");
         within
             .iter()
             .copied()
@@ -259,13 +265,6 @@ impl<'a> Resolver<'a> {
                     .filter(|(_, envs)| envs.contains(&i))
                     .map(|(k, _)| k.clone())
                     .collect();
-                if eval_marker(m, &e).unwrap_or(false) {
-                    return true;
-                }
-                if !patch_sensitive {
-                    return false;
-                }
-                e.python_full_version = format!("{}.99", e.python_version);
                 eval_marker(m, &e).unwrap_or(false)
             })
             .collect()
@@ -904,7 +903,12 @@ mod tests {
         let pythons: BTreeSet<String> = r.pythons.iter().skip(1).map(|p| p.to_string()).collect();
         assert_eq!(
             pythons,
-            BTreeSet::from(["3.12.0".to_owned(), "3.13.1".to_owned()]),
+            BTreeSet::from([
+                "3.12.0".to_owned(),
+                "3.12.99".to_owned(),
+                "3.13.1".to_owned(),
+                "3.13.99".to_owned()
+            ]),
             "{pythons:?}"
         );
         assert!(r
@@ -915,12 +919,22 @@ mod tests {
         let single = Resolver::new(&index, [3, 12, 0], true).single();
         assert_eq!(single.envs.len(), 1);
 
-        // Patch-level markers are not pruned by the per-minor sampling.
+        // Patch-level markers land on one of the two samples per minor, and
+        // only within the project's range.
         let r = Resolver::new(&index, [3, 12, 0], true).requires_python(Some(">=3.12,<3.13"));
         let all = r.all_envs();
         let none = Extras::new();
         assert!(!r
             .where_holds(Some("python_full_version >= '3.12.1'"), &none, &all)
+            .is_empty());
+        let narrow =
+            Resolver::new(&index, [3, 12, 0], true).requires_python(Some(">=3.12,<3.12.1"));
+        assert!(narrow
+            .where_holds(
+                Some("python_full_version >= '3.12.1'"),
+                &none,
+                &narrow.all_envs()
+            )
             .is_empty());
         assert!(r
             .where_holds(Some("python_full_version < '3.12'"), &none, &all)

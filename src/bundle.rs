@@ -14,6 +14,10 @@ pub use crate::venv::BIN as VENV_BIN;
 /// `sha256  path` for every file whose bytes must survive the trip. Files that
 /// `unpack` rewrites for the new location are left out.
 pub const CHECKSUMS: &str = "vivar-bundle.sha256";
+/// `sha256  path` for everything CHECKSUMS leaves out, as packed: the venv's
+/// launchers and activate scripts, pyvenv.cfg, every symlink (hash of its
+/// target) and the manifest. Checked before relocation; covered by the signature.
+pub const INVENTORY: &str = "vivar-bundle.inventory";
 
 /// Mirrors the tar excludes in `pack` so the checksum list and the archive agree.
 fn excluded(rel: &Path, python_dir: &str, mm: &str, opts: PackOptions) -> bool {
@@ -124,6 +128,121 @@ fn checksums(
         out.push_str(&format!("{digest}  {member}\n"));
     }
     Ok(out)
+}
+
+/// The pre-relocation inventory for `root` (see [`INVENTORY`]).
+fn inventory(
+    root: &Path,
+    python_root: &Path,
+    python_dir: &str,
+    mm: &str,
+    opts: PackOptions,
+    manifest: &[u8],
+) -> Result<String> {
+    let mut lines = Vec::new();
+    let venv = root.join(".venv");
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    if venv.join("pyvenv.cfg").is_file() {
+        files.push((".venv/pyvenv.cfg".to_owned(), venv.join("pyvenv.cfg")));
+    }
+    if let Ok(entries) = fs::read_dir(venv.join(VENV_BIN)) {
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            if e.path().is_file() && !e.path().is_symlink() {
+                files.push((
+                    format!(".venv/{VENV_BIN}/{}", e.file_name().to_string_lossy()),
+                    e.path(),
+                ));
+            }
+        }
+    }
+    for (member, path) in files {
+        let digest = crate::sha256::file(&path).with_context(|| format!("hashing {member}"))?;
+        lines.push(format!("{digest}  {member}"));
+    }
+    let mut digest = crate::sha256::Sha256::new();
+    digest.update(manifest);
+    lines.push(format!(
+        "{}  {MANIFEST}",
+        crate::sha256::hex(&digest.finish())
+    ));
+    // Symlinks: the target string is what matters.
+    let python_parent = python_root.parent().unwrap_or(python_root);
+    for (base, start) in [
+        (root, Path::new(".venv")),
+        (python_parent, Path::new(python_dir)),
+    ] {
+        let mut links = Vec::new();
+        symlinks(base, start, &mut links)?;
+        links.sort();
+        for rel in links {
+            if excluded(&rel, python_dir, mm, opts) {
+                continue;
+            }
+            let target = fs::read_link(base.join(&rel))?;
+            let mut h = crate::sha256::Sha256::new();
+            h.update(target.to_string_lossy().as_bytes());
+            lines.push(format!(
+                "{}  link:{}",
+                crate::sha256::hex(&h.finish()),
+                rel.to_string_lossy().replace('\\', "/")
+            ));
+        }
+    }
+    Ok(lines.join("\n") + "\n")
+}
+
+fn symlinks(base: &Path, rel: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(base.join(rel))?.flatten() {
+        let child = rel.join(entry.file_name());
+        let meta = fs::symlink_metadata(entry.path())?;
+        if meta.is_symlink() {
+            out.push(child);
+        } else if meta.is_dir() {
+            symlinks(base, &child, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Checks an extracted, not yet relocated bundle against its inventory.
+fn verify_inventory(dir: &Path) -> Result<Vec<String>> {
+    let text = fs::read_to_string(dir.join(INVENTORY))?;
+    let mut bad = Vec::new();
+    let hash_bytes = |b: &[u8]| {
+        let mut h = crate::sha256::Sha256::new();
+        h.update(b);
+        crate::sha256::hex(&h.finish())
+    };
+    for (member, digest) in parse_checksums(&text) {
+        let actual = if let Some(link) = member.strip_prefix("link:") {
+            fs::read_link(dir.join(link))
+                .ok()
+                .map(|t| hash_bytes(t.to_string_lossy().as_bytes()))
+        } else if member == MANIFEST {
+            fs::read(dir.join(MANIFEST)).ok().map(|m| hash_bytes(&m))
+        } else {
+            crate::sha256::file(&dir.join(&member)).ok()
+        };
+        match actual {
+            Some(a) if a == digest => {}
+            Some(_) => bad.push(format!("{member} (modified)")),
+            None => bad.push(format!("{member} (missing)")),
+        }
+    }
+    // Launchers that aren't in the inventory were added after packing.
+    if let Ok(entries) = fs::read_dir(dir.join(".venv").join(VENV_BIN)) {
+        let listed: std::collections::HashSet<String> =
+            parse_checksums(&text).into_iter().map(|(m, _)| m).collect();
+        for e in entries.flatten() {
+            let member = format!(".venv/{VENV_BIN}/{}", e.file_name().to_string_lossy());
+            if e.path().is_file() && !e.path().is_symlink() && !listed.contains(&member) {
+                bad.push(format!("{member} (not in the bundle)"));
+            }
+        }
+    }
+    Ok(bad)
 }
 
 /// Checks every file in a bundle directory against its checksum list. Returns
@@ -591,11 +710,21 @@ fn archive(tree: &Tree, name: &str, output: Option<&Path>, opts: PackOptions) ->
     let mm = major_minor(&tree.version);
     let sums = checksums(&tree.root, &tree.python_root, python_dir, &mm, opts)?;
     fs::write(staging.join(CHECKSUMS), &sums)?;
+    let manifest_bytes = manifest.to_string().into_bytes();
+    let inv = inventory(
+        &tree.root,
+        &tree.python_root,
+        python_dir,
+        &mm,
+        opts,
+        &manifest_bytes,
+    )?;
+    fs::write(staging.join(INVENTORY), &inv)?;
     if opts.sign {
         let key = crate::sign::require_key()?;
         fs::write(
             staging.join(crate::sign::SIGNATURE),
-            crate::sign::sign(sums.as_bytes(), &key),
+            crate::sign::sign(sums.as_bytes(), inv.as_bytes(), &key),
         )?;
     }
 
@@ -647,7 +776,8 @@ fn archive(tree: &Tree, name: &str, output: Option<&Path>, opts: PackOptions) ->
         .arg("-C")
         .arg(&staging)
         .arg(MANIFEST)
-        .arg(CHECKSUMS);
+        .arg(CHECKSUMS)
+        .arg(INVENTORY);
     if opts.sign {
         tar.arg(crate::sign::SIGNATURE);
     }
@@ -696,7 +826,10 @@ pub fn unpack(
         );
     }
     check_signature(&dest, require_signature)?;
-    let bad = verify_checksums(&dest)?;
+    let mut bad = verify_checksums(&dest)?;
+    if dest.join(INVENTORY).is_file() {
+        bad.extend(verify_inventory(&dest)?);
+    }
     if !bad.is_empty() {
         bail!(
             "{} failed its integrity check; {} file(s) differ from when it was packed:\n  {}",
@@ -749,6 +882,18 @@ fn check_signature(dir: &Path, required: bool) -> Result<()> {
     crate::sign::verify(dir, &key)?;
     println!("signature verified with the bundle key");
     Ok(())
+}
+
+/// A member name from a checksum list or delta that is safe to join onto a
+/// bundle directory: relative, no `..`, no absolute prefix.
+fn safe_member(member: &str) -> bool {
+    let p = Path::new(member);
+    !member.is_empty()
+        && p.is_relative()
+        && !member.starts_with(['/', '\\'])
+        && !member.contains(':')
+        && p.components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
 fn manifest_of(dir: &Path) -> Result<DocumentMut> {
@@ -855,7 +1000,11 @@ fn dedupe(dest: &Path, other: &Path) -> Result<u64> {
         let (Ok(a), Ok(b)) = (fs::metadata(&mine), fs::metadata(&existing)) else {
             continue;
         };
-        if !a.is_file() || !b.is_file() || a.len() != b.len() {
+        if !a.is_file() || !b.is_file() || a.len() != b.len() || !safe_member(&member) {
+            continue;
+        }
+        // The other bundle's list says what the file was; check what it is.
+        if crate::sha256::file(&existing).ok().as_deref() != Some(digest.as_str()) {
             continue;
         }
         let tmp = mine.with_extension("vivar-dedupe");
@@ -895,6 +1044,14 @@ pub fn make_delta(old: &Path, new: &Path, output: &Path) -> Result<String> {
         if !status.success() {
             bail!("{} is not a vivar bundle", old.display());
         }
+        // Older bundles have no inventory; a missing one just means "all differ".
+        let _ = Command::new("tar")
+            .arg("-xf")
+            .arg(old)
+            .arg("-C")
+            .arg(&old_dir)
+            .arg(INVENTORY)
+            .output();
         extract(new, &new_dir)?;
         let old_m = manifest_of(&old_dir)?;
         let new_m = manifest_of(&new_dir)?;
@@ -908,32 +1065,38 @@ pub fn make_delta(old: &Path, new: &Path, output: &Path) -> Result<String> {
             }
         }
         let old_sums = fs::read(old_dir.join(CHECKSUMS))?;
+        let old_inv = fs::read_to_string(old_dir.join(INVENTORY)).unwrap_or_default();
+        let new_inv = fs::read_to_string(new_dir.join(INVENTORY))?;
+        // Both lists together are the complete member inventory, symlinks included.
+        let strip = |m: String| m.strip_prefix("link:").map(str::to_owned).unwrap_or(m);
         let old_list: std::collections::HashMap<String, String> =
             parse_checksums(&String::from_utf8_lossy(&old_sums))
                 .into_iter()
+                .chain(parse_checksums(&old_inv))
+                .map(|(m, d)| (strip(m), d))
                 .collect();
-        let new_list = parse_checksums(&fs::read_to_string(new_dir.join(CHECKSUMS))?);
+        let new_list: Vec<(String, String)> =
+            parse_checksums(&fs::read_to_string(new_dir.join(CHECKSUMS))?)
+                .into_iter()
+                .chain(parse_checksums(&new_inv))
+                .map(|(m, d)| (strip(m), d))
+                .collect();
 
         let mut changed = Vec::new();
         for (member, digest) in &new_list {
-            if old_list.get(member) != Some(digest) {
+            if member != MANIFEST && old_list.get(member) != Some(digest) {
                 changed.push(member.clone());
             }
         }
         let new_names: std::collections::HashSet<&String> =
             new_list.iter().map(|(m, _)| m).collect();
-        let removed: Vec<&String> = old_list.keys().filter(|m| !new_names.contains(m)).collect();
+        let removed: Vec<&String> = old_list
+            .keys()
+            .filter(|m| !new_names.contains(m) && *m != MANIFEST && safe_member(m))
+            .collect();
 
-        // Files unpack rewrites aren't in the lists; they always travel, they're small.
-        let mut always = vec![".venv/pyvenv.cfg".to_owned()];
-        if let Ok(entries) = fs::read_dir(new_dir.join(".venv").join(VENV_BIN)) {
-            for e in entries.flatten() {
-                always.push(format!(
-                    ".venv/{VENV_BIN}/{}",
-                    e.file_name().to_string_lossy()
-                ));
-            }
-        }
+        // pyvenv.cfg always travels: it is tiny and it is what relocation rewrites.
+        let always = [".venv/pyvenv.cfg".to_owned()];
         for member in changed.iter().chain(always.iter()) {
             let (from, to) = (new_dir.join(member), stage.join(member));
             let Ok(meta) = fs::symlink_metadata(&from) else {
@@ -949,6 +1112,7 @@ pub fn make_delta(old: &Path, new: &Path, output: &Path) -> Result<String> {
         }
         fs::copy(new_dir.join(MANIFEST), stage.join(MANIFEST))?;
         fs::copy(new_dir.join(CHECKSUMS), stage.join(CHECKSUMS))?;
+        fs::copy(new_dir.join(INVENTORY), stage.join(INVENTORY))?;
         if new_dir.join(crate::sign::SIGNATURE).is_file() {
             fs::copy(
                 new_dir.join(crate::sign::SIGNATURE),
@@ -1020,7 +1184,26 @@ pub fn apply_delta(delta: &Path, dir: &Path, require_signature: bool) -> Result<
                 dir.display()
             );
         }
+        // The base must be intact before anything is touched, or a failed update
+        // could never be retried.
+        let damaged = verify_checksums(&dir)?;
+        if !damaged.is_empty() {
+            bail!(
+                "{} no longer matches the bundle it was unpacked from ({} file(s)); re-unpack it before applying a delta",
+                dir.display(),
+                damaged.len()
+            );
+        }
         check_signature(&tmp, require_signature)?;
+        // Only members the base actually had can be removed, and only inside it.
+        let base_members: std::collections::HashSet<String> =
+            parse_checksums(&fs::read_to_string(dir.join(CHECKSUMS))?)
+                .into_iter()
+                .chain(parse_checksums(
+                    &fs::read_to_string(dir.join(INVENTORY)).unwrap_or_default(),
+                ))
+                .map(|(m, _)| m.strip_prefix("link:").map(str::to_owned).unwrap_or(m))
+                .collect();
         let removed: Vec<String> = meta
             .get("removed")
             .and_then(|v| v.as_array())
@@ -1032,6 +1215,11 @@ pub fn apply_delta(delta: &Path, dir: &Path, require_signature: bool) -> Result<
             })
             .unwrap_or_default();
         for member in &removed {
+            if !safe_member(member) || !base_members.contains(member) {
+                bail!("delta asks to remove {member:?}, which is not part of the bundle; refusing");
+            }
+        }
+        for member in &removed {
             let _ = fs::remove_file(dir.join(member));
         }
         // Copy the delta's files over; the old bundle's relocated files are replaced.
@@ -1040,7 +1228,15 @@ pub fn apply_delta(delta: &Path, dir: &Path, require_signature: bool) -> Result<
         if !tmp.join(crate::sign::SIGNATURE).is_file() {
             let _ = fs::remove_file(dir.join(crate::sign::SIGNATURE));
         }
-        let bad = verify_checksums(&dir)?;
+        let mut bad = verify_checksums(&dir)?;
+        // Relocated files from the base are stale until relocation runs again, so
+        // the inventory is checked on the delta's own copies.
+        bad.extend(
+            verify_inventory(&tmp)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|b| !b.ends_with("(missing)")),
+        );
         if !bad.is_empty() {
             bail!(
                 "the updated bundle fails its integrity check ({} file(s)):\n  {}",

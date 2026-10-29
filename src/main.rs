@@ -460,7 +460,27 @@ fn main() -> Result<()> {
         Command::Import { file, python } => {
             let imported = import::read(&file)?;
             let project = match project {
-                Some(p) => p,
+                Some(p) if p.has_project_table() => p,
+                Some(p) => {
+                    // A poetry-only pyproject: give it PEP 621 metadata, keep the rest.
+                    let name = imported.name.clone().unwrap_or_else(|| p.name());
+                    let python = python.clone().or(imported.python.clone());
+                    project::ensure_pep621(&p.root, &name, python.as_deref())?;
+                    if !p.root.join(".python-version").exists() {
+                        let interpreter = venv::interpreter(python.as_deref())?;
+                        let [major, minor, _] = interpreter.version;
+                        std::fs::write(
+                            p.root.join(".python-version"),
+                            format!("{major}.{minor}\n"),
+                        )?;
+                    }
+                    project::write_defaults(&p.root)?;
+                    println!(
+                        "added [project] metadata to {}",
+                        p.root.join(project::PYPROJECT).display()
+                    );
+                    Project::require(&p.root)?
+                }
                 None => {
                     let python = python.or(imported.python.clone());
                     let interpreter = venv::interpreter(python.as_deref())?;
@@ -491,31 +511,46 @@ fn main() -> Result<()> {
                     groups.push(g.clone());
                 }
             }
-            for group in groups {
-                let reqs: Vec<String> = imported
-                    .requirements
-                    .iter()
-                    .filter(|(g, _)| *g == group)
-                    .map(|(_, r)| r.clone())
-                    .collect();
-                route_pytorch(&project, &reqs, imported.cuda.as_deref())?;
-                let list =
-                    std::env::temp_dir().join(format!("vivar-import-{}.txt", std::process::id()));
-                std::fs::write(&list, reqs.join("\n") + "\n")?;
-                let added = backend.add_requirements(&cwd, &list, group.as_deref());
-                let _ = std::fs::remove_file(&list);
-                added?;
-                println!(
-                    "added {} requirement(s){}",
-                    reqs.len(),
-                    group
-                        .as_deref()
-                        .map(|g| format!(" to group {g}"))
-                        .unwrap_or_default()
-                );
-            }
-            venv::mark_synced(project.venv_root());
-            after_install(&project, &policy)?;
+            // One transaction for the whole import: a policy rejection undoes all of it.
+            transact(&project, &backend, &project.root, None, || {
+                for group in &groups {
+                    let reqs: Vec<String> = imported
+                        .requirements
+                        .iter()
+                        .filter(|(g, _)| g == group)
+                        .map(|(_, r)| r.clone())
+                        .collect();
+                    // A conda `pytorch-cuda` pin routes the PyTorch family only.
+                    let family: Vec<String> = reqs
+                        .iter()
+                        .filter(|r| {
+                            PYTORCH_FAMILY.contains(
+                                &project::normalize(project::requirement_name(r)).as_str(),
+                            )
+                        })
+                        .cloned()
+                        .collect();
+                    if !family.is_empty() {
+                        route_pytorch(&project, &family, imported.cuda.as_deref())?;
+                    }
+                    let list = std::env::temp_dir()
+                        .join(format!("vivar-import-{}.txt", std::process::id()));
+                    std::fs::write(&list, reqs.join("\n") + "\n")?;
+                    let added = backend.add_requirements(&project.root, &list, group.as_deref());
+                    let _ = std::fs::remove_file(&list);
+                    added?;
+                    println!(
+                        "added {} requirement(s){}",
+                        reqs.len(),
+                        group
+                            .as_deref()
+                            .map(|g| format!(" to group {g}"))
+                            .unwrap_or_default()
+                    );
+                }
+                venv::mark_synced(project.venv_root());
+                after_install(&project, &policy)
+            })?;
             for s in &imported.skipped {
                 println!("skipped: {s}");
             }
@@ -1188,11 +1223,22 @@ fn run_check(
     if no_verify {
         results.push(("verify", "skipped", "--no-verify".to_owned()));
     } else if has_env {
+        // An unpacked bundle also gets its checksums re-verified, as `vivar verify` does.
+        let integrity = if project.venv_root().join(bundle::CHECKSUMS).is_file() {
+            bundle::verify_checksums(project.venv_root()).unwrap_or_else(|e| vec![e.to_string()])
+        } else {
+            Vec::new()
+        };
         record(
             &mut results,
             "verify",
             verify::run(&venv_dir, false, false, true).and_then(|(code, _)| {
-                if code == 0 {
+                if !integrity.is_empty() {
+                    Err(anyhow::anyhow!(
+                        "{} bundled file(s) changed since packing",
+                        integrity.len()
+                    ))
+                } else if code == 0 {
                     Ok("every package imports and loads".to_owned())
                 } else {
                     Err(anyhow::anyhow!(

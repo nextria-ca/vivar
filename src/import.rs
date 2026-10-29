@@ -240,6 +240,14 @@ fn pipfile(text: &str) -> Result<Imported> {
             continue;
         };
         for (name, item) in t.iter() {
+            if ["git", "path", "file", "url", "ref"]
+                .iter()
+                .any(|k| item.get(k).is_some())
+            {
+                out.skipped
+                    .push(format!("{name} (git/path/url source in Pipfile)"));
+                continue;
+            }
             out.requirements
                 .push((group.clone(), pipfile_spec(name, item)));
         }
@@ -277,7 +285,42 @@ fn pipfile_spec(name: &str, item: &Item) -> String {
         .and_then(Item::as_str)
         .filter(|v| *v != "*")
         .unwrap_or("");
-    format!("{name}{extras}{version}")
+    let markers = item
+        .get("markers")
+        .and_then(Item::as_str)
+        .map(|m| format!("; {m}"))
+        .unwrap_or_default();
+    format!("{name}{extras}{version}{markers}")
+}
+
+/// PEP 508 markers from poetry's `markers`, `python` and `platform` keys.
+fn poetry_markers(item: &Item) -> String {
+    let mut parts = Vec::new();
+    if let Some(m) = item.get("markers").and_then(Item::as_str) {
+        parts.push(m.to_owned());
+    }
+    if let Some(py) = item.get("python").and_then(Item::as_str) {
+        let clauses: Vec<String> = poetry_constraint(py)
+            .split(',')
+            .filter(|c| !c.is_empty())
+            .map(|c| {
+                let split = c.find(|ch: char| ch.is_ascii_digit()).unwrap_or(c.len());
+                let (op, ver) = c.split_at(split);
+                format!("python_full_version {} \"{}\"", op.trim(), ver.trim())
+            })
+            .collect();
+        if !clauses.is_empty() {
+            parts.push(clauses.join(" and "));
+        }
+    }
+    if let Some(platform) = item.get("platform").and_then(Item::as_str) {
+        parts.push(format!("sys_platform == \"{platform}\""));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", parts.join(" and "))
+    }
 }
 
 /// poetry's `[tool.poetry.dependencies]` and `[tool.poetry.group.*.dependencies]`.
@@ -330,7 +373,11 @@ fn poetry(text: &str) -> Result<Imported> {
                 .unwrap_or_default();
             out.requirements.push((
                 group.clone(),
-                format!("{name}{extras}{}", poetry_constraint(constraint)),
+                format!(
+                    "{name}{extras}{}{}",
+                    poetry_constraint(constraint),
+                    poetry_markers(item)
+                ),
             ));
         }
     };
@@ -453,6 +500,9 @@ mod tests {
                 "dev:pytest"
             ]
         );
+        let j = pipfile("[packages]\ntool = {git = \"https://x/y.git\"}\nwin = {version = \"*\", markers = \"sys_platform == 'win32'\"}\n").unwrap();
+        assert_eq!(names(&j), vec!["main:win; sys_platform == 'win32'"]);
+        assert_eq!(j.skipped.len(), 1);
         assert_eq!(i.python.as_deref(), Some("3.12"));
 
         let p = poetry("[tool.poetry]\nname = \"svc\"\n\n[tool.poetry.dependencies]\npython = \"^3.10\"\nrequests = \"^2.31\"\nnumpy = \"~1.26\"\nrich = \"*\"\npydantic = {version = \"2.5\", extras = [\"email\"]}\nlocal = {path = \"../local\"}\nextra = {version = \"1\", optional = true}\n\n[tool.poetry.group.dev.dependencies]\npytest = \"^8\"\n").unwrap();
@@ -469,6 +519,15 @@ mod tests {
             ]
         );
         assert_eq!(p.skipped.len(), 2);
+        let p = poetry("[tool.poetry.dependencies]\npywin32 = {version = \"^306\", platform = \"win32\"}\nold = {version = \"1\", python = \"<3.12\"}\nmk = {version = \"2\", markers = \"extra == 'x'\"}\n").unwrap();
+        assert_eq!(
+            names(&p),
+            vec![
+                "main:pywin32>=306,<307; sys_platform == \"win32\"",
+                "main:old==1; python_full_version < \"3.12\"",
+                "main:mk==2; extra == 'x'",
+            ]
+        );
         assert_eq!(poetry_constraint("^0.2.1"), ">=0.2.1,<0.3");
         assert_eq!(poetry_constraint("^0.0.3"), ">=0.0.3,<0.0.4");
         assert_eq!(poetry_constraint(">=1.0, <2.0"), ">=1.0,<2.0");

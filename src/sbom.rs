@@ -66,7 +66,12 @@ pub fn generate(project: &Project, format: Format) -> Result<String> {
             let mut pkgs = Vec::new();
             let mut rels = Vec::new();
             for p in &packages {
-                let id = format!("SPDXRef-Package-{}", p.name.replace(['.', '_'], "-"));
+                // Forked locks carry several versions of one package: the id needs both.
+                let id = format!(
+                    "SPDXRef-Package-{}-{}",
+                    p.name.replace(['.', '_'], "-"),
+                    p.version.replace(|c: char| !c.is_ascii_alphanumeric(), "-")
+                );
                 let purl = format!("pkg:pypi/{}@{}", p.name, p.version);
                 let declared = licenses
                     .get(&crate::project::normalize(&p.name))

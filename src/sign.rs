@@ -53,12 +53,17 @@ pub fn generate(force: bool) -> Result<PathBuf> {
     }
     fs::create_dir_all(path.parent().context("key path has no parent")?)?;
     let bytes = random_bytes()?;
-    fs::write(&path, sha256::hex(&bytes) + "\n")?;
+    // Private from the first byte: created with 0600, never widened.
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let mut file = options.open(&path)?;
+    use std::io::Write;
+    file.write_all((sha256::hex(&bytes) + "\n").as_bytes())?;
     Ok(path)
 }
 
@@ -87,21 +92,28 @@ fn random_bytes() -> Result<[u8; 32]> {
     Ok(out)
 }
 
-/// Signs the checksum list of a staged bundle.
-pub fn sign(checksums: &[u8], key: &[u8]) -> String {
-    sha256::hex(&sha256::hmac(key, checksums))
+/// Signs a bundle: the HMAC covers the checksum list and the inventory of
+/// everything the list leaves out (launchers, activate scripts, symlinks, the
+/// manifest), so nothing executable can be swapped under a valid signature.
+pub fn sign(checksums: &[u8], inventory: &[u8], key: &[u8]) -> String {
+    let mut message = Vec::with_capacity(checksums.len() + inventory.len() + 1);
+    message.extend_from_slice(checksums);
+    message.push(0);
+    message.extend_from_slice(inventory);
+    sha256::hex(&sha256::hmac(key, &message))
 }
 
-/// Verifies a bundle directory's signature. `Ok(false)` when it has none.
-pub fn verify(dir: &Path, key: &[u8]) -> Result<bool> {
-    let Ok(sig) = fs::read_to_string(dir.join(SIGNATURE)) else {
-        return Ok(false);
-    };
+/// Verifies a bundle directory's signature; any problem is an error.
+pub fn verify(dir: &Path, key: &[u8]) -> Result<()> {
+    let sig = fs::read_to_string(dir.join(SIGNATURE)).context("reading the bundle signature")?;
     let checksums = fs::read(dir.join(crate::bundle::CHECKSUMS))?;
-    if sign(&checksums, key) != sig.trim() {
+    let inventory = fs::read(dir.join(crate::bundle::INVENTORY))
+        .context("this signed bundle has no inventory; it was not made by this vivar")?;
+    let sig = sig.trim();
+    if sig.len() != 64 || sign(&checksums, &inventory, key) != sig {
         bail!("the bundle's signature does not match the bundle key: it was made with another key or altered");
     }
-    Ok(true)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -113,9 +125,10 @@ mod tests {
         std::env::set_var("VIVAR_BUNDLE_KEY", "ab".repeat(32));
         let k = key().unwrap().unwrap();
         assert_eq!(k, vec![0xab; 32]);
-        let sig = sign(b"checksums", &k);
+        let sig = sign(b"checksums", b"inventory", &k);
         assert_eq!(sig.len(), 64);
-        assert_ne!(sig, sign(b"checksums", &[0xcd; 32]));
+        assert_ne!(sig, sign(b"checksums", b"inventory", &[0xcd; 32]));
+        assert_ne!(sig, sign(b"checksums", b"other", &k));
         std::env::set_var("VIVAR_BUNDLE_KEY", "nothex");
         assert!(key().is_err());
         std::env::remove_var("VIVAR_BUNDLE_KEY");

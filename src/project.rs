@@ -249,6 +249,38 @@ pub fn pin_python(pin_dir: &Path, pyproject_dir: &Path, version: [u32; 3]) -> Re
     Ok(())
 }
 
+/// Adds PEP 621 `[project]` metadata to a pyproject.toml that lacks it (a
+/// poetry project being imported), keeping everything else in the file.
+pub fn ensure_pep621(root: &Path, name: &str, python: Option<&str>) -> Result<()> {
+    let path = root.join(PYPROJECT);
+    let mut doc: DocumentMut = fs::read_to_string(&path)?.parse()?;
+    if doc.get("project").is_some() {
+        return Ok(());
+    }
+    let poetry = doc.get("tool").and_then(|t| t.get("poetry"));
+    let version = poetry
+        .and_then(|p| p.get("version"))
+        .and_then(Item::as_str)
+        .unwrap_or("0.1.0")
+        .to_owned();
+    let description = poetry
+        .and_then(|p| p.get("description"))
+        .and_then(Item::as_str)
+        .map(str::to_owned);
+    let mut project = Table::new();
+    project["name"] = value(name);
+    project["version"] = value(version);
+    if let Some(d) = description {
+        project["description"] = value(d);
+    }
+    if let Some(py) = python {
+        project["requires-python"] = value(format!(">={py}"));
+    }
+    project["dependencies"] = value(Array::new());
+    doc["project"] = Item::Table(project);
+    fs::write(&path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
+}
+
 /// A valid project name derived from the directory name.
 pub fn default_name(root: &Path) -> String {
     let raw = root
@@ -532,6 +564,12 @@ impl Project {
             .get("dependency-groups")
             .and_then(Item::as_table_like)
             .is_some_and(|t| t.contains_key(group))
+    }
+
+    /// Whether `pyproject.toml` has PEP 621 `[project]` metadata (a poetry-only
+    /// file does not).
+    pub fn has_project_table(&self) -> bool {
+        self.doc.get("project").is_some()
     }
 
     /// `[project] requires-python`, if declared.

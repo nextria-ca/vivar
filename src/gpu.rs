@@ -22,7 +22,7 @@ pub enum Gpu {
 
 /// CUDA versions PyTorch publishes wheel indexes for, newest first. One line
 /// to update when a new one appears; `--cuda <ver>` always overrides.
-pub const PYTORCH_CUDA: &[(u32, u32)] = &[(12, 8), (12, 6), (12, 4), (12, 1), (11, 8)];
+pub const PYTORCH_CUDA: &[(u32, u32)] = &[(13, 0), (12, 8), (12, 6), (12, 4), (12, 1), (11, 8)];
 
 pub fn detect() -> Gpu {
     if let Some(gpu) = nvidia() {
@@ -164,7 +164,12 @@ pub fn describe(gpu: &Gpu) -> String {
             vram_mb,
             compute_capability,
         } => format!(
-            "NVIDIA {name}, driver {driver}{}{}{}",
+            "{}{name}, driver {driver}{}{}{}",
+            if name.to_uppercase().starts_with("NVIDIA") {
+                ""
+            } else {
+                "NVIDIA "
+            },
             cuda.map(|(a, b)| format!(", CUDA {a}.{b}"))
                 .unwrap_or_default(),
             vram_mb
@@ -188,6 +193,15 @@ mod tests {
     #[test]
     fn maps_drivers_to_indexes_and_profiles() {
         assert_eq!(cuda_tag_for((12, 9)).as_deref(), Some("cu128"));
+        assert_eq!(cuda_tag_for((13, 3)).as_deref(), Some("cu130"));
+        assert!(describe(&Gpu::Nvidia {
+            name: "NVIDIA RTX".into(),
+            driver: "1".into(),
+            cuda: None,
+            vram_mb: None,
+            compute_capability: None
+        })
+        .starts_with("NVIDIA RTX,"));
         assert_eq!(cuda_tag_for((12, 4)).as_deref(), Some("cu124"));
         assert_eq!(cuda_tag_for((12, 3)).as_deref(), Some("cu121"));
         assert_eq!(cuda_tag_for((11, 0)), None);

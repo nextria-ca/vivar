@@ -28,6 +28,8 @@ What works:
   sharing one lockfile, CUDA-aware Docker export.
 - **Rollout**: online installers, MSI/deb/rpm packages, self-upgrade with verified
   downloads, shell completions, `doctor`.
+- **Coming from elsewhere**: `import` for requirements.txt, conda environments, Pipfiles
+  and poetry projects; `check` for CI; SBOM export; delta and signed bundles.
 
 How it is built: projects, virtual environments, Python builds, running, bundles,
 verification, policy and upgrades are vivar's own code; dependency resolution and
@@ -162,6 +164,8 @@ vivar python list               # --all adds what can be downloaded
 More, all from the same binary:
 
 ```sh
+vivar import requirements.txt   # or environment.yml, Pipfile, poetry pyproject.toml: new project or add to this one
+vivar check                     # CI in one command: policy, lock freshness, hashes, licenses, audit, verify (--json)
 vivar shell                     # an interactive shell with the env activated
 vivar run test                  # a [tool.vivar.scripts] task; extra args are appended
 vivar run tool.py               # a PEP 723 script: its inline deps get a cached env of their own
@@ -186,6 +190,10 @@ vivar kernel install            # register .venv as a Jupyter kernel (needs ipyk
 vivar run --env-file .env train.py
 vivar python pin 3.13           # repin the project and rebuild .venv on it
 vivar diff a.tar.gz b.tar.gz    # what changed between two bundles
+vivar diff --patch a.tar.gz b.tar.gz        # a delta archive; `vivar unpack --apply delta.tar.gz <unpacked-a>` upgrades in place
+vivar unpack --dedupe-with ./other b.tar.gz # hard-link files identical to an already unpacked bundle
+vivar key generate && vivar pack --sign     # authenticate bundles; `unpack --require-signature` or policy enforces it
+vivar export sbom --format spdx # CycloneDX (default) or SPDX bill of materials from the lock
 vivar doctor                    # what's installed, configured, broken
 vivar env list / vivar clean    # what vivar keeps on disk; drop script envs and caches
 vivar completions zsh           # shell completion (bash, zsh, fish, powershell, elvish)
@@ -258,6 +266,23 @@ scp my-app-linux-x86_64.tar.gz machine-b:
 vivar unpack my-app-linux-x86_64.tar.gz      # on machine B -> ./my-app-linux-x86_64/
 source my-app-linux-x86_64/.venv/bin/activate
 ```
+
+**Deltas.** `vivar diff --patch old.tar.gz new.tar.gz` writes an archive holding only
+the files that changed (plus the new manifest and checksums). On the other machine,
+`vivar unpack --apply delta.tar.gz <dir>` upgrades the unpacked old bundle in place,
+refuses to apply onto anything but the exact base, and re-verifies every checksum
+afterwards. A torch upgrade travels as megabytes instead of gigabytes.
+
+**Authenticated bundles.** `vivar key generate` creates a 32-byte key in the config
+directory (copy it to the machines that unpack, or set `VIVAR_BUNDLE_KEY`).
+`pack --sign` writes an HMAC-SHA256 of the checksum list; `unpack --require-signature`,
+or `require-signed-bundles = true` in policy, refuses bundles that aren't signed with
+that key. It proves the bundle came from someone holding the key and wasn't altered;
+it is a shared secret, not a public-key signature.
+
+**Dedupe.** `unpack --dedupe-with <other-unpacked-bundle>` hard-links every file that is
+byte-identical (per both checksum lists) instead of storing it twice. Same filesystem
+only; it stops quietly otherwise.
 
 Every bundle carries a SHA-256 list of its files. `unpack` refuses an archive whose
 contents don't match it, and `vivar verify` on an unpacked bundle reports any file

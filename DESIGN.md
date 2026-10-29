@@ -225,8 +225,14 @@ Python, `uv pip install --python-platform --target`, hand-built venv under a fak
 that `unpack` rewrites), `--zstd`, `--use-host-cuda`, `require-wheels`, `telemetry`/
 `network` policy keys, `--env-file`, index credentials, `kernel install`, CUDA docker base.
 
-Deferred: native dependencies via conda-forge (phase 2), delta bundles, the in-process
-resolver that removes the `uv` binary, man pages.
+Open-source batch (2026-10-29): `import` (requirements/conda/Pipfile/poetry, `import.rs`),
+`check`, `export sbom` (CycloneDX/SPDX, `sbom.rs`), parallel wheelhouse downloads,
+`unpack --dedupe-with` (hard links by checksum), delta bundles (`diff --patch`,
+`unpack --apply`), HMAC-authenticated bundles (`sign.rs`, `key generate`, `pack --sign`,
+`require-signed-bundles`).
+
+Deferred: native dependencies via conda-forge (phase 2), public-key bundle signatures,
+the in-process resolver that removes the `uv` binary, man pages.
 
 ## 13. Open questions
 

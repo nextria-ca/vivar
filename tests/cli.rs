@@ -1642,3 +1642,284 @@ fn kernel_registration_and_cuda_docker_base() {
         );
     }
 }
+
+#[test]
+fn import_creates_projects_from_other_formats() {
+    let tmp = TempDir::new("import");
+    // requirements.txt into an empty directory: init + add in one go.
+    let a = tmp.0.join("reqs");
+    fs::create_dir_all(&a).unwrap();
+    fs::write(
+        a.join("requirements.txt"),
+        "six>=1.16\npycodestyle  # style\n-e ./local\n",
+    )
+    .unwrap();
+    let out = ok(&a, &["import", "requirements.txt", "--python", "3.12"]);
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("Initialized project")
+            && stdout.contains("added 2 requirement(s)")
+            && stdout.contains("skipped: -e ./local"),
+        "{stdout}"
+    );
+    ok(&a, &["run", "python", "-c", "import six, pycodestyle"]);
+    let text = read(&a.join("pyproject.toml"));
+    assert!(
+        text.contains("six>=1.16") && text.contains("pycodestyle"),
+        "{text}"
+    );
+
+    // A conda environment.yml: python pin, conda-only packages skipped, pip section honoured.
+    let b = tmp.0.join("conda");
+    fs::create_dir_all(&b).unwrap();
+    fs::write(b.join("environment.yml"), "name: sci\ndependencies:\n  - python=3.12\n  - six=1.17\n  - libgcc-ng\n  - pip\n  - pip:\n    - pycodestyle>=2.11\n").unwrap();
+    let out = ok(&b, &["import", "environment.yml"]);
+    assert!(
+        stdout_of(&out).contains("Initialized project `sci`"),
+        "{}",
+        stdout_of(&out)
+    );
+    assert!(stdout_of(&out).contains("skipped: libgcc-ng"));
+    assert_eq!(read(&b.join(".python-version")).trim(), "3.12");
+    ok(&b, &["run", "python", "-c", "import six, pycodestyle"]);
+
+    // A Pipfile with a dev group, imported into an existing project.
+    let c = tmp.0.join("pipfile");
+    fs::create_dir_all(&c).unwrap();
+    init(&c);
+    fs::write(
+        c.join("Pipfile"),
+        "[packages]\nsix = \"*\"\n\n[dev-packages]\npycodestyle = \">=2\"\n",
+    )
+    .unwrap();
+    let out = ok(&c, &["import", "Pipfile"]);
+    assert!(
+        stdout_of(&out).contains("to group dev"),
+        "{}",
+        stdout_of(&out)
+    );
+    let text = read(&c.join("pyproject.toml"));
+    assert!(
+        text.contains("[dependency-groups]") && text.contains("pycodestyle>=2"),
+        "{text}"
+    );
+}
+
+#[test]
+fn check_and_sbom() {
+    let tmp = TempDir::new("check");
+    let dir = &tmp.0;
+    init(dir);
+    ok(dir, &["add", "six"]);
+    let out = ok(dir, &["check", "--no-audit"]);
+    let text = stdout_of(&out);
+    assert!(
+        text.contains("all checks passed") && text.contains("lock") && text.contains("verify"),
+        "{text}"
+    );
+    let json = stdout_of(&ok(dir, &["check", "--no-audit", "--json"]));
+    assert!(
+        json.starts_with("{\"ok\":true") && json.contains("\"check\":\"licenses\""),
+        "{json}"
+    );
+    // A hand-edited dependency that is not locked fails the lock check.
+    let path = dir.join("pyproject.toml");
+    fs::write(
+        &path,
+        read(&path).replace("\"six", "\"pycodestyle\", \"six"),
+    )
+    .unwrap();
+    let out = vivar(dir, &["check", "--no-audit", "--no-verify"]);
+    assert!(!out.status.success());
+    assert!(stdout_of(&out).contains("FAIL lock"), "{}", stdout_of(&out));
+    ok(dir, &["sync"]);
+
+    for (fmt, marker) in [
+        ("cyclonedx", "\"bomFormat\":\"CycloneDX\""),
+        ("spdx", "\"spdxVersion\":\"SPDX-2.3\""),
+    ] {
+        let sbom = stdout_of(&ok(dir, &["export", "sbom", "--format", fmt, "-o", "-"]));
+        assert!(
+            sbom.contains(marker) && sbom.contains("pkg:pypi/six@"),
+            "{sbom}"
+        );
+        // Valid JSON, as a consumer would parse it.
+        fs::write(dir.join("sbom.json"), &sbom).unwrap();
+        ok(
+            dir,
+            &[
+                "run",
+                "python",
+                "-c",
+                "import json; json.load(open('sbom.json'))",
+            ],
+        );
+    }
+    ok(dir, &["export", "sbom"]);
+    assert!(dir.join("sbom.cyclonedx.json").is_file());
+}
+
+#[test]
+fn delta_bundles_dedupe_and_signing() {
+    let tmp = TempDir::new("delta");
+    let dir = &tmp.0;
+    let conf = tmp.0.join("conf");
+    let run = |cwd: &Path, args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_vivar"))
+            .current_dir(cwd)
+            .env("XDG_CONFIG_HOME", &conf)
+            .env("APPDATA", &conf)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let okr = |cwd: &Path, args: &[&str]| {
+        let out = run(cwd, args);
+        assert!(
+            out.status.success(),
+            "vivar {} failed:\n{}{}",
+            args.join(" "),
+            stdout_of(&out),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    };
+    init(dir);
+    ok(dir, &["add", "six"]);
+
+    // Signing needs a key; without one it says so.
+    let out = run(
+        dir,
+        &[
+            "pack",
+            "--sign",
+            "-o",
+            tmp.0.join("x.tar.gz").to_str().unwrap(),
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no bundle key"));
+    let out = okr(dir, &["key", "generate"]);
+    assert!(stdout_of(&out).contains("wrote bundle key"));
+    assert!(!run(dir, &["key", "generate"]).status.success()); // never silently replaced
+    assert!(stdout_of(&okr(dir, &["key", "show"])).contains("configured"));
+
+    let a = tmp.0.join("a.tar.gz");
+    okr(dir, &["pack", "--sign", "-o", a.to_str().unwrap()]);
+    ok(dir, &["add", "pycodestyle"]);
+    let b = tmp.0.join("b.tar.gz");
+    okr(dir, &["pack", "--sign", "-o", b.to_str().unwrap()]);
+
+    // Signed bundles unpack with --require-signature; a foreign key is refused.
+    let a_dir = tmp.0.join("a-dir");
+    assert!(stdout_of(&okr(
+        &tmp.0,
+        &[
+            "unpack",
+            "--require-signature",
+            a.to_str().unwrap(),
+            a_dir.to_str().unwrap()
+        ]
+    ))
+    .contains("signature verified"));
+    let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
+        .current_dir(&tmp.0)
+        .env("VIVAR_BUNDLE_KEY", "ab".repeat(32))
+        .args([
+            "unpack",
+            "--require-signature",
+            a.to_str().unwrap(),
+            tmp.0.join("foreign").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("does not match"));
+    // An unsigned bundle fails when a signature is required (here via org policy).
+    let unsigned = tmp.0.join("u.tar.gz");
+    ok(dir, &["pack", "-o", unsigned.to_str().unwrap()]);
+    let policy = tmp.0.join("org.toml");
+    fs::write(&policy, "[policy]\nrequire-signed-bundles = true\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
+        .current_dir(&tmp.0)
+        .env("VIVAR_POLICY", &policy)
+        .args([
+            "unpack",
+            unsigned.to_str().unwrap(),
+            tmp.0.join("u-dir").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not signed"));
+
+    // A delta from a to b applies onto the unpacked a and yields a verified b.
+    let delta = tmp.0.join("a-to-b.tar.gz");
+    let out = okr(
+        &tmp.0,
+        &[
+            "diff",
+            "--patch",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "-o",
+            delta.to_str().unwrap(),
+        ],
+    );
+    assert!(stdout_of(&out).contains("changed"), "{}", stdout_of(&out));
+    assert!(
+        fs::metadata(&delta).unwrap().len() < fs::metadata(&b).unwrap().len() / 2,
+        "delta is not small"
+    );
+    let out = vivar(&a_dir, &["run", "python", "-c", "import pycodestyle"]);
+    assert!(!out.status.success());
+    okr(
+        &tmp.0,
+        &[
+            "unpack",
+            "--apply",
+            "--require-signature",
+            delta.to_str().unwrap(),
+            a_dir.to_str().unwrap(),
+        ],
+    );
+    ok(&a_dir, &["run", "python", "-c", "import six, pycodestyle"]);
+    assert!(stdout_of(&ok(&a_dir, &["verify"])).contains("integrity: all bundled files match"));
+    // Applying it again is refused: the directory no longer matches the base.
+    assert!(!run(
+        &tmp.0,
+        &[
+            "unpack",
+            "--apply",
+            delta.to_str().unwrap(),
+            a_dir.to_str().unwrap()
+        ]
+    )
+    .status
+    .success());
+
+    // Dedupe hard-links identical files against an existing unpacked bundle.
+    let b_dir = tmp.0.join("b-dir");
+    let out = okr(
+        &tmp.0,
+        &[
+            "unpack",
+            "--dedupe-with",
+            a_dir.to_str().unwrap(),
+            b.to_str().unwrap(),
+            b_dir.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        stdout_of(&out).contains("deduplicated"),
+        "{}",
+        stdout_of(&out)
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let shared = fs::metadata(site_packages(&b_dir).join("six.py")).unwrap();
+        assert!(shared.nlink() >= 2, "six.py was not hard-linked");
+    }
+    ok(&b_dir, &["run", "python", "-c", "import six, pycodestyle"]);
+}

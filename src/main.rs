@@ -6,13 +6,16 @@ mod doctor;
 mod envs;
 mod export;
 mod gpu;
+mod import;
 mod json;
 mod kernel;
 mod licenses;
 mod lock;
 mod project;
 mod python;
+mod sbom;
 mod sha256;
+mod sign;
 mod tool;
 mod upgrade;
 mod venv;
@@ -63,6 +66,31 @@ enum Command {
         /// `cpu`, `rocm6.2`, `auto` (match this machine's GPU; the default) or `none` (PyPI as is)
         #[arg(long)]
         cuda: Option<String>,
+    },
+    /// Create or extend a project from requirements.txt, a conda environment.yml,
+    /// a Pipfile or a poetry pyproject.toml
+    Import {
+        file: PathBuf,
+        /// Python version for a new project (default: what the file pins, else newest installed)
+        #[arg(long)]
+        python: Option<String>,
+    },
+    /// Everything CI wants in one go: declared deps vs policy, lock freshness,
+    /// hashes, licenses, vulnerabilities and a verify run
+    Check {
+        /// Skip the OSV vulnerability query (offline machines)
+        #[arg(long)]
+        no_audit: bool,
+        /// Skip the import/native-library verification
+        #[arg(long)]
+        no_verify: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage the shared key that authenticates bundles
+    Key {
+        #[command(subcommand)]
+        command: KeyCommand,
     },
     /// Open an interactive shell with the project environment activated
     Shell {
@@ -137,7 +165,16 @@ enum Command {
         command: ExportCommand,
     },
     /// Show what changed between two bundles (archives or directories)
-    Diff { a: PathBuf, b: PathBuf },
+    Diff {
+        a: PathBuf,
+        b: PathBuf,
+        /// Write a delta archive that turns an unpacked `a` into `b` (`vivar unpack --apply`)
+        #[arg(long)]
+        patch: bool,
+        /// Delta file (default: <b>.delta.tar.gz)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
     /// Run and install command-line tools in their own environments
     Tool {
         #[command(subcommand)]
@@ -181,12 +218,24 @@ enum Command {
         /// Profile to bundle (default: the one .venv was last synced with)
         #[arg(long)]
         profile: Option<String>,
+        /// Authenticate the bundle with the bundle key (`vivar key generate`)
+        #[arg(long)]
+        sign: bool,
     },
     /// Extract a bundle made by `vivar pack` and make it activatable here
     Unpack {
         archive: PathBuf,
         /// Directory to unpack into (default: the archive name without .tar.gz)
         dest: Option<PathBuf>,
+        /// `archive` is a delta from `vivar diff --patch`; update the unpacked bundle in `dest`
+        #[arg(long)]
+        apply: bool,
+        /// Refuse a bundle that isn't signed with the bundle key
+        #[arg(long)]
+        require_signature: bool,
+        /// Hard-link files identical to this already-unpacked bundle (same filesystem)
+        #[arg(long)]
+        dedupe_with: Option<PathBuf>,
     },
     /// Check every installed package imports and its native libraries, CUDA
     /// driver, and scripts work on this machine
@@ -227,6 +276,15 @@ enum ExportCommand {
     /// A Dockerfile that installs exactly what uv.lock pins
     Docker {
         /// Output file (default: Dockerfile in the project root; `-` for stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// A software bill of materials from the lockfile
+    Sbom {
+        /// cyclonedx (default) or spdx
+        #[arg(long, default_value = "cyclonedx")]
+        format: String,
+        /// Output file (default: sbom.<format>.json in the project root; `-` for stdout)
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
@@ -285,6 +343,17 @@ enum ProfileCommand {
     },
     /// List the project's profiles and which one fits this machine
     List,
+}
+
+#[derive(Subcommand)]
+enum KeyCommand {
+    /// Create the bundle key (32 random bytes) in the config directory
+    Generate {
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print where the key is read from and whether one is configured
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -388,6 +457,99 @@ fn main() -> Result<()> {
             backend.remove(&cwd, &packages)?;
             venv::mark_synced(project.venv_root());
         }
+        Command::Import { file, python } => {
+            let imported = import::read(&file)?;
+            let project = match project {
+                Some(p) => p,
+                None => {
+                    let python = python.or(imported.python.clone());
+                    let interpreter = venv::interpreter(python.as_deref())?;
+                    let name = imported
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| project::default_name(&cwd));
+                    project::init_files(&cwd, &name, interpreter.version, false)?;
+                    println!(
+                        "Initialized project `{name}` on CPython {}",
+                        interpreter.version_string()
+                    );
+                    Project::require(&cwd)?
+                }
+            };
+            let policy = project.policy()?;
+            let backend = UvBackend::new(&policy);
+            venv::ensure(project.venv_root(), &project.name())?;
+            let all: Vec<String> = imported
+                .requirements
+                .iter()
+                .map(|(_, r)| r.clone())
+                .collect();
+            project.check_requirements(&all)?;
+            let mut groups: Vec<Option<String>> = Vec::new();
+            for (g, _) in &imported.requirements {
+                if !groups.contains(g) {
+                    groups.push(g.clone());
+                }
+            }
+            for group in groups {
+                let reqs: Vec<String> = imported
+                    .requirements
+                    .iter()
+                    .filter(|(g, _)| *g == group)
+                    .map(|(_, r)| r.clone())
+                    .collect();
+                route_pytorch(&project, &reqs, imported.cuda.as_deref())?;
+                let list =
+                    std::env::temp_dir().join(format!("vivar-import-{}.txt", std::process::id()));
+                std::fs::write(&list, reqs.join("\n") + "\n")?;
+                let added = backend.add_requirements(&cwd, &list, group.as_deref());
+                let _ = std::fs::remove_file(&list);
+                added?;
+                println!(
+                    "added {} requirement(s){}",
+                    reqs.len(),
+                    group
+                        .as_deref()
+                        .map(|g| format!(" to group {g}"))
+                        .unwrap_or_default()
+                );
+            }
+            venv::mark_synced(project.venv_root());
+            after_install(&project, &policy)?;
+            for s in &imported.skipped {
+                println!("skipped: {s}");
+            }
+            if !imported.skipped.is_empty() {
+                println!("(conda-only packages and local sources need a hand; see README)");
+            }
+        }
+        Command::Check {
+            no_audit,
+            no_verify,
+            json,
+        } => {
+            let project = require(project, &cwd)?;
+            std::process::exit(run_check(
+                &project, &policy, &backend, no_audit, no_verify, json,
+            )?);
+        }
+        Command::Key { command } => match command {
+            KeyCommand::Generate { force } => {
+                let path = sign::generate(force)?;
+                println!(
+                    "wrote bundle key to {} (copy it to the machines that unpack)",
+                    path.display()
+                );
+            }
+            KeyCommand::Show => {
+                let configured = sign::key()?.is_some();
+                println!(
+                    "bundle key: {} (VIVAR_BUNDLE_KEY or {})",
+                    if configured { "configured" } else { "none" },
+                    sign::key_path()?.display()
+                );
+            }
+        },
         Command::Shell { env_file } => {
             let project = require(project, &cwd)?;
             venv::warn_if_stale(project.venv_root());
@@ -613,6 +775,27 @@ fn main() -> Result<()> {
             backend.build(&cwd)?;
         }
         Command::Export { command } => match command {
+            ExportCommand::Sbom { format, output } => {
+                let project = require(project, &cwd)?;
+                let fmt = match format.to_lowercase().as_str() {
+                    "cyclonedx" | "cdx" => sbom::Format::CycloneDx,
+                    "spdx" => sbom::Format::Spdx,
+                    other => bail!("unknown SBOM format {other}; use cyclonedx or spdx"),
+                };
+                let text = sbom::generate(&project, fmt)?;
+                match output.as_deref().and_then(|p| p.to_str()) {
+                    Some("-") => print!("{text}"),
+                    _ => {
+                        let path = output.unwrap_or_else(|| {
+                            project
+                                .root
+                                .join(format!("sbom.{}.json", format.to_lowercase()))
+                        });
+                        std::fs::write(&path, text)?;
+                        println!("wrote {}", path.display());
+                    }
+                }
+            }
             ExportCommand::Requirements { output } => {
                 let project = require(project, &cwd)?;
                 let path = output.unwrap_or_else(|| project.root.join("requirements.txt"));
@@ -654,7 +837,24 @@ fn main() -> Result<()> {
                 }
             }
         },
-        Command::Diff { a, b } => {
+        Command::Diff {
+            a,
+            b,
+            patch,
+            output,
+        } => {
+            if patch {
+                let out = output.unwrap_or_else(|| {
+                    let name = b.file_name().unwrap_or_default().to_string_lossy();
+                    PathBuf::from(format!(
+                        "{}.delta.tar.gz",
+                        name.trim_end_matches(".tar.gz")
+                            .trim_end_matches(".tar.zst")
+                    ))
+                });
+                println!("{}", bundle::make_delta(&a, &b, &out)?);
+                return Ok(());
+            }
             let out = bundle::diff(&a, &b)?;
             if out.is_empty() {
                 println!("no differences");
@@ -696,6 +896,7 @@ fn main() -> Result<()> {
             zstd,
             use_host_cuda,
             profile,
+            sign,
         } => {
             let project = require(project, &cwd)?;
             project.check_declared()?;
@@ -709,6 +910,7 @@ fn main() -> Result<()> {
                 slim,
                 zstd,
                 host_cuda: use_host_cuda,
+                sign,
             };
             let archive = match target {
                 Some(target) => {
@@ -756,7 +958,21 @@ fn main() -> Result<()> {
                 archive.file_name().unwrap_or_default().to_string_lossy()
             );
         }
-        Command::Unpack { archive, dest } => {
+        Command::Unpack {
+            archive,
+            dest,
+            apply,
+            require_signature,
+            dedupe_with,
+        } => {
+            let require_signature = require_signature || policy.require_signed_bundles;
+            if apply {
+                let dir = dest.ok_or_else(|| {
+                    anyhow::anyhow!("--apply needs the unpacked bundle directory")
+                })?;
+                bundle::apply_delta(&archive, &dir, require_signature)?;
+                return Ok(());
+            }
             let dest = dest.unwrap_or_else(|| {
                 let stem = archive.file_name().unwrap_or_default().to_string_lossy();
                 PathBuf::from(
@@ -765,7 +981,7 @@ fn main() -> Result<()> {
                         .trim_end_matches(".tar.zst"),
                 )
             });
-            let dest = bundle::unpack(&archive, &dest)?;
+            let dest = bundle::unpack(&archive, &dest, require_signature, dedupe_with.as_deref())?;
             let bin = dest.join(".venv").join(venv::BIN);
             if cfg!(windows) {
                 println!(
@@ -884,10 +1100,164 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// `vivar check`: every gate in one pass. Returns the exit code.
+fn run_check(
+    project: &Project,
+    policy: &project::Policy,
+    backend: &UvBackend,
+    no_audit: bool,
+    no_verify: bool,
+    json: bool,
+) -> Result<i32> {
+    let mut results: Vec<(&'static str, &'static str, String)> = Vec::new();
+    record(
+        &mut results,
+        "policy",
+        project
+            .check_declared()
+            .map(|()| "declared dependencies pass the deny list".to_owned()),
+    );
+    record(
+        &mut results,
+        "lock",
+        backend
+            .lock_check(&project.root)
+            .map(|()| "uv.lock is present and up to date".to_owned()),
+    );
+    record(
+        &mut results,
+        "hashes",
+        check_hashes(project, policy).map(|()| {
+            if policy.require_hashes {
+                "all artifacts hashed and from the index".to_owned()
+            } else {
+                "not required by policy".to_owned()
+            }
+        }),
+    );
+    let venv_dir = project.venv_root().join(".venv");
+    let has_env = venv_dir.join("pyvenv.cfg").is_file();
+    record(
+        &mut results,
+        "env",
+        if has_env {
+            Ok("present".to_owned())
+        } else {
+            Err(anyhow::anyhow!("no .venv; run `vivar sync`"))
+        },
+    );
+    record(
+        &mut results,
+        "licenses",
+        licenses::check(
+            &venv_dir,
+            policy.allow_licenses.as_deref(),
+            &policy.license_exceptions,
+        )
+        .map(|()| {
+            if policy.allow_licenses.is_some() {
+                "all within the allowlist".to_owned()
+            } else {
+                "no allowlist set".to_owned()
+            }
+        }),
+    );
+    if no_audit {
+        results.push(("audit", "skipped", "--no-audit".to_owned()));
+    } else {
+        record(
+            &mut results,
+            "audit",
+            audit::run(project.venv_root()).and_then(|f| {
+                if f.is_empty() {
+                    Ok("no known vulnerabilities".to_owned())
+                } else {
+                    let list: Vec<String> = f
+                        .iter()
+                        .map(|x| format!("{} {} ({})", x.name, x.version, x.ids.join(", ")))
+                        .collect();
+                    Err(anyhow::anyhow!(
+                        "{} vulnerable package(s): {}",
+                        f.len(),
+                        list.join("; ")
+                    ))
+                }
+            }),
+        );
+    }
+    if no_verify {
+        results.push(("verify", "skipped", "--no-verify".to_owned()));
+    } else if has_env {
+        record(
+            &mut results,
+            "verify",
+            verify::run(&venv_dir, false, false, true).and_then(|(code, _)| {
+                if code == 0 {
+                    Ok("every package imports and loads".to_owned())
+                } else {
+                    Err(anyhow::anyhow!(
+                        "verify found problems; run `vivar verify` for details"
+                    ))
+                }
+            }),
+        );
+    } else {
+        results.push(("verify", "skipped", "no environment".to_owned()));
+    }
+    let failed = results.iter().filter(|(_, s, _)| *s == "fail").count();
+    if json {
+        let items: Vec<String> = results
+            .iter()
+            .map(|(n, st, d)| {
+                format!(
+                    "{{\"check\":{},\"status\":{},\"detail\":{}}}",
+                    json::quote(n),
+                    json::quote(st),
+                    json::quote(d)
+                )
+            })
+            .collect();
+        println!(
+            "{{\"ok\":{},\"checks\":[{}]}}",
+            failed == 0,
+            items.join(",")
+        );
+    } else {
+        for (n, st, d) in &results {
+            let tag = match *st {
+                "ok" => "ok  ",
+                "fail" => "FAIL",
+                _ => "skip",
+            };
+            println!("{tag} {n:<9} {d}");
+        }
+        println!(
+            "{}",
+            if failed == 0 {
+                "all checks passed"
+            } else {
+                "checks failed"
+            }
+        );
+    }
+    Ok(if failed == 0 { 0 } else { 1 })
+}
+
 /// Runs `op` (an add or a profile add) so that a failure, including a policy
 /// rejection after install, leaves the project files and the environment as
 /// they were: pyproject.toml and uv.lock are restored, and the env is re-synced
 /// only if something actually changed in it.
+fn record(
+    results: &mut Vec<(&'static str, &'static str, String)>,
+    name: &'static str,
+    r: Result<String>,
+) {
+    match r {
+        Ok(detail) => results.push((name, "ok", detail)),
+        Err(e) => results.push((name, "fail", e.to_string())),
+    }
+}
+
 fn transact(
     project: &Project,
     backend: &UvBackend,

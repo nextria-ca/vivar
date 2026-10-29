@@ -29,6 +29,10 @@ pub trait Backend {
     fn build(&self, dir: &Path) -> Result<()>;
     /// Installs requirement specs into the environment whose interpreter is `python`.
     fn install(&self, python: &Path, specs: &[String]) -> Result<()>;
+    /// Adds every requirement in a pip requirements file (`vivar import`).
+    fn add_requirements(&self, dir: &Path, file: &Path, group: Option<&str>) -> Result<()>;
+    /// Fails when `uv.lock` is missing or would change on re-resolve.
+    fn lock_check(&self, dir: &Path) -> Result<()>;
     /// Writes the lock as a pinned, hashed `requirements.txt`.
     fn export_requirements(&self, dir: &Path, output: &Path) -> Result<()>;
     /// Lays out the lock's packages for another machine (`triple`, `python`
@@ -199,6 +203,21 @@ impl Backend for UvBackend {
     fn build(&self, dir: &Path) -> Result<()> {
         let mut cmd = self.uv(dir);
         cmd.arg("build");
+        Self::check(cmd)
+    }
+
+    fn add_requirements(&self, dir: &Path, file: &Path, group: Option<&str>) -> Result<()> {
+        let mut cmd = self.uv(dir);
+        cmd.args(["add", "--requirements"]).arg(file);
+        if let Some(group) = group {
+            cmd.args(["--group", group]);
+        }
+        Self::check(cmd)
+    }
+
+    fn lock_check(&self, dir: &Path) -> Result<()> {
+        let mut cmd = self.uv(dir);
+        cmd.args(["lock", "--check"]);
         Self::check(cmd)
     }
 

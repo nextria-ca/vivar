@@ -165,8 +165,8 @@ pub fn verify_checksums(dir: &Path) -> Result<Vec<String>> {
         // A slim bundle legitimately lacks libpython; anything else unlisted is foreign.
         let lenient = PackOptions {
             slim: true,
-            zstd: false,
             host_cuda: true,
+            ..PackOptions::default()
         };
         if !listed.contains(&member)
             && !excluded(&rel, python_dir, &mm, lenient)
@@ -334,6 +334,8 @@ pub struct PackOptions {
     pub zstd: bool,
     /// Drop the NVIDIA libraries from `nvidia-*` wheels; the target supplies CUDA.
     pub host_cuda: bool,
+    /// Authenticate the bundle with the org's bundle key (`vivar key generate`).
+    pub sign: bool,
 }
 
 /// The files a bundle is made from.
@@ -587,10 +589,15 @@ fn archive(tree: &Tree, name: &str, output: Option<&Path>, opts: PackOptions) ->
     fs::create_dir_all(&staging)?;
     fs::write(staging.join(MANIFEST), manifest.to_string())?;
     let mm = major_minor(&tree.version);
-    fs::write(
-        staging.join(CHECKSUMS),
-        checksums(&tree.root, &tree.python_root, python_dir, &mm, opts)?,
-    )?;
+    let sums = checksums(&tree.root, &tree.python_root, python_dir, &mm, opts)?;
+    fs::write(staging.join(CHECKSUMS), &sums)?;
+    if opts.sign {
+        let key = crate::sign::require_key()?;
+        fs::write(
+            staging.join(crate::sign::SIGNATURE),
+            crate::sign::sign(sums.as_bytes(), &key),
+        )?;
+    }
 
     let mut tar = Command::new("tar");
     tar.arg("-c");
@@ -640,10 +647,11 @@ fn archive(tree: &Tree, name: &str, output: Option<&Path>, opts: PackOptions) ->
         .arg("-C")
         .arg(&staging)
         .arg(MANIFEST)
-        .arg(CHECKSUMS)
-        .arg("-C")
-        .arg(&tree.root)
-        .arg(".venv");
+        .arg(CHECKSUMS);
+    if opts.sign {
+        tar.arg(crate::sign::SIGNATURE);
+    }
+    tar.arg("-C").arg(&tree.root).arg(".venv");
     for file in ["pyproject.toml", "uv.lock", ".python-version"] {
         if tree.root.join(file).is_file() {
             tar.arg(file);
@@ -666,7 +674,12 @@ fn archive(tree: &Tree, name: &str, output: Option<&Path>, opts: PackOptions) ->
 
 /// Extracts a bundle into `dest` and points the venv at the Python that came
 /// with it. Returns the absolute destination.
-pub fn unpack(archive: &Path, dest: &Path) -> Result<PathBuf> {
+pub fn unpack(
+    archive: &Path,
+    dest: &Path,
+    require_signature: bool,
+    dedupe_with: Option<&Path>,
+) -> Result<PathBuf> {
     fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
     let dest = absolute(dest)?;
     if dest.join(".venv").exists() {
@@ -675,35 +688,14 @@ pub fn unpack(archive: &Path, dest: &Path) -> Result<PathBuf> {
             dest.display()
         );
     }
-
-    let status = Command::new("tar")
-        .arg("-xf")
-        .arg(archive)
-        .arg("-C")
-        .arg(&dest)
-        .status()
-        .context("failed to run `tar`")?;
-    if !status.success() {
-        bail!("tar exited with status {}", status.code().unwrap_or(1));
+    extract(archive, &dest)?;
+    if !dest.join(MANIFEST).is_file() {
+        bail!(
+            "{} is not a vivar bundle (no {MANIFEST})",
+            archive.display()
+        );
     }
-
-    let manifest: DocumentMut = fs::read_to_string(dest.join(MANIFEST))
-        .with_context(|| {
-            format!(
-                "{} is not a vivar bundle (no {MANIFEST})",
-                archive.display()
-            )
-        })?
-        .parse()
-        .context("parsing bundle manifest")?;
-    let field = |key: &str| -> Result<String> {
-        manifest
-            .get(key)
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-            .ok_or_else(|| anyhow!("bundle manifest is missing `{key}`"))
-    };
-
+    check_signature(&dest, require_signature)?;
     let bad = verify_checksums(&dest)?;
     if !bad.is_empty() {
         bail!(
@@ -717,7 +709,66 @@ pub fn unpack(archive: &Path, dest: &Path) -> Result<PathBuf> {
                 .join("\n  ")
         );
     }
+    relocate(&dest)?;
+    if let Some(other) = dedupe_with {
+        let saved = dedupe(&dest, other)?;
+        println!(
+            "deduplicated {:.1} MB against {}",
+            saved as f64 / 1e6,
+            other.display()
+        );
+    }
+    Ok(dest)
+}
 
+fn extract(archive: &Path, dest: &Path) -> Result<()> {
+    let status = Command::new("tar")
+        .arg("-xf")
+        .arg(archive)
+        .arg("-C")
+        .arg(dest)
+        .status()
+        .context("failed to run `tar`")?;
+    if !status.success() {
+        bail!("tar exited with status {}", status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+/// Verifies the signature when there is one or when one is required; the
+/// key comes from `VIVAR_BUNDLE_KEY` or the config directory.
+fn check_signature(dir: &Path, required: bool) -> Result<()> {
+    let has_sig = dir.join(crate::sign::SIGNATURE).is_file();
+    if !has_sig && !required {
+        return Ok(());
+    }
+    if !has_sig {
+        bail!("this bundle is not signed and policy (or --require-signature) demands it");
+    }
+    let key = crate::sign::require_key()?;
+    crate::sign::verify(dir, &key)?;
+    println!("signature verified with the bundle key");
+    Ok(())
+}
+
+fn manifest_of(dir: &Path) -> Result<DocumentMut> {
+    fs::read_to_string(dir.join(MANIFEST))
+        .with_context(|| format!("{} has no {MANIFEST}", dir.display()))?
+        .parse()
+        .context("parsing bundle manifest")
+}
+
+/// Points an extracted bundle's venv at its own Python: symlinks, text paths
+/// and (Windows) launcher resources. Idempotent, so a delta can re-run it.
+fn relocate(dest: &Path) -> Result<()> {
+    let manifest = manifest_of(dest)?;
+    let field = |key: &str| -> Result<String> {
+        manifest
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("bundle manifest is missing `{key}`"))
+    };
     let bundle_platform = field("platform")?;
     if bundle_platform != platform() {
         bail!(
@@ -775,7 +826,264 @@ pub fn unpack(archive: &Path, dest: &Path) -> Result<PathBuf> {
     if cfg!(windows) {
         patch_launchers(&bin, &old_venv, &old_home, &python_dir)?;
     }
-    Ok(dest)
+    Ok(())
+}
+
+/// Parses a checksum list into `(member, sha256)` pairs.
+fn parse_checksums(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|l| l.split_once("  "))
+        .map(|(d, m)| (m.to_owned(), d.to_owned()))
+        .collect()
+}
+
+/// Replaces files in `dest` that are byte-identical (per both checksum lists)
+/// to files in `other` with hard links to them. Returns the bytes saved.
+fn dedupe(dest: &Path, other: &Path) -> Result<u64> {
+    let theirs: std::collections::HashMap<String, String> = parse_checksums(
+        &fs::read_to_string(other.join(CHECKSUMS))
+            .with_context(|| format!("{} is not an unpacked vivar bundle", other.display()))?,
+    )
+    .into_iter()
+    .collect();
+    let mut saved = 0;
+    for (member, digest) in parse_checksums(&fs::read_to_string(dest.join(CHECKSUMS))?) {
+        if theirs.get(&member) != Some(&digest) {
+            continue;
+        }
+        let (mine, existing) = (dest.join(&member), other.join(&member));
+        let (Ok(a), Ok(b)) = (fs::metadata(&mine), fs::metadata(&existing)) else {
+            continue;
+        };
+        if !a.is_file() || !b.is_file() || a.len() != b.len() {
+            continue;
+        }
+        let tmp = mine.with_extension("vivar-dedupe");
+        if fs::hard_link(&existing, &tmp).is_err() {
+            // Different filesystem or no hard-link support: stop quietly.
+            let _ = fs::remove_file(&tmp);
+            break;
+        }
+        fs::rename(&tmp, &mine)?;
+        saved += a.len();
+    }
+    Ok(saved)
+}
+
+const DELTA: &str = "vivar-delta.toml";
+
+/// `vivar diff --patch old new -o delta`: an archive holding what changed
+/// between two bundles of the same environment line, plus the new manifest and
+/// checksums. `unpack --apply` turns an unpacked `old` into `new`.
+pub fn make_delta(old: &Path, new: &Path, output: &Path) -> Result<String> {
+    let tmp = std::env::temp_dir().join(format!("vivar-delta-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let result = (|| {
+        let (old_dir, new_dir, stage) = (tmp.join("old"), tmp.join("new"), tmp.join("stage"));
+        for d in [&old_dir, &new_dir, &stage] {
+            fs::create_dir_all(d)?;
+        }
+        // Only the checksum lists of the old bundle are needed; everything of the new one.
+        let status = Command::new("tar")
+            .arg("-xf")
+            .arg(old)
+            .arg("-C")
+            .arg(&old_dir)
+            .args([MANIFEST, CHECKSUMS])
+            .status()
+            .context("failed to run `tar`")?;
+        if !status.success() {
+            bail!("{} is not a vivar bundle", old.display());
+        }
+        extract(new, &new_dir)?;
+        let old_m = manifest_of(&old_dir)?;
+        let new_m = manifest_of(&new_dir)?;
+        for key in ["platform", "python-dir"] {
+            let (a, b) = (
+                old_m.get(key).and_then(|v| v.as_str()),
+                new_m.get(key).and_then(|v| v.as_str()),
+            );
+            if key == "platform" && a != b {
+                bail!("bundles are for different platforms ({:?} vs {:?})", a, b);
+            }
+        }
+        let old_sums = fs::read(old_dir.join(CHECKSUMS))?;
+        let old_list: std::collections::HashMap<String, String> =
+            parse_checksums(&String::from_utf8_lossy(&old_sums))
+                .into_iter()
+                .collect();
+        let new_list = parse_checksums(&fs::read_to_string(new_dir.join(CHECKSUMS))?);
+
+        let mut changed = Vec::new();
+        for (member, digest) in &new_list {
+            if old_list.get(member) != Some(digest) {
+                changed.push(member.clone());
+            }
+        }
+        let new_names: std::collections::HashSet<&String> =
+            new_list.iter().map(|(m, _)| m).collect();
+        let removed: Vec<&String> = old_list.keys().filter(|m| !new_names.contains(m)).collect();
+
+        // Files unpack rewrites aren't in the lists; they always travel, they're small.
+        let mut always = vec![".venv/pyvenv.cfg".to_owned()];
+        if let Ok(entries) = fs::read_dir(new_dir.join(".venv").join(VENV_BIN)) {
+            for e in entries.flatten() {
+                always.push(format!(
+                    ".venv/{VENV_BIN}/{}",
+                    e.file_name().to_string_lossy()
+                ));
+            }
+        }
+        for member in changed.iter().chain(always.iter()) {
+            let (from, to) = (new_dir.join(member), stage.join(member));
+            let Ok(meta) = fs::symlink_metadata(&from) else {
+                continue;
+            };
+            fs::create_dir_all(to.parent().context("member has no parent")?)?;
+            if meta.is_symlink() {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(fs::read_link(&from)?, &to)?;
+            } else {
+                fs::copy(&from, &to)?;
+            }
+        }
+        fs::copy(new_dir.join(MANIFEST), stage.join(MANIFEST))?;
+        fs::copy(new_dir.join(CHECKSUMS), stage.join(CHECKSUMS))?;
+        if new_dir.join(crate::sign::SIGNATURE).is_file() {
+            fs::copy(
+                new_dir.join(crate::sign::SIGNATURE),
+                stage.join(crate::sign::SIGNATURE),
+            )?;
+        }
+        let mut delta = DocumentMut::new();
+        delta["base-checksums"] = value(crate::sha256::hex(&{
+            let mut h = crate::sha256::Sha256::new();
+            h.update(&old_sums);
+            h.finish()
+        }));
+        let mut removed_arr = toml_edit::Array::new();
+        for r in &removed {
+            removed_arr.push(r.as_str());
+        }
+        delta["removed"] = value(removed_arr);
+        delta["created-by"] = value(concat!("vivar ", env!("CARGO_PKG_VERSION")));
+        fs::write(stage.join(DELTA), delta.to_string())?;
+
+        let output = absolute(output)?;
+        let status = Command::new("tar")
+            .arg("-czf")
+            .arg(&output)
+            .arg("-C")
+            .arg(&stage)
+            .arg(".")
+            .status()
+            .context("failed to run `tar`")?;
+        if !status.success() {
+            bail!("tar exited with status {}", status.code().unwrap_or(1));
+        }
+        let size = fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
+        Ok(format!(
+            "{} changed, {} removed; delta {} ({:.1} MB)",
+            changed.len(),
+            removed.len(),
+            output.display(),
+            size as f64 / 1e6
+        ))
+    })();
+    let _ = fs::remove_dir_all(&tmp);
+    result
+}
+
+/// `vivar unpack --apply delta dir`: brings an unpacked bundle up to the new
+/// one. The directory must still match the delta's base checksum list.
+pub fn apply_delta(delta: &Path, dir: &Path, require_signature: bool) -> Result<()> {
+    let dir = absolute(dir)?;
+    if !dir.join(CHECKSUMS).is_file() {
+        bail!("{} is not an unpacked vivar bundle", dir.display());
+    }
+    let tmp = std::env::temp_dir().join(format!("vivar-apply-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp)?;
+    let result = (|| {
+        extract(delta, &tmp)?;
+        let meta: DocumentMut = fs::read_to_string(tmp.join(DELTA))
+            .with_context(|| format!("{} is not a vivar delta", delta.display()))?
+            .parse()?;
+        let base = meta
+            .get("base-checksums")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let current = crate::sha256::file(&dir.join(CHECKSUMS))?;
+        if base != current {
+            bail!(
+                "this delta was made against a different bundle than the one in {}",
+                dir.display()
+            );
+        }
+        check_signature(&tmp, require_signature)?;
+        let removed: Vec<String> = meta
+            .get("removed")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for member in &removed {
+            let _ = fs::remove_file(dir.join(member));
+        }
+        // Copy the delta's files over; the old bundle's relocated files are replaced.
+        copy_tree(&tmp, &dir)?;
+        let _ = fs::remove_file(dir.join(DELTA));
+        if !tmp.join(crate::sign::SIGNATURE).is_file() {
+            let _ = fs::remove_file(dir.join(crate::sign::SIGNATURE));
+        }
+        let bad = verify_checksums(&dir)?;
+        if !bad.is_empty() {
+            bail!(
+                "the updated bundle fails its integrity check ({} file(s)):\n  {}",
+                bad.len(),
+                bad.iter()
+                    .take(20)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n  ")
+            );
+        }
+        relocate(&dir)?;
+        println!(
+            "applied {} to {}: {} file(s) removed",
+            delta.display(),
+            dir.display(),
+            removed.len()
+        );
+        Ok(())
+    })();
+    let _ = fs::remove_dir_all(&tmp);
+    result
+}
+
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    for entry in fs::read_dir(from)?.flatten() {
+        let (src, dst) = (entry.path(), to.join(entry.file_name()));
+        let meta = fs::symlink_metadata(&src)?;
+        if meta.is_dir() {
+            fs::create_dir_all(&dst)?;
+            copy_tree(&src, &dst)?;
+        } else if meta.is_symlink() {
+            let _ = fs::remove_file(&dst);
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(fs::read_link(&src)?, &dst)?;
+            #[cfg(windows)]
+            fs::copy(&src, &dst)?;
+        } else {
+            let _ = fs::remove_file(&dst);
+            fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
 }
 
 fn major_minor(version: &str) -> String {

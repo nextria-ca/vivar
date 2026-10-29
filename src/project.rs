@@ -295,6 +295,8 @@ pub struct Policy {
     pub telemetry_off: bool,
     /// `vivar run`/`shell` tell Hugging Face, uv and friends not to touch the network.
     pub offline: bool,
+    /// `unpack` refuses bundles that aren't authenticated with the org's bundle key.
+    pub require_signed_bundles: bool,
 }
 
 impl Policy {
@@ -391,6 +393,10 @@ impl Policy {
                 .and_then(|p| p.get("network"))
                 .and_then(Item::as_str)
                 .is_some_and(|v| v.eq_ignore_ascii_case("offline")),
+            require_signed_bundles: table
+                .and_then(|p| p.get("require-signed-bundles"))
+                .and_then(Item::as_bool)
+                .unwrap_or(false),
         }
     }
 
@@ -418,6 +424,7 @@ impl Policy {
         self.require_wheels |= org.require_wheels;
         self.telemetry_off |= org.telemetry_off;
         self.offline |= org.offline;
+        self.require_signed_bundles |= org.require_signed_bundles;
         self
     }
 }

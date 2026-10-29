@@ -177,6 +177,9 @@ pub fn export(root: &Path, target: &Target, out: &Path) -> Result<String> {
     let lock = Lock::read(root)?;
     fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
     let (mut wheels, mut sdists, mut skipped) = (0, Vec::new(), Vec::new());
+    // Decide everything first, then fetch in parallel: these are many small
+    // files from a CDN, and serial downloads are what makes large exports slow.
+    let mut jobs: Vec<(String, std::path::PathBuf, Option<String>)> = Vec::new();
     for pkg in lock.packages.iter().filter(|p| p.source_kind == "registry") {
         let Some((artifact, is_wheel)) = target.pick(pkg) else {
             skipped.push(format!("{} {}", pkg.name, pkg.version));
@@ -190,29 +193,21 @@ pub fn export(root: &Path, target: &Target, out: &Path) -> Result<String> {
                 artifact.url
             );
         }
-        let dest = out.join(&name);
-        let expected = artifact.sha256();
-        let cached = expected.is_some_and(|h| sha256::file(&dest).ok().as_deref() == Some(h));
-        if !cached {
-            println!("downloading {}", artifact.filename());
-            upgrade::fetch_to(&artifact.url, &dest)?;
-            if let Some(h) = expected {
-                let actual = sha256::file(&dest)?;
-                if actual != h {
-                    let _ = fs::remove_file(&dest);
-                    bail!(
-                        "{} does not match the hash in uv.lock (got {actual}, expected {h})",
-                        artifact.filename()
-                    );
-                }
-            }
-        }
         if is_wheel {
             wheels += 1;
         } else {
             sdists.push(pkg.name.clone());
         }
+        let dest = out.join(&name);
+        let expected = artifact.sha256().map(str::to_owned);
+        let cached = expected
+            .as_deref()
+            .is_some_and(|h| sha256::file(&dest).ok().as_deref() == Some(h));
+        if !cached {
+            jobs.push((artifact.url.clone(), dest, expected));
+        }
     }
+    download_all(&jobs)?;
     let mut summary = format!("{wheels} wheel(s) in {}", out.display());
     if !sdists.is_empty() {
         summary.push_str(&format!(
@@ -225,6 +220,52 @@ pub fn export(root: &Path, target: &Target, out: &Path) -> Result<String> {
         summary.push_str(&format!("; skipped (no artifacts): {}", skipped.join(", ")));
     }
     Ok(summary)
+}
+
+/// Fetches `(url, destination, expected sha256)` jobs eight at a time, each
+/// verified against its hash before it counts as done.
+fn download_all(jobs: &[(String, std::path::PathBuf, Option<String>)]) -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let next = AtomicUsize::new(0);
+    let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let workers = jobs.len().min(8);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                let Some((url, dest, expected)) = jobs.get(i) else { break };
+                let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                println!("downloading {name}");
+                let result = upgrade::fetch_to(url, dest).and_then(|()| {
+                    if let Some(h) = expected {
+                        let actual = sha256::file(dest)?;
+                        if &actual != h {
+                            let _ = fs::remove_file(dest);
+                            bail!("{name} does not match the hash in uv.lock (got {actual}, expected {h})");
+                        }
+                    }
+                    Ok(())
+                });
+                if let Err(e) = result {
+                    errors.lock().unwrap().push(e.to_string());
+                }
+            });
+        }
+    });
+    let errors = errors.into_inner().unwrap();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "{} download(s) failed:\n  {}",
+            errors.len(),
+            errors.join("\n  ")
+        )
+    }
 }
 
 #[cfg(test)]

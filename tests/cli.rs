@@ -2364,8 +2364,10 @@ fn native_backend_syncs_from_the_lock_without_uv() {
     // A fresh environment from the lock, with uv nowhere on PATH.
     fs::remove_dir_all(dir.join(".venv")).unwrap();
     let out = okn(dir, &["sync"]);
+    // pytest brings colorama along on Windows only.
+    let expected = if cfg!(windows) { 8 } else { 7 };
     assert!(
-        stdout_of(&out).contains("native sync: 7 package(s) installed"),
+        stdout_of(&out).contains(&format!("native sync: {expected} package(s) installed")),
         "{}",
         stdout_of(&out)
     );

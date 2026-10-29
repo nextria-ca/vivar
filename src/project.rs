@@ -26,9 +26,11 @@ pub fn init_files(root: &Path, name: &str, version: [u32; 3], lib: bool) -> Resu
         build["requires"] = value(requires);
         build["build-backend"] = value("hatchling.build");
         doc["build-system"] = Item::Table(build);
-        // `acme.widgets` → src/acme/widgets/, each level a package.
+        // `acme.widgets` → src/acme/widgets/, each level a package; hatchling
+        // is told the top-level directory since it wouldn't guess a hierarchy.
+        let module = name.replace('-', "_");
         let mut package = root.join("src");
-        for part in name.replace('-', "_").split('.') {
+        for part in module.split('.') {
             package = package.join(part);
             fs::create_dir_all(&package)?;
             let init = package.join("__init__.py");
@@ -36,6 +38,24 @@ pub fn init_files(root: &Path, name: &str, version: [u32; 3], lib: bool) -> Resu
                 fs::write(init, "")?;
             }
         }
+        let top = module.split('.').next().unwrap_or(&module);
+        let mut packages = Array::new();
+        packages.push(format!("src/{top}"));
+        let mut wheel = Table::new();
+        wheel["packages"] = value(packages);
+        let mut targets = Table::new();
+        targets.set_implicit(true);
+        targets["wheel"] = Item::Table(wheel);
+        let mut build_cfg = Table::new();
+        build_cfg.set_implicit(true);
+        build_cfg["targets"] = Item::Table(targets);
+        let mut hatch = Table::new();
+        hatch.set_implicit(true);
+        hatch["build"] = Item::Table(build_cfg);
+        let mut tool = Table::new();
+        tool.set_implicit(true);
+        tool["hatch"] = Item::Table(hatch);
+        doc["tool"] = Item::Table(tool);
     }
     fs::write(root.join(PYPROJECT), doc.to_string())?;
     fs::write(root.join(".python-version"), format!("{major}.{minor}\n"))?;
@@ -769,6 +789,19 @@ lint = ["ruff"]
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn lib_layout_nests_dotted_names() {
+        let tmp = TempDir::new("lib");
+        init_files(&tmp.0, "acme.widgets", [3, 12, 0], true).unwrap();
+        assert!(tmp.0.join("src/acme/__init__.py").is_file());
+        assert!(tmp.0.join("src/acme/widgets/__init__.py").is_file());
+        let text = fs::read_to_string(tmp.0.join(PYPROJECT)).unwrap();
+        assert!(text.contains("[tool.hatch.build.targets.wheel]"), "{text}");
+        assert!(text.contains("packages = [\"src/acme\"]"), "{text}");
+        // write_defaults must still have added the vivar policy table.
+        assert!(text.contains("[tool.vivar.policy]"), "{text}");
     }
 
     #[test]

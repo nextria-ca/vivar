@@ -79,9 +79,11 @@ impl Target {
         }
         // The ABI must be ours, stable, or none: no free-threaded (`cp313t`) or
         // debug builds for a regular interpreter.
+        // (`cp37m` was the regular ABI before 3.8.)
+        let regular = format!("{}m", self.py);
         if !abi
             .split('.')
-            .any(|a| a == self.py || a == "abi3" || a == "none")
+            .any(|a| a == self.py || a == regular || a == "abi3" || a == "none")
         {
             return None;
         }
@@ -172,7 +174,15 @@ pub fn export(root: &Path, target: &Target, out: &Path) -> Result<String> {
             skipped.push(format!("{} {}", pkg.name, pkg.version));
             continue;
         };
-        let dest = out.join(artifact.filename());
+        let name = artifact.filename();
+        // A lock entry is data from elsewhere: its file name must stay inside `out`.
+        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+            bail!(
+                "refusing to write artifact with unsafe file name {name:?} from {}",
+                artifact.url
+            );
+        }
+        let dest = out.join(&name);
         let expected = artifact.sha256();
         let cached = expected.is_some_and(|h| sha256::file(&dest).ok().as_deref() == Some(h));
         if !cached {
@@ -247,6 +257,13 @@ mod tests {
             linux.score("numpy-2.5.4-cp312-cp312-manylinux_2_17_x86_64.whl")
                 > linux.score("numpy-2.5.4-cp312-cp312-manylinux_2_28_x86_64.whl")
         );
+        let py37 = Target::new(Some("linux-x86_64"), "3.7").unwrap();
+        assert!(py37
+            .score("old-1.0-cp37-cp37m-manylinux1_x86_64.whl")
+            .is_some());
+        assert!(py37
+            .score("old-1.0-cp37-cp37dm-manylinux1_x86_64.whl")
+            .is_none());
         let py313 = Target::new(Some("linux-x86_64"), "3.13").unwrap();
         assert!(py313
             .score("numpy-2.5.4-cp313-cp313-manylinux_2_28_x86_64.whl")

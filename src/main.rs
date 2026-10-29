@@ -330,6 +330,13 @@ fn main() -> Result<()> {
                 });
             if let Err(e) = added {
                 println!("rolling back the add");
+                // uv rewrites the lock before touching the env: an unchanged lock
+                // means nothing was installed and the env must be left alone.
+                let lock_path = project.venv_root().join(lock::LOCKFILE);
+                let env_touched = snapshot
+                    .iter()
+                    .find(|(p, _)| *p == lock_path)
+                    .is_some_and(|(_, before)| std::fs::read(&lock_path).ok() != *before);
                 for (path, contents) in snapshot {
                     match contents {
                         Some(bytes) => std::fs::write(&path, bytes)?,
@@ -340,11 +347,13 @@ fn main() -> Result<()> {
                 }
                 // Keep the group that was being added to installed, as before the
                 // add; a group the add itself created no longer exists to sync.
-                let group = group
-                    .as_deref()
-                    .filter(|g| Project::load(&project.root).is_ok_and(|p| p.has_group(g)));
-                let _ = backend.sync_group(&cwd, group);
-                venv::mark_synced(project.venv_root());
+                if env_touched {
+                    let group = group
+                        .as_deref()
+                        .filter(|g| Project::load(&project.root).is_ok_and(|p| p.has_group(g)));
+                    let _ = backend.sync_group(&cwd, group);
+                    venv::mark_synced(project.venv_root());
+                }
                 return Err(e);
             }
         }

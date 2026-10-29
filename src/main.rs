@@ -1346,8 +1346,26 @@ fn transact(
     if ours_to_remove && venv_dir.exists() {
         // The operation created the environment (a fresh import, a converted
         // poetry project), finished or not: there is nothing to sync back to,
-        // so it goes, and a retry starts clean.
-        let _ = std::fs::remove_dir_all(&venv_dir);
+        // so it goes, and a retry starts clean. A `.venv` that is a symlink
+        // (someone's redirect to another disk) keeps the link; its target,
+        // empty before, is emptied again.
+        let is_link = std::fs::symlink_metadata(&venv_dir)
+            .map(|m| m.is_symlink())
+            .unwrap_or(false);
+        if is_link {
+            if let Ok(entries) = std::fs::read_dir(&venv_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let _ = if path.is_dir() && !path.is_symlink() {
+                        std::fs::remove_dir_all(&path)
+                    } else {
+                        std::fs::remove_file(&path)
+                    };
+                }
+            }
+        } else {
+            let _ = std::fs::remove_dir_all(&venv_dir);
+        }
         return Err(e);
     }
     // A poetry-only manifest is the one thing uv cannot sync against; a virtual

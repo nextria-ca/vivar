@@ -2231,6 +2231,34 @@ fn import_rolls_back_on_policy_and_handles_poetry_in_place() {
     );
     assert_eq!(read(&e.join("pyproject.toml")), original);
 
+    // A .venv that is a symlink to an empty directory keeps the link; the
+    // environment built in its target is cleared again on failure.
+    #[cfg(unix)]
+    {
+        let l = tmp.0.join("linked");
+        let target = tmp.0.join("linked-target");
+        fs::create_dir_all(&l).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, l.join(".venv")).unwrap();
+        fs::write(l.join("pyproject.toml"), original).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
+            .current_dir(&l)
+            .env("VIVAR_POLICY", &strict)
+            .args(["import", "pyproject.toml"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(
+            l.join(".venv").is_symlink(),
+            "the .venv symlink was removed"
+        );
+        assert_eq!(
+            fs::read_dir(&target).unwrap().count(),
+            0,
+            "environment left in the link target"
+        );
+    }
+
     // A poetry-only pyproject in place gets [project] metadata and its deps.
     let b = tmp.0.join("poetry");
     fs::create_dir_all(&b).unwrap();

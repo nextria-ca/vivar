@@ -1126,19 +1126,7 @@ fn workspace_members_share_the_root_env() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(
-        !root.join("pyproject.toml").exists()
-            || !read(&root.join("pyproject.toml")).contains("typing-extensions")
-    );
-    assert!(
-        !ok(
-            root,
-            &["run", "python", "-c", "import sys; print(sys.prefix)"]
-        )
-        .status
-        .success()
-            || true
-    );
+    assert!(!read(&root.join("pyproject.toml")).contains("typing-extensions"));
     let out = vivar(root, &["run", "python", "-c", "import typing_extensions"]);
     assert!(!out.status.success(), "rejected package is still installed");
 }

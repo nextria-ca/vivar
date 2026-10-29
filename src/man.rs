@@ -50,9 +50,18 @@ fn page(path: &[String], cmd: &Command) -> String {
     out.push_str(&format!(".SH NAME\n{} \\- {}\n", esc(&name), esc(&about)));
     // Synopsis: options, then positionals, then a subcommand slot.
     let mut synopsis = format!("\\fB{}\\fR", esc(&title));
+    let generated = |a: &&clap::Arg| {
+        matches!(
+            a.get_action(),
+            clap::ArgAction::Help
+                | clap::ArgAction::HelpShort
+                | clap::ArgAction::HelpLong
+                | clap::ArgAction::Version
+        )
+    };
     let (opts, positionals): (Vec<_>, Vec<_>) = cmd
         .get_arguments()
-        .filter(|a| a.get_id() != "help" && a.get_id() != "version")
+        .filter(|a| !generated(a))
         .partition(|a| !a.is_positional());
     if !opts.is_empty() {
         synopsis.push_str(" [\\fIOPTIONS\\fR]");
@@ -167,9 +176,13 @@ mod tests {
                     ),
             )
             .subcommand(
-                Command::new("python")
-                    .about("Manage Pythons")
-                    .subcommand(Command::new("install").about("Install a build")),
+                Command::new("python").about("Manage Pythons").subcommand(
+                    Command::new("install").about("Install a build").arg(
+                        clap::Arg::new("version")
+                            .required(true)
+                            .help("Series or full version"),
+                    ),
+                ),
             );
         let dir = std::env::temp_dir().join(format!("vivar-man-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -191,6 +204,8 @@ mod tests {
         );
         assert!(add.contains("\\fB\\-\\-group\\fR <GROUP>"), "{add}");
         assert!(add.contains("checked against policy first"), "{add}");
+        let install = fs::read_to_string(dir.join("vivar-python-install.1")).unwrap();
+        assert!(install.contains("<VERSION>"), "{install}");
         let top = fs::read_to_string(dir.join("vivar.1")).unwrap();
         assert!(
             top.contains(".SH COMMANDS") && top.contains("\\fBvivar\\-python\\fR(1)"),

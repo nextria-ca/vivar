@@ -250,8 +250,16 @@ Bundle signatures moved from HMAC to Ed25519 (`sha512.rs`, `ed25519.rs`, RFC 803
 vectors): `key generate` writes `bundle.key` + `bundle.pub`, verifiers trust
 `trusted-keys` in policy, `VIVAR_TRUSTED_KEYS`, or their own keys.
 
+Follow-up batch (2026-10-29, later): index listing cache with stale fallback, `--json` on
+`tree`/`why`/`outdated` (a `Backend::outdated` returning structured changes), `init
+--template`, completions and man pages (`man.rs`, `vivar man`) through the installers and
+packages, a loader probe in `verify` on macOS and Windows, and on the native backend:
+direct references (`name @ https://…/x.whl`, `.tar.gz`, `git+https://…@rev`, recorded as
+uv-style `url`/`git` sources) and source distributions built through the same PEP 517
+driver, cached under `~/.cache/vivar/built` by hash or commit.
+
 Deferred: native dependencies via conda-forge (phase 2), Windows launcher stubs for
-cross-target Windows bundles, man pages.
+cross-target Windows bundles.
 
 ## 13. Open questions
 

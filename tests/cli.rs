@@ -2563,6 +2563,137 @@ fn native_backend_syncs_from_the_lock_without_uv() {
     assert!(!native(dir, &["run", "python", "-c", "import socks"])
         .status
         .success());
+    // Direct references resolve natively: a wheel by URL, a source
+    // distribution by URL (built with its own backend), a git checkout.
+    let file_url = |p: &Path| {
+        format!(
+            "file:///{}",
+            p.display()
+                .to_string()
+                .replace('\\', "/")
+                .trim_start_matches('/')
+        )
+    };
+    let whl = make_wheel(dir, &tmp.0.join("direct"));
+    okn(dir, &["add", &format!("minipkg @ {}", file_url(&whl))]);
+    okn(
+        dir,
+        &[
+            "run",
+            "python",
+            "-c",
+            "import minipkg; assert minipkg.VALUE == 42",
+        ],
+    );
+    let lock = read(&dir.join("uv.lock"));
+    assert!(lock.contains("source = { url = \"file:///"), "{lock}");
+    let sd = tmp.0.join("sdistpkg-0.1");
+    fs::create_dir_all(sd.join("src").join("sdistpkg")).unwrap();
+    fs::write(
+        sd.join("pyproject.toml"),
+        "[project]\nname = \"sdistpkg\"\nversion = \"0.1\"\ndependencies = [\"six\"]\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n",
+    )
+    .unwrap();
+    fs::write(
+        sd.join("src").join("sdistpkg").join("__init__.py"),
+        "VALUE = 7\n",
+    )
+    .unwrap();
+    let tarball = tmp.0.join("sdistpkg-0.1.tar.gz");
+    let status = Command::new("tar")
+        .arg("-czf")
+        .arg(&tarball)
+        .arg("-C")
+        .arg(&tmp.0)
+        .arg("sdistpkg-0.1")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let out = okn(dir, &["add", &format!("sdistpkg @ {}", file_url(&tarball))]);
+    assert!(
+        stdout_of(&out).contains("building sdistpkg from source"),
+        "{}",
+        stdout_of(&out)
+    );
+    okn(
+        dir,
+        &[
+            "run",
+            "python",
+            "-c",
+            "import sdistpkg, six; assert sdistpkg.VALUE == 7",
+        ],
+    );
+    let lock = read(&dir.join("uv.lock"));
+    assert!(
+        lock.contains("sdist = { url = \"file:///") && lock.contains("sdistpkg-0.1.tar.gz"),
+        "{lock}"
+    );
+    // A second resolve reuses the built wheel.
+    let out = okn(dir, &["lock"]);
+    assert!(
+        !stdout_of(&out).contains("building sdistpkg"),
+        "{}",
+        stdout_of(&out)
+    );
+    if Command::new("git").arg("--version").output().is_ok() {
+        let repo = tmp.0.join("gitpkg");
+        fs::create_dir_all(repo.join("src").join("gitpkg")).unwrap();
+        fs::write(
+            repo.join("pyproject.toml"),
+            "[project]\nname = \"gitpkg\"\nversion = \"0.2\"\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src").join("gitpkg").join("__init__.py"),
+            "VALUE = 9\n",
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["-c", "user.name=t", "-c", "user.email=t@t", "add", "."],
+            vec![
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
+        ] {
+            let st = Command::new("git")
+                .current_dir(&repo)
+                .args(&args)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?}");
+        }
+        okn(
+            dir,
+            &["add", &format!("gitpkg @ git+{}@main", file_url(&repo))],
+        );
+        okn(
+            dir,
+            &[
+                "run",
+                "python",
+                "-c",
+                "import gitpkg; assert gitpkg.VALUE == 9",
+            ],
+        );
+        let lock = read(&dir.join("uv.lock"));
+        assert!(
+            lock.contains("source = { git = \"file:///") && lock.contains("?rev=main#"),
+            "{lock}"
+        );
+        okn(dir, &["remove", "gitpkg"]);
+    }
+    okn(dir, &["remove", "minipkg", "sdistpkg"]);
+    assert!(!native(dir, &["run", "python", "-c", "import minipkg"])
+        .status
+        .success());
     // Building is native too: hatchling comes from the index into a throwaway env.
     let path = dir.join("pyproject.toml");
     let text = read(&path)

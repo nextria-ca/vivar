@@ -9,7 +9,7 @@
 use crate::index::{File, Index, Metadata};
 use crate::pep::{eval_marker, MarkerEnv, Requirement, Specifier, Version};
 use crate::wheelhouse::Target;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// What to resolve: the project's own requirements by section.
@@ -33,6 +33,38 @@ pub struct ResolvedPackage {
     pub files: Vec<File>,
     /// Dependencies with the markers they carry, as they go into the lock.
     pub dependencies: Vec<Requirement>,
+    pub source: Source,
+}
+
+/// Where a resolved package comes from: the lock's `source` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    Registry,
+    /// A wheel or source distribution at a URL (`name @ https://…`).
+    Url(String),
+    /// A git checkout (`name @ git+https://…@rev`), pinned to a commit.
+    Git {
+        url: String,
+        rev: Option<String>,
+        commit: String,
+    },
+}
+
+/// What a direct requirement (`name @ url`) resolves to.
+#[derive(Debug, Clone)]
+pub struct Direct {
+    pub version: Version,
+    pub metadata: Metadata,
+    pub files: Vec<File>,
+    pub source: Source,
+}
+
+/// What the resolver needs beyond the index: direct references, and wheels
+/// built from source distributions. Without one, both are refused.
+pub trait Fetch {
+    fn direct(&self, req: &Requirement) -> Result<Direct>;
+    /// A wheel built from `sdist` (cached by its hash).
+    fn wheel_from_sdist(&self, name: &str, sdist: &File) -> Result<std::path::PathBuf>;
 }
 
 pub struct Resolution {
@@ -59,6 +91,9 @@ pub struct Resolver<'a> {
     upgrade_all: bool,
     python_floor: Version,
     cache: BTreeMap<(String, String), Metadata>,
+    fetch: Option<&'a dyn Fetch>,
+    /// Direct references seen so far, by name: one URL per package.
+    directs: BTreeMap<String, Direct>,
 }
 
 /// A requirement on a package together with the environments it applies to.
@@ -116,9 +151,17 @@ impl<'a> Resolver<'a> {
             ))
             .expect("numeric version"),
             cache: BTreeMap::new(),
+            fetch: None,
+            directs: BTreeMap::new(),
         };
         r.set_envs(python_floor, python_floor);
         r
+    }
+
+    /// Enables direct references and source builds.
+    pub fn fetch(mut self, fetch: &'a dyn Fetch) -> Self {
+        self.fetch = Some(fetch);
+        self
     }
 
     fn set_envs(&mut self, floor: [u32; 3], machine: [u32; 3]) {
@@ -345,6 +388,16 @@ impl<'a> Resolver<'a> {
     /// Candidate versions of `name`, newest first, acceptable under `constraints`
     /// and installable wherever they apply.
     fn candidates(&self, name: &str, constraints: &[Constraint]) -> Result<Vec<Version>> {
+        if let Some(d) = self.directs.get(name) {
+            let ok = constraints
+                .iter()
+                .all(|c| c.specifier.matches_allowing_pre(&d.version));
+            return Ok(if ok {
+                vec![d.version.clone()]
+            } else {
+                Vec::new()
+            });
+        }
         let files = self.index.files(name)?;
         let mut by_version: BTreeMap<Version, Vec<&File>> = BTreeMap::new();
         for f in &files {
@@ -412,6 +465,9 @@ impl<'a> Resolver<'a> {
         if let Some(m) = self.cache.get(&key) {
             return Ok(m.clone());
         }
+        if let Some(d) = self.directs.get(name) {
+            return Ok(d.metadata.clone());
+        }
         let files = self.index.files(name)?;
         let wheels: Vec<&File> = files
             .iter()
@@ -422,9 +478,32 @@ impl<'a> Resolver<'a> {
             .find(|f| self.envs[0].1.score(&f.filename).is_some())
             .or_else(|| wheels.iter().find(|f| f.has_metadata))
             .or(wheels.first())
-            .copied()
-            .ok_or_else(|| anyhow!("{name} {version} has no wheel to read dependencies from; vivar's resolver needs wheels (uv can build from source)"))?;
-        let m = self.index.metadata(file)?;
+            .copied();
+        let m = match file {
+            Some(file) => self.index.metadata(file)?,
+            None => {
+                // No wheel at all: build the source distribution once and read
+                // its metadata, unless builds are ruled out.
+                let sdist = files
+                    .iter()
+                    .find(|f| {
+                        !f.is_wheel() && f.version(name).as_ref() == Some(version) && !f.yanked
+                    })
+                    .ok_or_else(|| {
+                        anyhow!("{name} {version} has no artifact to read dependencies from")
+                    })?;
+                if self.wheels_only {
+                    bail!("{name} {version} ships only a source distribution and policy requires wheels");
+                }
+                let fetch = self.fetch.ok_or_else(|| {
+                    anyhow!("{name} {version} ships only a source distribution; building it needs the native backend's builder")
+                })?;
+                let wheel = fetch.wheel_from_sdist(name, sdist)?;
+                let text = crate::index::metadata_from_wheel(&std::fs::read(&wheel)?)
+                    .with_context(|| format!("reading METADATA from {}", wheel.display()))?;
+                crate::index::parse_metadata(&text)
+            }
+        };
         self.cache.insert(key, m.clone());
         Ok(m)
     }
@@ -458,13 +537,18 @@ impl<'a> Resolver<'a> {
             }
             root_envs.push(envs);
         }
-        for (r, envs) in root_reqs.iter().zip(root_envs) {
+        // Direct references go first: a URL settles a package's version before
+        // anything else can pick one from the index.
+        let mut ordered: Vec<(&Requirement, BTreeSet<usize>)> =
+            root_reqs.iter().copied().zip(root_envs).collect();
+        ordered.sort_by_key(|(r, _)| r.url.is_none());
+        for (r, envs) in ordered {
             if envs.is_empty() {
                 continue;
             }
-            state.edges.push((root_name.clone(), (*r).clone()));
+            state.edges.push((root_name.clone(), r.clone()));
             state.pending.push_back(Pending {
-                req: (*r).clone(),
+                req: r.clone(),
                 envs,
             });
         }
@@ -478,11 +562,40 @@ impl<'a> Resolver<'a> {
             let Some(Pending { req, envs }) = state.pending.pop_front() else {
                 break; // everything satisfied
             };
-            if req.url.is_some() {
-                bail!(
-                    "{}: direct URL requirements are not supported by the native resolver",
-                    req.name
-                );
+            // A direct reference is its own single candidate: fetched once,
+            // then treated as an exact pin for every other requirement.
+            let mut req = req;
+            if let Some(url) = req.url.clone() {
+                let fetch = self.fetch.ok_or_else(|| {
+                    anyhow!(
+                        "{}: direct references need the native backend's builder",
+                        req.name
+                    )
+                })?;
+                if !self.directs.contains_key(&req.name) {
+                    let d = fetch.direct(&req)?;
+                    self.directs.insert(req.name.clone(), d);
+                }
+                let d = &self.directs[&req.name];
+                if d.source != Source::Url(url.clone())
+                    && !matches!((&d.source, url.strip_prefix("git+")), (Source::Git { url: u, .. }, Some(g)) if g.starts_with(u.as_str()))
+                {
+                    bail!(
+                        "{} is required from two different places: {url} and {:?}",
+                        req.name,
+                        d.source
+                    );
+                }
+                if let Some((_, v)) = state.assigned.iter().find(|(n, _)| *n == req.name) {
+                    if *v != d.version {
+                        bail!(
+                            "{} is pinned to {} by {url} but version {v} was already chosen for it; direct references must come before index versions",
+                            req.name,
+                            d.version
+                        );
+                    }
+                }
+                req.specifier = Specifier::parse(&format!("=={}", d.version))?;
             }
             // Record the constraint and extras. A package already assigned is
             // expanded again when it now applies in more environments (or with
@@ -571,14 +684,18 @@ impl<'a> Resolver<'a> {
         let mut packages = Vec::new();
         for (name, version) in &state.assigned {
             let allow_yanked = state.constraints.get(name).is_some_and(|c| exact_pin(c));
-            let files: Vec<File> = self
-                .index
-                .files(name)?
-                .into_iter()
-                .filter(|f| {
-                    f.version(name).as_ref() == Some(version) && (!f.yanked || allow_yanked)
-                })
-                .collect();
+            // A direct reference brings its own files; the index knows nothing of it.
+            let files: Vec<File> = if self.directs.contains_key(name) {
+                Vec::new()
+            } else {
+                self.index
+                    .files(name)?
+                    .into_iter()
+                    .filter(|f| {
+                        f.version(name).as_ref() == Some(version) && (!f.yanked || allow_yanked)
+                    })
+                    .collect()
+            };
             let mut dependencies: Vec<Requirement> = Vec::new();
             for (_, r) in state.edges.iter().filter(|(from, _)| from == name) {
                 if !dependencies
@@ -588,11 +705,16 @@ impl<'a> Resolver<'a> {
                     dependencies.push(r.clone());
                 }
             }
+            let (files, source) = match self.directs.get(name) {
+                Some(d) => (d.files.clone(), d.source.clone()),
+                None => (files, Source::Registry),
+            };
             packages.push(ResolvedPackage {
                 name: name.clone(),
                 version: version.clone(),
                 files,
                 dependencies,
+                source,
             });
         }
         packages.sort_by(|a, b| a.name.cmp(&b.name));
@@ -690,6 +812,20 @@ impl<'a> Resolver<'a> {
 }
 
 /// An actual pin to one release (`==1.2.3`, `===x`), not `==1.*` or a range.
+/// `git+https://host/repo.git@rev` → (`https://host/repo.git`, `Some("rev")`).
+pub fn git_parts(url: &str) -> (String, Option<String>) {
+    let u = url.strip_prefix("git+").unwrap_or(url);
+    let u = u.split('#').next().unwrap_or(u);
+    // The `@` that separates the rev comes after the last `/`; one before it
+    // is userinfo (`git@github.com:`-style URLs are not accepted anyway).
+    match u.rfind('@') {
+        Some(i) if i > u.rfind('/').unwrap_or(0) => {
+            (u[..i].to_owned(), Some(u[i + 1..].to_owned()))
+        }
+        _ => (u.to_owned(), None),
+    }
+}
+
 fn exact_pin(constraints: &[Constraint]) -> bool {
     constraints.iter().any(|c| {
         c.specifier
@@ -825,9 +961,20 @@ pub fn write_lock(roots: &Roots, resolution: &Resolution, registry: &str) -> Str
             }
             t.insert("extras", a.into());
         }
-        let spec = r.specifier.to_string();
-        if !spec.is_empty() {
-            t.insert("specifier", spec.into());
+        match r.url.as_deref() {
+            Some(u) if u.starts_with("git+") => {
+                let (repo, _) = git_parts(u);
+                t.insert("git", repo.into());
+            }
+            Some(u) => {
+                t.insert("url", u.into());
+            }
+            None => {
+                let spec = r.specifier.to_string();
+                if !spec.is_empty() {
+                    t.insert("specifier", spec.into());
+                }
+            }
         }
         let marker = match (r.marker.as_deref(), extra) {
             (Some(m), Some(e)) if m.contains(" or ") => Some(format!("({m}) and extra == '{e}'")),
@@ -904,7 +1051,18 @@ pub fn write_lock(roots: &Roots, resolution: &Resolution, registry: &str) -> Str
         t["name"] = value(p.name.as_str());
         t["version"] = value(p.version.to_string());
         let mut src = InlineTable::new();
-        src.insert("registry", registry.into());
+        match &p.source {
+            Source::Registry => src.insert("registry", registry.into()),
+            Source::Url(u) => src.insert("url", u.as_str().into()),
+            Source::Git { url, rev, commit } => src.insert(
+                "git",
+                match rev {
+                    Some(r) => format!("{url}?rev={r}#{commit}"),
+                    None => format!("{url}#{commit}"),
+                }
+                .into(),
+            ),
+        };
         t["source"] = value(src);
         // Plain edges go to `dependencies`; `extra == 'x'` edges under the
         // extra, so an installer following `extra = [...]` finds them.
@@ -1112,7 +1270,41 @@ mod tests {
                 Requirement::parse("urllib3<3").unwrap(),
                 Requirement::parse("PySocks>=1.5.6; extra == 'socks'").unwrap(),
             ],
+            source: Source::Registry,
         };
+        let direct = ResolvedPackage {
+            name: "minipkg".into(),
+            version: Version::parse("1.0").unwrap(),
+            files: vec![],
+            dependencies: vec![],
+            source: Source::Git {
+                url: "https://example.com/minipkg.git".into(),
+                rev: Some("main".into()),
+                commit: "abc123".into(),
+            },
+        };
+        assert_eq!(
+            git_parts("git+https://example.com/minipkg.git@main#subdirectory=x"),
+            (
+                "https://example.com/minipkg.git".into(),
+                Some("main".into())
+            )
+        );
+        assert_eq!(
+            git_parts("git+ssh://git@example.com/r.git"),
+            ("ssh://git@example.com/r.git".into(), None)
+        );
+        let text = write_lock(
+            &roots,
+            &Resolution {
+                packages: vec![direct],
+            },
+            "https://pypi.org/simple",
+        );
+        assert!(
+            text.contains("source = { git = \"https://example.com/minipkg.git?rev=main#abc123\" }"),
+            "{text}"
+        );
         let text = write_lock(
             &roots,
             &Resolution {

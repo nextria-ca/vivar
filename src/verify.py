@@ -105,24 +105,54 @@ def native_libs():
     return missing, needed
 
 
-def unloadable_extensions():
-    '''{path: error} for every extension module the dynamic loader refuses (macOS, Windows).
+LOADER_PROBE = '''
+import ctypes, importlib, json, sys
+mods, paths = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+for m in mods:
+    try:
+        importlib.import_module(m)
+    except BaseException:
+        pass
+bad = []
+for p in paths:
+    try:
+        ctypes.CDLL(p)
+    except OSError as e:
+        bad.append([p, str(e)])
+print(json.dumps(bad))
+'''
 
-    ldd is Linux-only; here each extension is loaded the way Python would, so a
-    missing dependent library (a CUDA runtime, a vendored .dylib) is named.
+
+def unloadable_extensions(dist, mods):
+    '''[(path, error)] for the extension modules of `dist` the dynamic loader refuses (macOS, Windows).
+
+    ldd is Linux-only; here each extension is loaded the way Python would, in a
+    child with a timeout, after the package's own import has run (torch adds
+    its DLL directory that way), so a missing dependent library is named and a
+    crashing initializer cannot take the verifier down.
     '''
     exts = (".so", ".dylib") if sys.platform == "darwin" else (".pyd", ".dll")
-    bad = {}
-    for root, _, files in os.walk(SITE):
-        for f in files:
-            if not f.endswith(exts):
-                continue
-            path = os.path.join(root, f)
+    paths = []
+    for f in dist.files or ():
+        if str(f).endswith(exts):
             try:
-                ctypes.CDLL(path)
-            except OSError as e:
-                bad[path] = str(e).split(":")[-1].strip() or str(e)
-    return bad
+                paths.append(str(dist.locate_file(f)))
+            except Exception:  # noqa: BLE001
+                continue
+    if not paths:
+        return []
+    import json
+    try:
+        r = subprocess.run([sys.executable, "-I", "-c", LOADER_PROBE, json.dumps(mods), json.dumps(paths)],
+                           capture_output=True, text=True, timeout=IMPORT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return [(paths[0], f"loader probe timed out after {IMPORT_TIMEOUT}s")]
+    if r.returncode != 0:
+        return [(paths[0], f"loader probe crashed (exit {r.returncode}) while loading this package's extensions")]
+    try:
+        return [(p, e.split(":")[-1].strip() or e) for p, e in json.loads(r.stdout.strip().splitlines()[-1])]
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def cuda_problem(runtime):
@@ -264,8 +294,9 @@ def main():
         for path, libs in sorted(missing.items()):
             report("ERR", os.path.relpath(path, SITE), f"needs {', '.join(libs)}, not found on this machine")
     else:
-        for path, err in sorted(unloadable_extensions().items()):
-            report("ERR", os.path.relpath(path, SITE), f"cannot be loaded: {err}")
+        for dist in dists:
+            for path, err in unloadable_extensions(dist, top_levels(dist)):
+                report("ERR", os.path.relpath(path, SITE), f"cannot be loaded: {err}")
 
     # 3. CUDA packages need a driver.
     cuda_dists = [d.metadata["Name"] for d in dists if d.metadata["Name"].lower().startswith("nvidia-")]

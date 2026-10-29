@@ -6,10 +6,11 @@
 
 use crate::backend::{Backend, Change};
 use crate::index::Index;
+use crate::index::{File, Metadata};
 use crate::lock::{Lock, Package};
 use crate::pep::{eval_marker, MarkerEnv, Requirement, Version};
 use crate::project::{self, Policy, Project};
-use crate::resolve::{write_lock, Resolver, Roots};
+use crate::resolve::{write_lock, Direct, Fetch, Resolver, Roots, Source as ResolvedSource};
 use crate::{dirs, install, sha256, upgrade, venv, wheelhouse};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -110,7 +111,12 @@ impl NativeBackend {
             .filter_map(|(n, v)| Version::parse(v).ok().map(|v| (n.clone(), v)))
             .collect();
         let index = self.index();
+        let builder = Builder {
+            backend: self,
+            series: format!("{}.{}", machine[0], machine[1]),
+        };
         let resolution = Resolver::new(&index, floor, self.no_build)
+            .fetch(&builder)
             .machine(machine)
             .requires_python(roots.requires_python.as_deref())
             .prefer(prefer)
@@ -277,11 +283,30 @@ fn cache_dir() -> Result<PathBuf> {
 struct Source<'a> {
     index_url: &'a str,
     wheelhouse_dir: Option<&'a Path>,
+    /// Builds wheels from source distributions and git checkouts, for this
+    /// machine only (a cross-target layout gets none).
+    builder: Option<Builder<'a>>,
+}
+
+/// The native backend's builder: PEP 517 in a throwaway environment on a
+/// Python of `series`, with results cached under `~/.cache/vivar/built`.
+struct Builder<'a> {
+    backend: &'a NativeBackend,
+    series: String,
 }
 
 /// Fetches the wheel for `pkg` on `target`, hash-checked, from the cache or
 /// the URL the lock records.
 fn fetch_wheel(pkg: &Package, target: &wheelhouse::Target, source: &Source) -> Result<PathBuf> {
+    if pkg.source_kind == "git" {
+        let builder = source.builder.as_ref().ok_or_else(|| {
+            anyhow!(
+                "{} comes from git and cannot be built for another machine",
+                pkg.name
+            )
+        })?;
+        return builder.wheel_from_git(&pkg.name, &pkg.source);
+    }
     let (artifact, is_wheel) = target.pick(pkg).ok_or_else(|| {
         anyhow!(
             "{} {} has no artifact for this platform in uv.lock",
@@ -290,11 +315,29 @@ fn fetch_wheel(pkg: &Package, target: &wheelhouse::Target, source: &Source) -> R
         )
     })?;
     if !is_wheel {
-        bail!(
-            "{} {} is only available as a source distribution; vivar's native installer handles wheels (uv can build it, or set require-wheels and pick a version with wheels)",
-            pkg.name,
-            pkg.version
-        );
+        let builder = source.builder.as_ref().ok_or_else(|| {
+            anyhow!(
+                "{} {} is only available as a source distribution, which cannot be built for another machine",
+                pkg.name,
+                pkg.version
+            )
+        })?;
+        if builder.backend.no_build {
+            bail!(
+                "{} {} is only available as a source distribution and policy requires wheels",
+                pkg.name,
+                pkg.version
+            );
+        }
+        let sdist = File {
+            filename: artifact.filename(),
+            url: artifact.url.clone(),
+            sha256: artifact.sha256().map(str::to_owned),
+            requires_python: None,
+            yanked: false,
+            has_metadata: false,
+        };
+        return builder.wheel_from_sdist(&pkg.name, &sdist);
     }
     let name = artifact.filename();
     if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
@@ -366,7 +409,7 @@ fn apply(
             continue;
         }
         match pkg.source_kind.as_str() {
-            "registry" => {
+            "registry" | "url" | "git" => {
                 let wheel = fetch_wheel(pkg, target, source)?;
                 install::install_wheel(&wheel, layout)?;
                 installed += 1;
@@ -444,12 +487,20 @@ impl NativeBackend {
     }
 
     /// Runs `f` with this backend's artifact source.
-    fn with_source<T>(&self, f: impl FnOnce(&Source) -> Result<T>) -> Result<T> {
+    fn with_source<T>(
+        &self,
+        series: Option<&str>,
+        f: impl FnOnce(&Source) -> Result<T>,
+    ) -> Result<T> {
         let index = self.index();
         let wheelhouse = self.wheelhouse_dir();
         f(&Source {
             index_url: index.url(),
             wheelhouse_dir: wheelhouse.as_deref(),
+            builder: series.map(|s| Builder {
+                backend: self,
+                series: s.to_owned(),
+            }),
         })
     }
 
@@ -458,14 +509,16 @@ impl NativeBackend {
         let version = env_version(venv_dir)?;
         let env = MarkerEnv::current(version);
         let wanted = plan(&lock, &env, groups)?;
-        let target = wheelhouse::Target::new(None, &format!("{}.{}", version[0], version[1]))?;
+        let series = format!("{}.{}", version[0], version[1]);
+        let target = wheelhouse::Target::new(None, &series)?;
         let layout = install::Layout::venv(
             venv_dir,
             &format!("{}.{}", version[0], version[1]),
             cfg!(windows),
         );
-        let (installed, removed) =
-            self.with_source(|source| apply(lock_root, &wanted, &layout, &target, source))?;
+        let (installed, removed) = self.with_source(Some(&series), |source| {
+            apply(lock_root, &wanted, &layout, &target, source)
+        })?;
         println!(
             "native sync: {} package(s) installed, {} removed, {} in the environment",
             installed,
@@ -473,6 +526,426 @@ impl NativeBackend {
             wanted.len().saturating_sub(1)
         );
         Ok(())
+    }
+}
+
+impl NativeBackend {
+    /// Runs a project's PEP 517 backend in a throwaway environment on Python
+    /// `series`, building `modes` (`sdist`, `wheel`) into `dist`; returns the
+    /// built file names.
+    fn pep517(
+        &self,
+        root: &Path,
+        dist: &Path,
+        series: &str,
+        modes: &[&str],
+    ) -> Result<Vec<String>> {
+        let doc: toml_edit::DocumentMut = fs::read_to_string(root.join(project::PYPROJECT))
+            .unwrap_or_default()
+            .parse()
+            .context("parsing pyproject.toml")?;
+        let table = doc.get("build-system").and_then(|i| i.as_table_like());
+        let strings = |key: &str| -> Vec<String> {
+            table
+                .and_then(|t| t.get(key))
+                .and_then(|i| i.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        // No [build-system]: PEP 517's legacy fallback.
+        let (requires, backend) = match table {
+            Some(t) => (
+                strings("requires"),
+                t.get("build-backend")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("setuptools.build_meta:__legacy__")
+                    .to_owned(),
+            ),
+            None => (
+                vec!["setuptools>=40.8.0".to_owned()],
+                "setuptools.build_meta:__legacy__".to_owned(),
+            ),
+        };
+        let backend_path = strings("backend-path");
+        let canonical_root = fs::canonicalize(root)?;
+        for p in &backend_path {
+            let full = fs::canonicalize(root.join(p))
+                .with_context(|| format!("build-system.backend-path entry {p:?}"))?;
+            if Path::new(p).is_absolute() || !full.starts_with(&canonical_root) {
+                bail!("build-system.backend-path must stay inside the project ({p:?} does not)");
+            }
+        }
+
+        let python = venv::interpreter(Some(series))?;
+        let build_env = std::env::temp_dir().join(format!(
+            "vivar-build-{}-{}",
+            std::process::id(),
+            BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&build_env);
+        venv::create(&build_env, &python, "build")?;
+        let result = (|| -> Result<Vec<String>> {
+            let py = venv::python(&build_env);
+            if !requires.is_empty() {
+                self.install(&py, &requires)?;
+            }
+            fs::create_dir_all(dist)?;
+            // Build tools the backend shells out to (ninja, meson, cython)
+            // live in the build env's bin: it goes first on PATH.
+            let mut dirs = vec![build_env.join(venv::BIN)];
+            if let Some(p) = std::env::var_os("PATH") {
+                dirs.extend(std::env::split_paths(&p));
+            }
+            let path = std::env::join_paths(dirs).context("PATH")?;
+            let hook = |mode: &str| -> Result<String> {
+                let mut cmd = std::process::Command::new(&py);
+                cmd.current_dir(root)
+                    .env("PATH", &path)
+                    .args(["-c", BUILD_HOOK, mode, &backend])
+                    .arg(dist)
+                    .args(&backend_path);
+                let out = cmd
+                    .output()
+                    .with_context(|| format!("running {}", py.display()))?;
+                if !out.status.success() {
+                    bail!(
+                        "the build backend `{backend}` failed during {mode}:\n{}",
+                        String::from_utf8_lossy(&out.stderr).trim_end()
+                    );
+                }
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                Ok(stdout.lines().last().unwrap_or_default().trim().to_owned())
+            };
+            // Dynamic requirements (setuptools asks for wheel, for instance),
+            // resolved together with the static ones so pins hold.
+            let extra = hook("requires")?;
+            let extra: Vec<String> = crate::json::parse(&extra)
+                .context("the build backend's dynamic requirements are not a JSON list")?
+                .as_array()
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect();
+            if !extra.is_empty() {
+                let mut all = requires.clone();
+                all.extend(extra);
+                self.install(&py, &all)?;
+            }
+            let mut built = Vec::new();
+            for mode in modes {
+                let name = hook(mode)?;
+                if name.is_empty() {
+                    bail!("the build backend `{backend}` returned no {mode} name");
+                }
+                built.push(name);
+            }
+            Ok(built)
+        })();
+        let _ = fs::remove_dir_all(&build_env);
+        result
+    }
+}
+
+static BUILD_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+impl Builder<'_> {
+    /// `~/.cache/vivar/built/<key>/`: one directory per source, holding the wheel.
+    fn built_dir(key: &str) -> Result<PathBuf> {
+        Ok(dirs::cache()?.join("built").join(key))
+    }
+
+    fn cached_wheel(dir: &Path) -> Option<PathBuf> {
+        fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|e| e == "whl"))
+    }
+
+    /// Downloads a source distribution (hash-checked when a hash is known,
+    /// computed otherwise) and returns its path and hash.
+    fn fetch_sdist(&self, file: &File) -> Result<(PathBuf, String)> {
+        let key = file.sha256.clone().unwrap_or_else(|| {
+            let mut h = sha256::Sha256::new();
+            h.update(file.url.as_bytes());
+            sha256::hex(&h.finish())
+        });
+        let dir = dirs::cache()?.join("sdists").join(&key[..16]);
+        fs::create_dir_all(&dir)?;
+        let dest = dir.join(&file.filename);
+        if !dest.is_file() {
+            println!("downloading {}", file.filename);
+            let url = if crate::index::same_origin(&file.url, self.backend.index().url()) {
+                crate::backend::with_credentials(&file.url)
+            } else {
+                file.url.clone()
+            };
+            upgrade::fetch_to(&url, &dest)?;
+        }
+        let actual = sha256::file(&dest)?;
+        if let Some(expected) = &file.sha256 {
+            if actual != *expected {
+                let _ = fs::remove_file(&dest);
+                bail!(
+                    "{} does not match its hash (got {actual}, expected {expected})",
+                    file.filename
+                );
+            }
+        }
+        Ok((dest, actual))
+    }
+
+    /// Unpacks a `.tar.gz`/`.zip` source distribution into `into` and returns
+    /// the project directory inside it.
+    fn unpack_sdist(archive: &Path, into: &Path) -> Result<PathBuf> {
+        let _ = fs::remove_dir_all(into);
+        fs::create_dir_all(into)?;
+        let name = archive.file_name().unwrap_or_default().to_string_lossy();
+        if name.ends_with(".zip") {
+            let data = fs::read(archive)?;
+            for entry in crate::zip::entries(&data)? {
+                if entry.name.ends_with('/') {
+                    continue;
+                }
+                let rel = Path::new(&entry.name);
+                if rel.is_absolute()
+                    || rel
+                        .components()
+                        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+                {
+                    bail!("{name} contains an unsafe path {:?}", entry.name);
+                }
+                let out = into.join(rel);
+                fs::create_dir_all(out.parent().context("entry parent")?)?;
+                fs::write(out, crate::zip::read(&data, &entry)?)?;
+            }
+        } else {
+            let status = std::process::Command::new("tar")
+                .arg("-xzf")
+                .arg(archive)
+                .arg("-C")
+                .arg(into)
+                .status()
+                .context("running tar")?;
+            if !status.success() {
+                bail!("tar could not unpack {name}");
+            }
+        }
+        // The one directory the archive holds, or the archive root itself.
+        let mut dirs: Vec<PathBuf> = fs::read_dir(into)?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        match dirs.len() {
+            1 => Ok(dirs.remove(0)),
+            _ => Ok(into.to_path_buf()),
+        }
+    }
+
+    /// Builds (or finds the cached) wheel for a source tree.
+    fn wheel_from_tree(&self, name: &str, src: &Path, key: &str) -> Result<PathBuf> {
+        let out = Self::built_dir(key)?;
+        if let Some(w) = Self::cached_wheel(&out) {
+            return Ok(w);
+        }
+        fs::create_dir_all(&out)?;
+        println!("building {name} from source");
+        let built = self.backend.pep517(src, &out, &self.series, &["wheel"])?;
+        let wheel = out.join(built.first().context("no wheel built")?);
+        if !wheel.is_file() {
+            bail!(
+                "the build backend reported {} but did not write it",
+                wheel.display()
+            );
+        }
+        Ok(wheel)
+    }
+
+    /// A git checkout at a commit: `source` is the lock's
+    /// `https://host/repo?rev=<rev>#<commit>`.
+    fn wheel_from_git(&self, name: &str, source: &str) -> Result<PathBuf> {
+        let (repo_with_rev, commit) = source
+            .split_once('#')
+            .ok_or_else(|| anyhow!("{name}: git source {source:?} has no commit"))?;
+        let repo = repo_with_rev.split('?').next().unwrap_or(repo_with_rev);
+        let key = {
+            let mut h = sha256::Sha256::new();
+            h.update(format!("{repo}#{commit}").as_bytes());
+            sha256::hex(&h.finish())[..16].to_owned()
+        };
+        if let Some(w) = Self::cached_wheel(&Self::built_dir(&key)?) {
+            return Ok(w);
+        }
+        let src = Self::clone(repo, Some(commit))?.0;
+        self.wheel_from_tree(name, &src, &key)
+    }
+
+    /// Clones `repo` at `rev` (a branch, tag or commit; HEAD when none) into a
+    /// scratch directory; returns it and the commit it ended up at.
+    fn clone(repo: &str, rev: Option<&str>) -> Result<(PathBuf, String)> {
+        let dir = std::env::temp_dir().join(format!(
+            "vivar-git-{}-{}",
+            std::process::id(),
+            BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let git = |args: &[&str], cwd: Option<&Path>| -> Result<String> {
+            let mut cmd = std::process::Command::new("git");
+            cmd.args(args);
+            if let Some(c) = cwd {
+                cmd.current_dir(c);
+            }
+            let out = cmd.output().context("running git (is it installed?)")?;
+            if !out.status.success() {
+                bail!(
+                    "git {} failed:\n{}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&out.stderr).trim_end()
+                );
+            }
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        };
+        git(
+            &[
+                "clone",
+                "--quiet",
+                repo,
+                dir.to_str().context("scratch path")?,
+            ],
+            None,
+        )?;
+        if let Some(rev) = rev {
+            git(&["checkout", "--quiet", rev], Some(&dir))?;
+        }
+        let commit = git(&["rev-parse", "HEAD"], Some(&dir))?;
+        Ok((dir, commit))
+    }
+}
+
+impl Fetch for Builder<'_> {
+    fn wheel_from_sdist(&self, name: &str, sdist: &File) -> Result<PathBuf> {
+        if self.backend.no_build {
+            bail!("{name} ships only a source distribution and policy requires wheels");
+        }
+        let (archive, hash) = self.fetch_sdist(sdist)?;
+        let key = hash[..16].to_owned();
+        if let Some(w) = Self::cached_wheel(&Self::built_dir(&key)?) {
+            return Ok(w);
+        }
+        let scratch =
+            std::env::temp_dir().join(format!("vivar-sdist-{}-{key}", std::process::id()));
+        let result = Self::unpack_sdist(&archive, &scratch)
+            .and_then(|src| self.wheel_from_tree(name, &src, &key));
+        let _ = fs::remove_dir_all(&scratch);
+        result
+    }
+
+    fn direct(&self, req: &Requirement) -> Result<Direct> {
+        let url = req.url.clone().context("not a direct reference")?;
+        let name = project::normalize(&req.name);
+        let metadata_of = |wheel: &Path| -> Result<(Version, Metadata)> {
+            let text = crate::index::metadata_from_wheel(&fs::read(wheel)?)
+                .with_context(|| format!("reading METADATA from {}", wheel.display()))?;
+            let filename = wheel
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let probe = File {
+                filename,
+                url: String::new(),
+                sha256: None,
+                requires_python: None,
+                yanked: false,
+                has_metadata: false,
+            };
+            let version = probe.version(&name).ok_or_else(|| {
+                anyhow!(
+                    "{} is not a wheel for {name} (the file name says otherwise)",
+                    wheel.display()
+                )
+            })?;
+            Ok((version, crate::index::parse_metadata(&text)))
+        };
+        if let Some(spec) = url.strip_prefix("git+") {
+            if spec.contains("#subdirectory=") {
+                bail!("{name}: git references with a subdirectory are not supported yet");
+            }
+            let (repo, rev) = crate::resolve::git_parts(&url);
+            let (src, commit) = Self::clone(&repo, rev.as_deref())?;
+            let key = {
+                let mut h = sha256::Sha256::new();
+                h.update(format!("{repo}#{commit}").as_bytes());
+                sha256::hex(&h.finish())[..16].to_owned()
+            };
+            let wheel = self.wheel_from_tree(&name, &src, &key);
+            let _ = fs::remove_dir_all(&src);
+            let (version, metadata) = metadata_of(&wheel?)?;
+            return Ok(Direct {
+                version,
+                metadata,
+                files: Vec::new(),
+                source: ResolvedSource::Git {
+                    url: repo,
+                    rev,
+                    commit,
+                },
+            });
+        }
+        let filename = crate::lock::Artifact {
+            url: url.clone(),
+            hash: None,
+        }
+        .filename();
+        if filename.is_empty() || filename.contains(['/', '\\']) {
+            bail!("{name}: {url} does not name a file");
+        }
+        let file = File {
+            filename: filename.clone(),
+            url: url.clone(),
+            sha256: None,
+            requires_python: None,
+            yanked: false,
+            has_metadata: false,
+        };
+        if filename.ends_with(".whl") {
+            let (path, hash) = self.fetch_sdist(&file)?; // same download path; it is just a file
+            let (version, metadata) = metadata_of(&path)?;
+            // The wheel lands in the wheel cache under its hash, where sync finds it.
+            let dest = cache_dir()?.join(&hash[..16]).join(&filename);
+            if !dest.is_file() {
+                fs::create_dir_all(dest.parent().context("cache path")?)?;
+                fs::copy(&path, &dest)?;
+            }
+            return Ok(Direct {
+                version,
+                metadata,
+                files: vec![File {
+                    sha256: Some(hash),
+                    ..file
+                }],
+                source: ResolvedSource::Url(url),
+            });
+        }
+        let (archive, hash) = self.fetch_sdist(&file)?;
+        let hashed = File {
+            sha256: Some(hash),
+            ..file
+        };
+        let wheel = self.wheel_from_sdist(&name, &hashed)?;
+        let _ = archive;
+        let (version, metadata) = metadata_of(&wheel)?;
+        Ok(Direct {
+            version,
+            metadata,
+            files: vec![hashed],
+            source: ResolvedSource::Url(url),
+        })
     }
 }
 
@@ -555,111 +1028,13 @@ impl Backend for NativeBackend {
     /// `build_wheel` into `dist/`.
     fn build(&self, dir: &Path) -> Result<()> {
         let project = Project::require(dir)?;
-        let root = project.root.clone();
-        let doc: toml_edit::DocumentMut = fs::read_to_string(root.join(project::PYPROJECT))?
-            .parse()
-            .context("parsing pyproject.toml")?;
-        let table = doc.get("build-system").and_then(|i| i.as_table_like());
-        let strings = |key: &str| -> Vec<String> {
-            table
-                .and_then(|t| t.get(key))
-                .and_then(|i| i.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-        // No [build-system]: PEP 517's legacy fallback.
-        let (requires, backend) = match table {
-            Some(t) => (
-                strings("requires"),
-                t.get("build-backend")
-                    .and_then(|i| i.as_str())
-                    .unwrap_or("setuptools.build_meta:__legacy__")
-                    .to_owned(),
-            ),
-            None => (
-                vec!["setuptools>=40.8.0".to_owned()],
-                "setuptools.build_meta:__legacy__".to_owned(),
-            ),
-        };
-        let backend_path = strings("backend-path");
-        let canonical_root = fs::canonicalize(&root)?;
-        for p in &backend_path {
-            let full = fs::canonicalize(root.join(p))
-                .with_context(|| format!("build-system.backend-path entry {p:?}"))?;
-            if Path::new(p).is_absolute() || !full.starts_with(&canonical_root) {
-                bail!("build-system.backend-path must stay inside the project ({p:?} does not)");
-            }
-        }
-
         let version = python_floor(&project)?;
         let series = format!("{}.{}", version[0], version[1]);
-        let python = venv::interpreter(Some(&series))?;
-        let build_env = std::env::temp_dir().join(format!("vivar-build-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&build_env);
-        venv::create(&build_env, &python, "build")?;
-        let result = (|| -> Result<()> {
-            let py = venv::python(&build_env);
-            if !requires.is_empty() {
-                self.install(&py, &requires)?;
-            }
-            let dist = root.join("dist");
-            fs::create_dir_all(&dist)?;
-            // Build tools the backend shells out to (ninja, meson, cython)
-            // live in the build env's bin: it goes first on PATH.
-            let mut dirs = vec![build_env.join(venv::BIN)];
-            if let Some(p) = std::env::var_os("PATH") {
-                dirs.extend(std::env::split_paths(&p));
-            }
-            let path = std::env::join_paths(dirs).context("PATH")?;
-            let hook = |mode: &str| -> Result<String> {
-                let mut cmd = std::process::Command::new(&py);
-                cmd.current_dir(&root)
-                    .env("PATH", &path)
-                    .args(["-c", BUILD_HOOK, mode, &backend])
-                    .arg(&dist)
-                    .args(&backend_path);
-                let out = cmd
-                    .output()
-                    .with_context(|| format!("running {}", py.display()))?;
-                if !out.status.success() {
-                    bail!(
-                        "the build backend `{backend}` failed during {mode}:\n{}",
-                        String::from_utf8_lossy(&out.stderr).trim_end()
-                    );
-                }
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                Ok(stdout.lines().last().unwrap_or_default().trim().to_owned())
-            };
-            // Dynamic requirements (setuptools asks for wheel, for instance),
-            // resolved together with the static ones so pins hold.
-            let extra = hook("requires")?;
-            let extra: Vec<String> = crate::json::parse(&extra)
-                .context("the build backend's dynamic requirements are not a JSON list")?
-                .as_array()
-                .unwrap_or(&[])
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect();
-            if !extra.is_empty() {
-                let mut all = requires.clone();
-                all.extend(extra);
-                self.install(&py, &all)?;
-            }
-            for mode in ["sdist", "wheel"] {
-                let name = hook(mode)?;
-                if name.is_empty() {
-                    bail!("the build backend `{backend}` returned no {mode} name");
-                }
-                println!("built dist/{name}");
-            }
-            Ok(())
-        })();
-        let _ = fs::remove_dir_all(&build_env);
-        result
+        let dist = project.root.join("dist");
+        for name in self.pep517(&project.root, &dist, &series, &["sdist", "wheel"])? {
+            println!("built dist/{name}");
+        }
+        Ok(())
     }
 
     /// Installs `specs` into the environment whose interpreter is `python`:
@@ -682,7 +1057,12 @@ impl Backend for NativeBackend {
             ..Default::default()
         };
         let index = self.index();
+        let builder = Builder {
+            backend: self,
+            series: format!("{}.{}", version[0], version[1]),
+        };
         let resolution = Resolver::new(&index, version, self.no_build)
+            .fetch(&builder)
             .single()
             .resolve(&roots)?;
         let lock_text = write_lock(&roots, &resolution, index.url());
@@ -705,7 +1085,8 @@ impl Backend for NativeBackend {
             if let Some(old) = present.iter().find(|d| d.name == pkg.name) {
                 install::uninstall(old)?;
             }
-            let wheel = self.with_source(|source| fetch_wheel(pkg, &target, source))?;
+            let wheel =
+                self.with_source(Some(&series), |source| fetch_wheel(pkg, &target, source))?;
             install::install_wheel(&wheel, &layout)?;
             installed += 1;
         }
@@ -817,8 +1198,9 @@ impl Backend for NativeBackend {
             .copied()
             .filter(|p| p.source_kind == "registry")
             .collect();
-        let (installed, _) =
-            self.with_source(|source| apply(project.venv_root(), &registry, &layout, &t, source))?;
+        let (installed, _) = self.with_source(None, |source| {
+            apply(project.venv_root(), &registry, &layout, &t, source)
+        })?;
         println!("native layout: {installed} package(s) for {triple}");
         Ok(())
     }

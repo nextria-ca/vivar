@@ -155,13 +155,19 @@ impl Index {
             Ok(body) => {
                 let text = String::from_utf8_lossy(&body).into_owned();
                 if ttl > 0 {
+                    // Written whole, then renamed: a full disk or a concurrent
+                    // refresh never leaves a half entry behind a valid stamp.
                     let _ = fs::create_dir_all(&cache);
-                    let _ = fs::write(&path, format!("{now}\n{text}"));
+                    let tmp = cache.join(format!("{name}.listing.{}.tmp", std::process::id()));
+                    if fs::write(&tmp, format!("{now}\n{text}")).is_ok() {
+                        let _ = fs::rename(&tmp, &path);
+                    }
+                    let _ = fs::remove_file(&tmp);
                 }
                 Ok(text)
             }
             Err(e) => match cached {
-                Some((stamp, body)) => {
+                Some((stamp, body)) if ttl > 0 => {
                     eprintln!(
                         "note: {} is unreachable ({e:#}); using the listing for {name} cached {}s ago",
                         self.base,
@@ -169,7 +175,7 @@ impl Index {
                     );
                     Ok(body)
                 }
-                None => Err(e).with_context(|| format!("looking up {name} on {}", self.base)),
+                _ => Err(e).with_context(|| format!("looking up {name} on {}", self.base)),
             },
         }
     }

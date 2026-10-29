@@ -276,24 +276,42 @@ impl Backend for UvBackend {
         cmd.args(["lock", "--upgrade", "--dry-run"]);
         // uv prints one line per change: `Update six v1.16.0 -> v1.17.0`,
         // `Add x v1.0`, `Remove y v2.0`.
+        // A forked lock lists several versions a side: `v1.26.4, v2.1.0 -> v1.26.4, v2.2.0`.
         let mut changes = Vec::new();
         for line in Self::capture(cmd)?.lines() {
-            let words: Vec<&str> = line.split_whitespace().collect();
-            let strip = |v: &str| v.trim_start_matches('v').to_owned();
-            match words.as_slice() {
-                ["Update" | "Updated", name, from, "->", to] => changes.push(Change {
-                    name: crate::project::normalize(name),
-                    from: Some(strip(from)),
-                    to: Some(strip(to)),
-                }),
-                ["Add" | "Added", name, to] => changes.push(Change {
-                    name: crate::project::normalize(name),
+            let line = line.trim();
+            let Some((action, rest)) = line.split_once(' ') else {
+                continue;
+            };
+            let Some((name, versions)) = rest.split_once(' ') else {
+                continue;
+            };
+            let strip = |v: &str| {
+                v.split(',')
+                    .map(|p| p.trim().trim_start_matches('v'))
+                    .filter(|p| !p.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let name = crate::project::normalize(name);
+            match action {
+                "Update" | "Updated" => {
+                    if let Some((from, to)) = versions.split_once(" -> ") {
+                        changes.push(Change {
+                            name,
+                            from: Some(strip(from)),
+                            to: Some(strip(to)),
+                        });
+                    }
+                }
+                "Add" | "Added" => changes.push(Change {
+                    name,
                     from: None,
-                    to: Some(strip(to)),
+                    to: Some(strip(versions)),
                 }),
-                ["Remove" | "Removed", name, from] => changes.push(Change {
-                    name: crate::project::normalize(name),
-                    from: Some(strip(from)),
+                "Remove" | "Removed" => changes.push(Change {
+                    name,
+                    from: Some(strip(versions)),
                     to: None,
                 }),
                 _ => {}

@@ -70,6 +70,9 @@ jobs:
           else
             curl -LsSf "$uv_url.tar.gz" | tar -xz --strip-components=1 -C dist/$name uv-$t/uv
             cp target/$t/release/vivar install.sh dist/$name/
+            if target/$t/release/vivar --version >/dev/null 2>&1; then
+              target/$t/release/vivar man dist/$name/man
+            fi
           fi
           curl -LsSf https://raw.githubusercontent.com/astral-sh/uv/$UV_VERSION/LICENSE-MIT -o dist/$name/LICENSE-uv
           # the CPython builds uv itself would download for this target, laid out as uv keeps them

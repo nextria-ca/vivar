@@ -513,9 +513,25 @@ fn main() -> Result<()> {
             );
             if !no_sync {
                 venv::ensure(&cwd, &name)?;
-                if backend::uv_available() {
-                    backend.lock(&cwd)?;
-                    venv::mark_synced(&cwd);
+                // A template that declares dependencies or a package is synced
+                // so its tasks work at once; a plain app without uv waits for
+                // the first `add` rather than resolving an empty project online.
+                let needs_sync = template != project::Template::App;
+                if backend::uv_available() || needs_sync {
+                    let result = backend.lock(&cwd).and_then(|_| {
+                        if needs_sync {
+                            backend.sync(&cwd)
+                        } else {
+                            Ok(())
+                        }
+                    });
+                    match result {
+                        Ok(()) => venv::mark_synced(&cwd),
+                        Err(e) if !backend::uv_available() => {
+                            println!("note: could not resolve the template's dependencies yet ({e:#}); run `vivar sync` when online")
+                        }
+                        Err(e) => return Err(e),
+                    }
                 } else {
                     println!("note: uv is not installed; uv.lock will be written on the first `vivar add`");
                 }

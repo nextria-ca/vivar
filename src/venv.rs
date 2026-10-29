@@ -117,6 +117,34 @@ pub fn interpreter(request: Option<&str>) -> Result<Installed> {
     }
 }
 
+/// A cheap fingerprint of what is installed: the dist-info directories and
+/// their modification times. Changes whenever a package is added, removed or
+/// replaced, even partially.
+pub fn fingerprint(venv: &Path) -> String {
+    let Ok(site) = site_packages(venv) else {
+        return String::new();
+    };
+    let mut entries: Vec<String> = fs::read_dir(&site)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".dist-info"))
+                .map(|e| {
+                    let mtime = e
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0);
+                    format!("{}@{mtime}", e.file_name().to_string_lossy())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    entries.sort();
+    entries.join("\n")
+}
+
 /// Records that `root/.venv` matches `root/uv.lock` right now.
 pub fn mark_synced(root: &Path) {
     let venv = root.join(".venv");

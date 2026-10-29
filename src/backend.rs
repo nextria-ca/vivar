@@ -27,9 +27,58 @@ pub trait Backend {
     fn install(&self, python: &Path, specs: &[String]) -> Result<()>;
     /// Writes the lock as a pinned, hashed `requirements.txt`.
     fn export_requirements(&self, dir: &Path, output: &Path) -> Result<()>;
+    /// Lays out the lock's packages for another machine (`triple`, `python`
+    /// as `3.12`) into `target`: site-packages plus a `bin/` of scripts.
+    /// Wheels only; nothing is executed.
+    fn install_for_target(
+        &self,
+        dir: &Path,
+        triple: &str,
+        python: &str,
+        target: &Path,
+    ) -> Result<()>;
 }
 
 const UV_INSTALL_HINT: &str = "install it with `curl -LsSf https://astral.sh/uv/install.sh | sh`";
+
+/// Credentials for the mirror, from the environment: `VIVAR_INDEX_TOKEN` (sent
+/// as the password with user `__token__`, Artifactory/Nexus style) or
+/// `VIVAR_INDEX_USERNAME` + `VIVAR_INDEX_PASSWORD`. A `~/.netrc` entry works
+/// too, since both uv and curl read it.
+pub fn index_credentials() -> Option<(String, String)> {
+    if let Ok(token) = std::env::var("VIVAR_INDEX_TOKEN") {
+        return Some(("__token__".to_owned(), token));
+    }
+    match (
+        std::env::var("VIVAR_INDEX_USERNAME"),
+        std::env::var("VIVAR_INDEX_PASSWORD"),
+    ) {
+        (Ok(u), Ok(p)) => Some((u, p)),
+        _ => None,
+    }
+}
+
+/// The index URL with the configured credentials in its userinfo, if any.
+pub fn with_credentials(url: &str) -> String {
+    match (index_credentials(), url.split_once("://")) {
+        (Some((user, pass)), Some((scheme, rest))) if !rest.contains('@') => {
+            format!("{scheme}://{}:{}@{rest}", percent(&user), percent(&pass))
+        }
+        _ => url.to_owned(),
+    }
+}
+
+fn percent(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
 
 /// Whether the `uv` binary is reachable on PATH.
 pub fn uv_available() -> bool {
@@ -44,12 +93,15 @@ pub struct UvBackend {
     /// Replaces PyPI when set (`[tool.vivar.policy] index-url`): a mirror URL, or a
     /// local directory of wheels that is then the only source.
     index_url: Option<String>,
+    /// `require-wheels`: never build from source.
+    no_build: bool,
 }
 
 impl UvBackend {
     pub fn new(policy: &Policy) -> Self {
         UvBackend {
             index_url: policy.index_url.clone(),
+            no_build: policy.require_wheels,
         }
     }
 
@@ -62,9 +114,12 @@ impl UvBackend {
                 cmd.env("UV_FIND_LINKS", dir).env("UV_NO_INDEX", "1");
             }
             Some(url) => {
-                cmd.env("UV_DEFAULT_INDEX", url);
+                cmd.env("UV_DEFAULT_INDEX", with_credentials(url));
             }
             None => {}
+        }
+        if self.no_build {
+            cmd.env("UV_NO_BUILD", "1");
         }
         cmd
     }
@@ -156,6 +211,49 @@ impl Backend for UvBackend {
         Self::check(cmd)
     }
 
+    fn install_for_target(
+        &self,
+        dir: &Path,
+        triple: &str,
+        python: &str,
+        target: &Path,
+    ) -> Result<()> {
+        let reqs = std::env::temp_dir().join(format!("vivar-reqs-{}.txt", std::process::id()));
+        let mut export = self.uv(dir);
+        export
+            .args([
+                "export",
+                "--format",
+                "requirements.txt",
+                "--no-dev",
+                "--frozen",
+                "--no-emit-project",
+                "--quiet",
+                "--output-file",
+            ])
+            .arg(&reqs);
+        Self::check(export)?;
+        let mut cmd = self.uv(dir);
+        cmd.args([
+            "pip",
+            "install",
+            "--reinstall",
+            "--only-binary",
+            ":all:",
+            "--python-platform",
+            triple,
+            "--python-version",
+            python,
+            "--target",
+        ])
+        .arg(target)
+        .arg("--requirements")
+        .arg(&reqs);
+        let result = Self::check(cmd);
+        let _ = std::fs::remove_file(&reqs);
+        result
+    }
+
     fn install(&self, python: &Path, specs: &[String]) -> Result<()> {
         let dir = python.parent().unwrap_or(python);
         let mut cmd = self.uv(dir);
@@ -163,5 +261,29 @@ impl Backend for UvBackend {
             .arg(python)
             .args(specs);
         Self::check(cmd)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credentials_go_into_the_index_url() {
+        std::env::remove_var("VIVAR_INDEX_TOKEN");
+        std::env::set_var("VIVAR_INDEX_USERNAME", "svc user");
+        std::env::set_var("VIVAR_INDEX_PASSWORD", "p@ss/w");
+        assert_eq!(
+            with_credentials("https://mirror.example/simple"),
+            "https://svc%20user:p%40ss%2Fw@mirror.example/simple"
+        );
+        // An URL that already carries credentials is left alone.
+        assert_eq!(
+            with_credentials("https://a:b@m/simple"),
+            "https://a:b@m/simple"
+        );
+        std::env::remove_var("VIVAR_INDEX_USERNAME");
+        std::env::remove_var("VIVAR_INDEX_PASSWORD");
+        assert_eq!(with_credentials("https://m/simple"), "https://m/simple");
     }
 }

@@ -17,9 +17,7 @@ const ACTIVATE_FISH: &str = include_str!("venv/activate.fish");
 const ACTIVATE_CSH: &str = include_str!("venv/activate.csh");
 /// Hash of the lockfile the env was last synced from, for drift warnings.
 const SYNCED: &str = "vivar-synced.sha256";
-#[cfg(windows)]
 const ACTIVATE_BAT: &str = include_str!("venv/activate.bat");
-#[cfg(windows)]
 const DEACTIVATE_BAT: &str = include_str!("venv/deactivate.bat");
 
 /// Creates a fresh `venv` on `python`. Refuses to touch an existing one.
@@ -74,18 +72,29 @@ pub fn create(venv: &Path, python: &Installed, prompt: &str) -> Result<()> {
     )?;
     fs::write(venv.join(".gitignore"), "*\n")?;
 
+    write_activate_scripts(&bin, &venv.to_string_lossy(), prompt, BIN, cfg!(windows))
+}
+
+/// Writes the activate scripts into `bin` for a venv at `venv_dir` (as the
+/// scripts should spell it). `windows` adds the cmd scripts.
+pub fn write_activate_scripts(
+    bin: &Path,
+    venv_dir: &str,
+    prompt: &str,
+    bin_name: &str,
+    windows: bool,
+) -> Result<()> {
     let fill = |template: &str| {
         template
-            .replace("__VENV_DIR__", &venv.to_string_lossy())
+            .replace("__VENV_DIR__", venv_dir)
             .replace("__VENV_PROMPT__", prompt)
-            .replace("__VENV_BIN__", BIN)
+            .replace("__VENV_BIN__", bin_name)
     };
     fs::write(bin.join("activate"), fill(ACTIVATE_SH))?;
     fs::write(bin.join("Activate.ps1"), fill(ACTIVATE_PS1))?;
     fs::write(bin.join("activate.fish"), fill(ACTIVATE_FISH))?;
     fs::write(bin.join("activate.csh"), fill(ACTIVATE_CSH))?;
-    #[cfg(windows)]
-    {
+    if windows {
         fs::write(bin.join("activate.bat"), fill(ACTIVATE_BAT))?;
         fs::write(bin.join("deactivate.bat"), DEACTIVATE_BAT)?;
     }
@@ -169,7 +178,7 @@ pub fn warn_if_stale(root: &Path) {
 }
 
 /// `vivar shell`: an interactive shell with the env activated.
-pub fn shell(root: &Path, prompt: &str) -> Result<i32> {
+pub fn shell(root: &Path, prompt: &str, extra: &[(String, String)]) -> Result<i32> {
     let venv = root.join(".venv");
     if !venv.join("pyvenv.cfg").exists() {
         bail!("{} has no .venv yet; run `vivar sync`", root.display());
@@ -189,6 +198,9 @@ pub fn shell(root: &Path, prompt: &str) -> Result<i32> {
         .env("VIRTUAL_ENV_PROMPT", format!("({prompt}) "))
         .env("PATH", path)
         .env_remove("PYTHONHOME");
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
     let name = shell.file_stem().and_then(|n| n.to_str()).unwrap_or("");
     if matches!(name, "bash" | "zsh" | "sh" | "dash") {
         cmd.env("PS1", format!(r"({prompt}) \u@\h:\w\$ "));
@@ -229,18 +241,49 @@ pub fn site_packages(venv: &Path) -> Result<PathBuf> {
     bail!("no site-packages under {}", lib.display())
 }
 
-/// Runs `args` in the project's `.venv`.
-pub fn run(root: &Path, args: &[String]) -> Result<i32> {
+/// Runs `args` in the project's `.venv` with `extra` environment variables.
+pub fn run(root: &Path, args: &[String], extra: &[(String, String)]) -> Result<i32> {
     let venv = root.join(".venv");
     if !venv.join("pyvenv.cfg").exists() {
         bail!("{} has no .venv yet; run `vivar sync`", root.display());
     }
-    exec(&venv, args)
+    exec_with(&venv, args, extra)
+}
+
+/// `KEY=VALUE` lines from a dotenv-style file: `#` comments, blank lines,
+/// optional `export `, single or double quotes.
+pub fn read_env_file(path: &Path) -> Result<Vec<(String, String)>> {
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut vars = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else {
+            bail!("{}: expected KEY=VALUE, got {line:?}", path.display());
+        };
+        let value = value.trim();
+        let value = if (value.starts_with('"') && value.ends_with('"') && value.len() >= 2)
+            || (value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2)
+        {
+            value[1..value.len() - 1].to_owned()
+        } else {
+            value.split(" #").next().unwrap_or(value).trim().to_owned()
+        };
+        vars.push((key.trim().to_owned(), value));
+    }
+    Ok(vars)
 }
 
 /// Runs `args` with the env's bin directory first on PATH. On Unix this execs,
 /// so the command owns the terminal and signals; Windows waits for it.
 pub fn exec(venv: &Path, args: &[String]) -> Result<i32> {
+    exec_with(venv, args, &[])
+}
+
+pub fn exec_with(venv: &Path, args: &[String], extra: &[(String, String)]) -> Result<i32> {
     let bin = venv.join(BIN);
     let (program, rest) = args
         .split_first()
@@ -260,6 +303,9 @@ pub fn exec(venv: &Path, args: &[String]) -> Result<i32> {
         .env("VIRTUAL_ENV", venv)
         .env("PATH", path)
         .env_remove("PYTHONHOME");
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
 
     #[cfg(unix)]
     {
@@ -286,5 +332,33 @@ fn ignore_ctrl_c() {
     // SAFETY: a null handler with add=1 only sets the process's ignore flag.
     unsafe {
         SetConsoleCtrlHandler(std::ptr::null(), 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_env_files() {
+        let path = std::env::temp_dir().join(format!("vivar-envfile-{}", std::process::id()));
+        fs::write(
+            &path,
+            "# keys\nOPENAI_API_KEY=sk-123\nexport HF_TOKEN='hf_abc'\nMSG=\"hello world\" \nPLAIN=value # trailing\n\n",
+        )
+        .unwrap();
+        let vars = read_env_file(&path).unwrap();
+        assert_eq!(
+            vars,
+            vec![
+                ("OPENAI_API_KEY".to_owned(), "sk-123".to_owned()),
+                ("HF_TOKEN".to_owned(), "hf_abc".to_owned()),
+                ("MSG".to_owned(), "hello world".to_owned()),
+                ("PLAIN".to_owned(), "value".to_owned()),
+            ]
+        );
+        fs::write(&path, "NOEQUALS\n").unwrap();
+        assert!(read_env_file(&path).is_err());
+        let _ = fs::remove_file(&path);
     }
 }

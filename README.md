@@ -158,7 +158,13 @@ vivar export docker             # a Dockerfile that installs exactly what uv.loc
 vivar export requirements       # pinned, hashed requirements.txt for pip-only consumers
 vivar export wheelhouse --target windows-x86_64 --python 3.12   # the lock's wheels, for offline installs
 vivar policy                    # the effective policy and which file each rule came from
-vivar add torch --cuda 12.4     # route packages to the PyTorch index for that CUDA version
+vivar add torch                 # picks the PyTorch build for this machine's GPU (--cuda 12.4 / cpu / rocm6.2 / none)
+vivar profile add cu124 torch torchvision   # a machine variant; `profile add cpu torch` another, same lockfile
+vivar sync --profile auto       # install the profile that fits this machine's GPU
+vivar pack --target linux-x86_64 --python 3.12   # a bundle for another machine, built here
+vivar pack --zstd --use-host-cuda               # faster compression; leave CUDA libs to the target
+vivar kernel install            # register .venv as a Jupyter kernel (needs ipykernel)
+vivar run --env-file .env train.py
 vivar python pin 3.13           # repin the project and rebuild .venv on it
 vivar diff a.tar.gz b.tar.gz    # what changed between two bundles
 vivar doctor                    # what's installed, configured, broken
@@ -168,6 +174,42 @@ vivar upgrade                   # vivar itself (`--check` only reports)
 ```
 
 `audit`, `licenses`, `verify` and `policy` take `--json` for CI and compliance tooling.
+
+### GPUs
+
+`vivar doctor` reports the accelerator (NVIDIA driver and the CUDA version it
+supports, VRAM, compute capability; ROCm; Apple Silicon). `vivar add torch` uses that
+to route torch, torchvision and torchaudio to the matching PyTorch index: the newest
+CUDA build the driver can run, ROCm on AMD, the CPU index on a Linux box without a GPU
+(PyPI's Linux wheels drag in 2+ GB of CUDA libraries), and PyPI's own wheels on macOS
+and Windows. `--cuda 12.4`, `--cuda cpu`, `--cuda rocm6.2` override it; `--cuda none`
+leaves PyPI alone.
+
+**Profiles** are machine variants of one project that share a lockfile:
+`vivar profile add cu124 torch torchvision` and `vivar profile add cpu torch` create
+mutually exclusive dependency groups routed to the right indexes, and
+`vivar sync --profile auto` installs the one that fits the current machine.
+
+`vivar verify` goes beyond the driver check when torch is installed: it runs a matmul
+on the GPU (or MPS), reports cuDNN and NCCL, and compares the driver's CUDA version
+with the one the packages were built for (major mismatch is an error, minor is a
+warning: NVIDIA's minor-version compatibility usually covers it).
+
+**Cross-target bundles.** `vivar pack --target linux-x86_64` builds a bundle for a
+Linux or macOS machine from any Linux or macOS host: the target's Python build is
+downloaded, the lock's wheels are laid out for it, and the venv is assembled by hand.
+Nothing from the target is executed, so wheels only (`require-wheels` enforces that
+at add time). Windows bundles are built on Windows. `--zstd` compresses multi-GB
+environments several times faster (the unpacking machine needs zstd too);
+`--use-host-cuda` leaves out the NVIDIA libraries from `nvidia-*` wheels when the
+target provides CUDA itself.
+
+Policy for ML boxes: `telemetry = "off"` makes `run` and `shell` set the variables that
+silence Hugging Face, Gradio, Weights & Biases and friends; `network = "offline"` puts
+them in offline mode; `require-wheels = true` refuses source distributions. Private
+registries take `VIVAR_INDEX_TOKEN` or `VIVAR_INDEX_USERNAME`/`VIVAR_INDEX_PASSWORD`
+(or a `~/.netrc` entry). `export docker` uses an `nvidia/cuda` base image when the
+lock contains CUDA packages.
 `vivar run` prints a one-line note when `uv.lock` changed since the last sync.
 Activate scripts exist for sh/bash/zsh, fish, csh/tcsh, PowerShell and cmd.
 

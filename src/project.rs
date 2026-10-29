@@ -62,11 +62,28 @@ pub fn init_files(root: &Path, name: &str, version: [u32; 3], lib: bool) -> Resu
     write_defaults(root)
 }
 
-/// Routes `packages` to the PyTorch index for a CUDA version: an explicit
-/// `[[tool.uv.index]]` plus `[tool.uv.sources]` entries, so uv (and anyone
-/// without vivar) resolves them from there and nothing else from it.
-pub fn route_to_cuda_index(root: &Path, packages: &[String], cuda: &str) -> Result<()> {
-    let tag = format!("cu{}", cuda.replace('.', ""));
+/// `12.4` → `cu124`, `cpu` → `cpu`, `rocm6.2` → `rocm6.2`, `cu124` → `cu124`.
+pub fn pytorch_variant_tag(spec: &str) -> String {
+    let spec = spec.trim().to_lowercase();
+    if spec == "cpu" || spec.starts_with("rocm") || spec.starts_with("cu") {
+        spec
+    } else {
+        format!("cu{}", spec.replace('.', ""))
+    }
+}
+
+/// Routes `packages` to the PyTorch index for a variant (`cu124`, `cpu`,
+/// `rocm6.2`): an explicit `[[tool.uv.index]]` plus `[tool.uv.sources]`
+/// entries, so uv (and anyone without vivar) resolves them from there and
+/// nothing else from it. With `group`, the source only applies inside that
+/// dependency group, which is how profiles coexist.
+pub fn route_to_pytorch_index(
+    root: &Path,
+    packages: &[String],
+    variant: &str,
+    group: Option<&str>,
+) -> Result<()> {
+    let tag = pytorch_variant_tag(variant);
     let index_name = format!("pytorch-{tag}");
     let path = root.join(PYPROJECT);
     let mut doc: DocumentMut = fs::read_to_string(&path)?.parse()?;
@@ -104,9 +121,83 @@ pub fn route_to_cuda_index(root: &Path, packages: &[String], cuda: &str) -> Resu
         .as_table_mut()
         .context("`tool.uv.sources` is not a table")?;
     for package in packages {
+        let name = normalize(requirement_name(package));
         let mut source = toml_edit::InlineTable::new();
         source.insert("index", index_name.as_str().into());
-        sources[&normalize(requirement_name(package))] = value(source);
+        match group {
+            None => sources[&name] = value(source),
+            Some(group) => {
+                source.insert("group", group.into());
+                // Profiles stack: keep the other groups' entries for this package.
+                let mut list = sources
+                    .get(&name)
+                    .and_then(Item::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                list.retain(|v| {
+                    v.as_inline_table()
+                        .and_then(|t| t.get("group"))
+                        .and_then(|g| g.as_str())
+                        != Some(group)
+                });
+                list.push(source);
+                sources[&name] = value(list);
+            }
+        }
+    }
+    fs::write(&path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Registers `name` as a profile: a dependency group whose members come from
+/// the matching PyTorch index, mutually exclusive with the other profiles.
+/// The packages themselves are added with `uv add --group` afterwards.
+pub fn declare_profile(root: &Path, name: &str, packages: &[String]) -> Result<()> {
+    route_to_pytorch_index(root, packages, name, Some(name))?;
+    let path = root.join(PYPROJECT);
+    let mut doc: DocumentMut = fs::read_to_string(&path)?.parse()?;
+    let tool = doc["tool"]
+        .as_table_mut()
+        .context("`tool` is not a table")?;
+    let mut vivar_default = Table::new();
+    vivar_default.set_implicit(true);
+    let vivar = tool
+        .entry("vivar")
+        .or_insert(Item::Table(vivar_default))
+        .as_table_mut()
+        .context("`tool.vivar` is not a table")?;
+    let mut profiles: Vec<String> = vivar
+        .get("profiles")
+        .and_then(Item::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !profiles.iter().any(|p| p == name) {
+        profiles.push(name.to_owned());
+    }
+    let mut list = Array::new();
+    for p in &profiles {
+        list.push(p.as_str());
+    }
+    vivar["profiles"] = value(list);
+
+    // uv must know the groups exclude each other, or it resolves them together.
+    let uv = tool["uv"]
+        .as_table_mut()
+        .context("`tool.uv` is not a table")?;
+    if profiles.len() > 1 {
+        let mut set = Array::new();
+        for p in &profiles {
+            let mut t = toml_edit::InlineTable::new();
+            t.insert("group", p.as_str().into());
+            set.push(t);
+        }
+        let mut conflicts = Array::new();
+        conflicts.push(set);
+        uv["conflicts"] = value(conflicts);
     }
     fs::write(&path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
 }
@@ -178,6 +269,40 @@ pub struct Policy {
     pub license_exceptions: Vec<String>,
     /// Every locked package must be a hashed registry artifact from `index-url`.
     pub require_hashes: bool,
+    /// Refuse source distributions: wheels only (air-gapped boxes have no compilers).
+    pub require_wheels: bool,
+    /// `vivar run`/`shell` set the variables that silence ML-library telemetry.
+    pub telemetry_off: bool,
+    /// `vivar run`/`shell` tell Hugging Face, uv and friends not to touch the network.
+    pub offline: bool,
+}
+
+impl Policy {
+    /// Environment variables `run` and `shell` add under this policy.
+    pub fn runtime_env(&self) -> Vec<(&'static str, &'static str)> {
+        let mut vars = Vec::new();
+        if self.telemetry_off {
+            vars.extend([
+                ("HF_HUB_DISABLE_TELEMETRY", "1"),
+                ("DISABLE_TELEMETRY", "1"),
+                ("DO_NOT_TRACK", "1"),
+                ("GRADIO_ANALYTICS_ENABLED", "False"),
+                ("SCARF_NO_ANALYTICS", "true"),
+                ("WANDB_DISABLE_GIT", "true"),
+            ]);
+        }
+        if self.offline {
+            vars.extend([
+                ("HF_HUB_OFFLINE", "1"),
+                ("TRANSFORMERS_OFFLINE", "1"),
+                ("HF_DATASETS_OFFLINE", "1"),
+                ("UV_OFFLINE", "1"),
+                ("PIP_NO_INDEX", "1"),
+                ("WANDB_MODE", "offline"),
+            ]);
+        }
+        vars
+    }
 }
 
 impl Policy {
@@ -234,6 +359,18 @@ impl Policy {
                 .and_then(|p| p.get("require-hashes"))
                 .and_then(Item::as_bool)
                 .unwrap_or(false),
+            require_wheels: table
+                .and_then(|p| p.get("require-wheels"))
+                .and_then(Item::as_bool)
+                .unwrap_or(false),
+            telemetry_off: table
+                .and_then(|p| p.get("telemetry"))
+                .and_then(Item::as_str)
+                .is_some_and(|v| v.eq_ignore_ascii_case("off")),
+            offline: table
+                .and_then(|p| p.get("network"))
+                .and_then(Item::as_str)
+                .is_some_and(|v| v.eq_ignore_ascii_case("offline")),
         }
     }
 
@@ -258,6 +395,9 @@ impl Policy {
         };
         self.license_exceptions.extend(org.license_exceptions);
         self.require_hashes |= org.require_hashes;
+        self.require_wheels |= org.require_wheels;
+        self.telemetry_off |= org.telemetry_off;
+        self.offline |= org.offline;
         self
     }
 }
@@ -374,6 +514,22 @@ impl Project {
             .and_then(|p| p.get("requires-python"))
             .and_then(Item::as_str)
             .map(str::to_owned)
+    }
+
+    /// `[tool.vivar] profiles`: dependency groups that are machine variants.
+    pub fn profiles(&self) -> Vec<String> {
+        self.doc
+            .get("tool")
+            .and_then(|t| t.get("vivar"))
+            .and_then(|v| v.get("profiles"))
+            .and_then(Item::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// `[tool.vivar.scripts]`: named commands for `vivar run <name>`.
@@ -740,6 +896,7 @@ lint = ["ruff"]
             allow_licenses: Some(vec!["mit".into(), "Apache-2.0".into()]),
             license_exceptions: vec!["legacy".into()],
             require_hashes: true,
+            ..Default::default()
         };
         let merged = project.merge(org);
         assert_eq!(merged.deny, vec!["a", "b"]);
@@ -767,6 +924,53 @@ lint = ["ruff"]
     }
 
     #[test]
+    fn declares_profiles_with_conflicts() {
+        let tmp = TempDir::new("profiles");
+        fs::write(
+            tmp.0.join(PYPROJECT),
+            "[project]\nname = \"t\"\ndependencies = []\n",
+        )
+        .unwrap();
+        declare_profile(&tmp.0, "cpu", &["torch".into()]).unwrap();
+        declare_profile(&tmp.0, "cu124", &["torch".into(), "torchvision".into()]).unwrap();
+        declare_profile(&tmp.0, "cu124", &["torch".into()]).unwrap();
+        let project = Project::load(&tmp.0).unwrap();
+        assert_eq!(project.profiles(), vec!["cpu", "cu124"]);
+        let text = fs::read_to_string(tmp.0.join(PYPROJECT)).unwrap();
+        assert!(text.contains("download.pytorch.org/whl/cpu"), "{text}");
+        assert!(text.contains("download.pytorch.org/whl/cu124"), "{text}");
+        assert!(text.contains("conflicts"), "{text}");
+        assert!(
+            text.contains("{ index = \"pytorch-cpu\", group = \"cpu\" }"),
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("index = \"pytorch-cu124\", group = \"cu124\"")
+                .count(),
+            2,
+            "{text}"
+        );
+        assert_eq!(pytorch_variant_tag("12.4"), "cu124");
+        assert_eq!(pytorch_variant_tag("cu118"), "cu118");
+        assert_eq!(pytorch_variant_tag("CPU"), "cpu");
+        assert_eq!(pytorch_variant_tag("rocm6.2"), "rocm6.2");
+    }
+
+    #[test]
+    fn runtime_env_follows_policy() {
+        let tmp = TempDir::new("runtime");
+        let project = project_with(
+            &tmp.0,
+            "[project]\nname = \"t\"\n[tool.vivar.policy]\ntelemetry = \"off\"\nnetwork = \"offline\"\nrequire-wheels = true\n",
+        );
+        let policy = project.own_policy();
+        assert!(policy.require_wheels && policy.telemetry_off && policy.offline);
+        let env = policy.runtime_env();
+        assert!(env.contains(&("HF_HUB_OFFLINE", "1")) && env.contains(&("DO_NOT_TRACK", "1")));
+        assert!(Policy::default().runtime_env().is_empty());
+    }
+
+    #[test]
     fn routes_packages_to_a_cuda_index() {
         let tmp = TempDir::new("cuda");
         fs::write(
@@ -774,8 +978,14 @@ lint = ["ruff"]
             "[project]\nname = \"t\"\ndependencies = []\n",
         )
         .unwrap();
-        route_to_cuda_index(&tmp.0, &["torch>=2".into(), "torchvision".into()], "12.4").unwrap();
-        route_to_cuda_index(&tmp.0, &["torchaudio".into()], "12.4").unwrap();
+        route_to_pytorch_index(
+            &tmp.0,
+            &["torch>=2".into(), "torchvision".into()],
+            "12.4",
+            None,
+        )
+        .unwrap();
+        route_to_pytorch_index(&tmp.0, &["torchaudio".into()], "12.4", None).unwrap();
         let text = fs::read_to_string(tmp.0.join(PYPROJECT)).unwrap();
         assert_eq!(
             text.matches("download.pytorch.org/whl/cu124").count(),

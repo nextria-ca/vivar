@@ -5,7 +5,9 @@ mod dirs;
 mod doctor;
 mod envs;
 mod export;
+mod gpu;
 mod json;
+mod kernel;
 mod licenses;
 mod lock;
 mod project;
@@ -57,12 +59,27 @@ enum Command {
         /// Add to a dependency group, e.g. dev
         #[arg(long)]
         group: Option<String>,
-        /// Take these packages from the PyTorch index for this CUDA version, e.g. 12.4
+        /// PyTorch build for torch/torchvision/torchaudio: a CUDA version (12.4),
+        /// `cpu`, `rocm6.2`, `auto` (match this machine's GPU; the default) or `none` (PyPI as is)
         #[arg(long)]
         cuda: Option<String>,
     },
     /// Open an interactive shell with the project environment activated
-    Shell,
+    Shell {
+        /// Also load KEY=VALUE pairs from this file
+        #[arg(long)]
+        env_file: Option<PathBuf>,
+    },
+    /// Machine variants of the project (cpu, cu124, rocm6.2 …) that share one lockfile
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
+    /// Register the project environment as a Jupyter kernel
+    Kernel {
+        #[command(subcommand)]
+        command: KernelCommand,
+    },
     /// Show the effective policy and where each rule comes from
     Policy {
         #[arg(long)]
@@ -76,10 +93,17 @@ enum Command {
     /// Resolve dependencies and write the lockfile
     Lock,
     /// Make the environment match the lockfile exactly
-    Sync,
+    Sync {
+        /// Install this profile's packages (`auto` picks the one for this machine's GPU)
+        #[arg(long)]
+        profile: Option<String>,
+    },
     /// Run a command, a `[tool.vivar.scripts]` task, or a PEP 723 script in the
     /// project environment (no activation needed)
     Run {
+        /// Also load KEY=VALUE pairs from this file (API keys and the like)
+        #[arg(long)]
+        env_file: Option<PathBuf>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -142,6 +166,18 @@ enum Command {
         /// Leave out libpython (only embedders need it; saves ~30 MB)
         #[arg(long)]
         slim: bool,
+        /// Build for another machine: <os>-<arch>, e.g. linux-x86_64 or macos-aarch64
+        #[arg(long)]
+        target: Option<String>,
+        /// Python series for a --target bundle (default: the project's pin)
+        #[arg(long)]
+        python: Option<String>,
+        /// Compress with zstd (much faster on multi-GB environments; needs zstd on the machine that unpacks)
+        #[arg(long)]
+        zstd: bool,
+        /// Leave out the NVIDIA libraries from nvidia-* wheels; the target machine provides CUDA
+        #[arg(long)]
+        use_host_cuda: bool,
     },
     /// Extract a bundle made by `vivar pack` and make it activatable here
     Unpack {
@@ -237,6 +273,32 @@ enum ToolCommand {
 }
 
 #[derive(Subcommand)]
+enum ProfileCommand {
+    /// Create a profile (cpu, cu124, rocm6.2 …) holding these PyTorch-family packages
+    Add {
+        name: String,
+        #[arg(required = true)]
+        packages: Vec<String>,
+    },
+    /// List the project's profiles and which one fits this machine
+    List,
+}
+
+#[derive(Subcommand)]
+enum KernelCommand {
+    /// Register .venv as a Jupyter kernel (needs ipykernel in the env)
+    Install {
+        /// Kernel name (default: the project name)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Remove a kernel registered by vivar
+    Uninstall { name: String },
+    /// List Jupyter kernels
+    List,
+}
+
+#[derive(Subcommand)]
 enum EnvCommand {
     /// List environments, Python builds and caches with sizes
     List,
@@ -318,9 +380,7 @@ fn main() -> Result<()> {
             .into_iter()
             .map(|p| (p.clone(), std::fs::read(&p).ok()))
             .collect();
-            if let Some(cuda) = &cuda {
-                project::route_to_cuda_index(&project.root, &packages, cuda)?;
-            }
+            route_pytorch(&project, &packages, cuda.as_deref())?;
             let env_before = venv::fingerprint(&project.venv_root().join(".venv"));
             // A failed add (bad index, unresolvable spec) is rolled back like a policy failure.
             let added = backend
@@ -366,11 +426,54 @@ fn main() -> Result<()> {
             backend.remove(&cwd, &packages)?;
             venv::mark_synced(project.venv_root());
         }
-        Command::Shell => {
+        Command::Shell { env_file } => {
             let project = require(project, &cwd)?;
             venv::warn_if_stale(project.venv_root());
-            std::process::exit(venv::shell(project.venv_root(), &project.name())?);
+            let extra = runtime_env(&policy, env_file.as_deref())?;
+            std::process::exit(venv::shell(project.venv_root(), &project.name(), &extra)?);
         }
+        Command::Profile { command } => match command {
+            ProfileCommand::Add { name, packages } => {
+                let project = require(project, &cwd)?;
+                project.check_requirements(&packages)?;
+                venv::ensure(project.venv_root(), &project.name())?;
+                project::declare_profile(&project.root, &name, &packages)?;
+                backend.add(&cwd, &packages, Some(&name))?;
+                venv::mark_synced(project.venv_root());
+                after_install(&project, &policy)?;
+                println!("profile `{name}` ready; `vivar sync --profile {name}` (or `--profile auto`) installs it");
+            }
+            ProfileCommand::List => {
+                let project = require(project, &cwd)?;
+                let profiles = project.profiles();
+                if profiles.is_empty() {
+                    println!(
+                        "no profiles; `vivar profile add cu124 torch torchvision` creates one"
+                    );
+                }
+                let gpu = gpu::detect();
+                let pick = gpu::profile_for(&gpu, &profiles);
+                for p in &profiles {
+                    println!(
+                        "{p}{}",
+                        if Some(p) == pick {
+                            "  (fits this machine)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                println!("this machine: {}", gpu::describe(&gpu));
+            }
+        },
+        Command::Kernel { command } => match command {
+            KernelCommand::Install { name } => {
+                let project = require(project, &cwd)?;
+                kernel::install(project.venv_root(), &project.name(), name.as_deref())?;
+            }
+            KernelCommand::Uninstall { name } => kernel::uninstall(&name)?,
+            KernelCommand::List => kernel::list()?,
+        },
         Command::Policy { json } => print_policy(project.as_ref(), &policy, json)?,
         Command::Lock => {
             let project = require(project, &cwd)?;
@@ -378,16 +481,39 @@ fn main() -> Result<()> {
             backend.lock(&cwd)?;
             check_hashes(&project, &policy)?;
         }
-        Command::Sync => {
+        Command::Sync { profile } => {
             let project = require(project, &cwd)?;
             project.check_declared()?;
             venv::ensure(project.venv_root(), &project.name())?;
-            backend.sync(&cwd)?;
+            let group = match profile.as_deref() {
+                None => None,
+                Some("auto") => {
+                    let profiles = project.profiles();
+                    let gpu = gpu::detect();
+                    let pick = gpu::profile_for(&gpu, &profiles).cloned();
+                    match &pick {
+                        Some(p) => println!("profile `{p}` for {}", gpu::describe(&gpu)),
+                        None => println!(
+                            "no profile fits {}; syncing the default groups",
+                            gpu::describe(&gpu)
+                        ),
+                    }
+                    pick
+                }
+                Some(name) => {
+                    if !project.profiles().iter().any(|p| p == name) {
+                        bail!("no profile named {name}; `vivar profile list` shows them");
+                    }
+                    Some(name.to_owned())
+                }
+            };
+            backend.sync_group(&cwd, group.as_deref())?;
             venv::mark_synced(project.venv_root());
             after_install(&project, &policy)?;
         }
-        Command::Run { args } => {
+        Command::Run { env_file, args } => {
             let first = args[0].as_str();
+            let extra = runtime_env(&policy, env_file.as_deref())?;
             // A PEP 723 script carries its own environment.
             let script = std::path::Path::new(first);
             if first.ends_with(".py")
@@ -407,7 +533,7 @@ fn main() -> Result<()> {
                 }
                 None => args,
             };
-            std::process::exit(venv::run(project.venv_root(), &args)?);
+            std::process::exit(venv::run(project.venv_root(), &args, &extra)?);
         }
         Command::Outdated => {
             require(project, &cwd)?;
@@ -585,19 +711,56 @@ fn main() -> Result<()> {
         Command::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "vivar", &mut std::io::stdout());
         }
-        Command::Pack { output, slim } => {
+        Command::Pack {
+            output,
+            slim,
+            target,
+            python,
+            zstd,
+            use_host_cuda,
+        } => {
             let project = require(project, &cwd)?;
             project.check_declared()?;
-            venv::ensure(project.venv_root(), &project.name())?;
-            backend.sync(&cwd)?;
-            venv::mark_synced(project.venv_root());
-            after_install(&project, &policy)?;
-            let archive = bundle::pack(
-                project.venv_root(),
-                &project.name(),
-                output.as_deref(),
+            let opts = bundle::PackOptions {
                 slim,
-            )?;
+                zstd,
+                host_cuda: use_host_cuda,
+            };
+            let archive = match target {
+                Some(target) => {
+                    let python = python
+                        .or_else(|| {
+                            std::fs::read_to_string(project.venv_root().join(".python-version"))
+                                .ok()
+                                .map(|s| s.trim().to_owned())
+                        })
+                        .unwrap_or_else(|| "3.12".to_owned());
+                    let t = wheelhouse::Target::new(Some(&target), &python)?;
+                    check_hashes(&project, &policy)?;
+                    bundle::pack_for_target(
+                        &backend,
+                        project.venv_root(),
+                        &project.name(),
+                        output.as_deref(),
+                        t.os(),
+                        t.arch(),
+                        &python,
+                        opts,
+                    )?
+                }
+                None => {
+                    venv::ensure(project.venv_root(), &project.name())?;
+                    backend.sync(&cwd)?;
+                    venv::mark_synced(project.venv_root());
+                    after_install(&project, &policy)?;
+                    bundle::pack(
+                        project.venv_root(),
+                        &project.name(),
+                        output.as_deref(),
+                        opts,
+                    )?
+                }
+            };
             let size = std::fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
             println!(
                 "Packed {} ({:.1} MB). Unpack elsewhere with `vivar unpack {}`",
@@ -609,7 +772,11 @@ fn main() -> Result<()> {
         Command::Unpack { archive, dest } => {
             let dest = dest.unwrap_or_else(|| {
                 let stem = archive.file_name().unwrap_or_default().to_string_lossy();
-                PathBuf::from(stem.trim_end_matches(".tar.gz").trim_end_matches(".tgz"))
+                PathBuf::from(
+                    stem.trim_end_matches(".tar.gz")
+                        .trim_end_matches(".tgz")
+                        .trim_end_matches(".tar.zst"),
+                )
             });
             let dest = bundle::unpack(&archive, &dest)?;
             let bin = dest.join(".venv").join(venv::BIN);
@@ -726,6 +893,60 @@ fn main() -> Result<()> {
             }
             PythonCommand::List { all } => python::list(all)?,
         },
+    }
+    Ok(())
+}
+
+/// Environment for `run`/`shell`: the policy's variables, then the env file's.
+fn runtime_env(
+    policy: &project::Policy,
+    env_file: Option<&std::path::Path>,
+) -> Result<Vec<(String, String)>> {
+    let mut vars: Vec<(String, String)> = policy
+        .runtime_env()
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+    if let Some(path) = env_file {
+        vars.extend(venv::read_env_file(path)?);
+    }
+    Ok(vars)
+}
+
+/// Packages that come from PyTorch's own indexes rather than PyPI.
+const PYTORCH_FAMILY: &[&str] = &["torch", "torchvision", "torchaudio"];
+
+/// `vivar add torch`: pick the PyTorch build for this machine's GPU unless told
+/// otherwise (`--cuda 12.4`, `cpu`, `rocm6.2`, or `none` to leave PyPI alone).
+fn route_pytorch(project: &Project, packages: &[String], cuda: Option<&str>) -> Result<()> {
+    let family: Vec<String> = packages
+        .iter()
+        .filter(|p| {
+            PYTORCH_FAMILY.contains(&project::normalize(project::requirement_name(p)).as_str())
+        })
+        .cloned()
+        .collect();
+    let (variant, targets) = match cuda {
+        Some("none") => (None, Vec::new()),
+        Some("auto") | None => {
+            if family.is_empty() {
+                return Ok(());
+            }
+            let gpu = gpu::detect();
+            let variant = gpu::pytorch_variant(&gpu);
+            match &variant {
+                Some(v) => println!("{}: using PyTorch's {v} wheels", gpu::describe(&gpu)),
+                None => println!(
+                    "{}: using PyPI's default PyTorch wheels",
+                    gpu::describe(&gpu)
+                ),
+            }
+            (variant, family)
+        }
+        Some(explicit) => (Some(explicit.to_owned()), packages.to_vec()),
+    };
+    if let (Some(variant), false) = (variant, targets.is_empty()) {
+        project::route_to_pytorch_index(&project.root, &targets, &variant, None)?;
     }
     Ok(())
 }

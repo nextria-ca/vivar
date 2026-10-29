@@ -18,6 +18,14 @@ pub struct Target {
 }
 
 impl Target {
+    pub fn os(&self) -> &str {
+        &self.os
+    }
+
+    pub fn arch(&self) -> &str {
+        &self.arch
+    }
+
     /// `name` as `<os>-<arch>` (defaults to this machine), `python` as `3.12`.
     pub fn new(name: Option<&str>, python: &str) -> Result<Target> {
         let (os, arch) = match name {

@@ -78,6 +78,30 @@ pub fn run(cwd: &Path) -> Result<i32> {
         ),
     }
 
+    line(
+        true,
+        format!(
+            "accelerator: {}",
+            crate::gpu::describe(&crate::gpu::detect())
+        ),
+    );
+    if crate::backend::index_credentials().is_some() {
+        line(
+            true,
+            "index credentials present (VIVAR_INDEX_TOKEN / USERNAME+PASSWORD)".to_owned(),
+        );
+    }
+    for var in [
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "SSL_CERT_FILE",
+        "VIVAR_CA_BUNDLE",
+    ] {
+        if let Ok(v) = std::env::var(var) {
+            line(true, format!("{var}={v}"));
+        }
+    }
+
     match project::org_policy()? {
         Some((path, policy)) => line(
             true,
@@ -122,6 +146,16 @@ pub fn run(cwd: &Path) -> Result<i32> {
                 let ok =
                     !index.contains("://") && Path::new(index).is_dir() || index.contains("://");
                 line(ok, format!("index-url {index}"));
+            }
+            let env = policy.runtime_env();
+            if !env.is_empty() {
+                line(
+                    true,
+                    format!(
+                        "run/shell set {} policy variables (telemetry/offline)",
+                        env.len()
+                    ),
+                );
             }
             match project.check_declared() {
                 Ok(()) => line(true, "declared dependencies pass the deny list".to_owned()),

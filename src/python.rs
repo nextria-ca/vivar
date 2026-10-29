@@ -6,7 +6,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const RELEASES: &str = "https://github.com/astral-sh/python-build-standalone/releases";
@@ -221,9 +221,75 @@ pub fn select(spec: Option<&str>) -> Result<Installed> {
 /// Downloads for this machine in the latest python-build-standalone release:
 /// `(version, file name, sha256)`, newest first. Pre-releases are left out.
 fn available() -> Result<Vec<([u32; 3], String, String)>> {
+    available_for(&triple()?)
+}
+
+/// The python-build-standalone triple for an `(os, arch)` pair as vivar names
+/// them (`linux`/`macos`/`windows`, `x86_64`/`aarch64`).
+pub fn triple_for(os: &str, arch: &str) -> String {
+    match os {
+        "linux" => format!("{arch}-unknown-linux-gnu"),
+        "macos" => format!("{arch}-apple-darwin"),
+        _ => format!("{arch}-pc-windows-msvc"),
+    }
+}
+
+/// uv's directory key for a build: `cpython-3.12.4-linux-x86_64-gnu`.
+pub fn key_for(os: &str, arch: &str, version: [u32; 3]) -> String {
+    let [a, b, c] = version;
+    let libc = if os == "linux" { "gnu" } else { "none" };
+    format!("cpython-{a}.{b}.{c}-{os}-{arch}-{libc}")
+}
+
+/// Downloads a build matching `request` for another machine into `dest`
+/// (laid out as `dest/<key>/`), checksum verified. Returns the key and version.
+pub fn download_for(
+    os: &str,
+    arch: &str,
+    request: &str,
+    dest: &Path,
+) -> Result<(String, [u32; 3])> {
+    let wanted = parse_request(request)?;
+    let triple = triple_for(os, arch);
+    let (version, file, digest) = available_for(&triple)?
+        .into_iter()
+        .find(|(v, _, _)| satisfies(*v, &wanted))
+        .ok_or_else(|| anyhow!("no standalone CPython {request} build for {triple}"))?;
+    let tag = file
+        .split('+')
+        .nth(1)
+        .and_then(|rest| rest.split('-').next())
+        .ok_or_else(|| anyhow!("unexpected download name {file}"))?;
+    let url = format!("{RELEASES}/download/{tag}/{file}");
+    fs::create_dir_all(dest)?;
+    let archive = dest.join(&file);
+    println!("downloading {file}");
+    crate::upgrade::fetch_to(&url, &archive)?;
+    let actual = crate::sha256::file(&archive)?;
+    if actual != digest {
+        let _ = fs::remove_file(&archive);
+        bail!("{file} failed its checksum (got {actual}, expected {digest})");
+    }
+    let status = Command::new("tar")
+        .arg("-xzf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(dest)
+        .status()
+        .context("failed to run `tar`")?;
+    let _ = fs::remove_file(&archive);
+    if !status.success() {
+        bail!("could not extract {file}");
+    }
+    let key = key_for(os, arch, version);
+    fs::rename(dest.join("python"), dest.join(&key))?;
+    Ok((key, version))
+}
+
+fn available_for(triple: &str) -> Result<Vec<([u32; 3], String, String)>> {
     let sums = crate::upgrade::fetch(&format!("{RELEASES}/latest/download/SHA256SUMS"), None)
         .context("fetching the list of Python downloads")?;
-    let suffix = format!("-{}-install_only_stripped.tar.gz", triple()?);
+    let suffix = format!("-{triple}-install_only_stripped.tar.gz");
     let mut out = Vec::new();
     for line in String::from_utf8_lossy(&sums).lines() {
         let mut fields = line.split_whitespace();

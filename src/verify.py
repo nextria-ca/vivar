@@ -146,6 +146,73 @@ def cuda_runtime_version(dists):
     return None
 
 
+def torch_checks():
+    """Runs torch's own accelerator probes in a child (a broken CUDA stack can
+    crash the interpreter). Yields (level, subject, detail)."""
+    probe = r"""
+import json, sys
+out = {}
+try:
+    import torch
+except Exception as e:  # noqa: BLE001
+    print(json.dumps({"import": f"{type(e).__name__}: {e}"})); sys.exit(0)
+out["version"] = torch.__version__
+out["cuda_built"] = torch.version.cuda
+out["hip_built"] = getattr(torch.version, "hip", None)
+out["cudnn"] = torch.backends.cudnn.version() if torch.backends.cudnn.is_available() else None
+try:
+    out["nccl"] = ".".join(map(str, torch.cuda.nccl.version())) if hasattr(torch.cuda, "nccl") and torch.cuda.is_available() else None
+except Exception:  # noqa: BLE001
+    out["nccl"] = None
+out["mps"] = bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
+try:
+    out["cuda_available"] = torch.cuda.is_available()
+    if out["cuda_available"]:
+        out["device"] = torch.cuda.get_device_name(0)
+        a = torch.randn(256, 256, device="cuda")
+        out["matmul_ok"] = bool(torch.allclose(a @ torch.eye(256, device="cuda"), a, atol=1e-4))
+    elif out["mps"]:
+        a = torch.randn(64, 64, device="mps")
+        out["matmul_ok"] = bool(torch.allclose((a @ torch.eye(64, device="mps")).cpu(), a.cpu(), atol=1e-4))
+except Exception as e:  # noqa: BLE001
+    out["error"] = f"{type(e).__name__}: {e}"
+print(json.dumps(out))
+"""
+    import json
+    try:
+        r = subprocess.run([sys.executable, "-I", "-c", probe], capture_output=True, text=True, timeout=IMPORT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return [("ERR", "torch", f"accelerator probe timed out after {IMPORT_TIMEOUT}s")]
+    if r.returncode != 0 or not r.stdout.strip():
+        tail = (r.stderr.strip().splitlines() or ["crashed"])[-1]
+        return [("ERR", "torch", f"accelerator probe crashed: {tail}")]
+    info = json.loads(r.stdout.strip().splitlines()[-1])
+    if "import" in info:
+        return []  # the import loop already reported it
+    results = []
+    built_for = info.get("cuda_built") or (info.get("hip_built") and f"ROCm {info['hip_built']}")
+    if info.get("cuda_built"):
+        if info.get("cuda_available"):
+            if info.get("matmul_ok"):
+                results.append(("ok", "torch", f"CUDA {info['cuda_built']} works on {info.get('device')}"
+                                               f" (cuDNN {info.get('cudnn')}, NCCL {info.get('nccl') or 'n/a'})"))
+            else:
+                results.append(("ERR", "torch", f"CUDA matmul failed on {info.get('device')}: {info.get('error', 'wrong result')}"))
+        else:
+            level = "WARN" if ALLOW_MISSING_GPU else "ERR"
+            results.append((level, "torch", f"built for CUDA {info['cuda_built']} but torch.cuda.is_available() is False"
+                                             f" ({info.get('error') or 'no usable GPU/driver'})"))
+    elif info.get("hip_built"):
+        results.append(("ok" if info.get("cuda_available") else ("WARN" if ALLOW_MISSING_GPU else "ERR"),
+                        "torch", f"built for {built_for}; GPU {'available' if info.get('cuda_available') else 'not available'}"))
+    elif info.get("mps"):
+        results.append(("ok" if info.get("matmul_ok") else "ERR", "torch",
+                        f"MPS {'works' if info.get('matmul_ok') else 'failed: ' + str(info.get('error'))}"))
+    else:
+        results.append(("ok", "torch", f"{info['version']} is a CPU build"))
+    return results
+
+
 def main():
     global ok_count
     venv = sys.prefix
@@ -184,6 +251,16 @@ def main():
             say(f"  ok   CUDA driver and GPU present for {', '.join((cuda_dists or cuda_libs)[:5])}")
         for note in warnings_only:
             report("WARN", "CUDA", note)
+
+    # 3b. If torch is installed, exercise the accelerator it was built for.
+    torch_dist = next((d for d in dists if d.metadata["Name"].lower() == "torch"), None)
+    if torch_dist:
+        for level, subject, detail in torch_checks():
+            if level == "ok":
+                if VERBOSE:
+                    say(f"  ok   {subject}: {detail}")
+            else:
+                report(level, subject, detail)
 
     # 4. Scripts point at an interpreter that exists.
     bindir = os.path.join(venv, "Scripts" if os.name == "nt" else "bin")

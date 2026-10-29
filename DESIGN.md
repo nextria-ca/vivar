@@ -218,8 +218,15 @@ MSI/deb/rpm packages, `SSL_CERT_FILE`/`VIVAR_CA_BUNDLE` for private CAs, org pol
 delivered by the installers, `upgrade --check`, `add --cuda` (PyTorch index routing) and a
 driver-version check in `verify`, `export requirements`, `pack --slim`, `init --lib`.
 
-Deferred: native dependencies via conda-forge (phase 2), full GPU-aware resolution
-beyond index routing, the in-process resolver that removes the `uv` binary, man pages.
+AI batch (2026-10-29): GPU detection (`gpu.rs`) driving `add torch`, profiles
+(`profile add/list`, `sync --profile auto`, uv conflicting groups + per-group sources),
+torch accelerator probes in `verify`, cross-target `pack --target` (download target
+Python, `uv pip install --python-platform --target`, hand-built venv under a fake root
+that `unpack` rewrites), `--zstd`, `--use-host-cuda`, `require-wheels`, `telemetry`/
+`network` policy keys, `--env-file`, index credentials, `kernel install`, CUDA docker base.
+
+Deferred: native dependencies via conda-forge (phase 2), delta bundles, the in-process
+resolver that removes the `uv` binary, man pages.
 
 ## 13. Open questions
 

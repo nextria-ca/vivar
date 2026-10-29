@@ -1359,3 +1359,204 @@ fn shell_slim_pack_init_lib_and_cuda_routing() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("failed"));
 }
+
+#[test]
+fn cross_target_pack_builds_a_runnable_bundle() {
+    let tmp = TempDir::new("xpack");
+    let dir = &tmp.0;
+    init(dir);
+    ok(dir, &["add", "six", "pycodestyle"]);
+
+    // The same platform as this machine, built the cross-target way: it must unpack and run.
+    let here = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    let archive = tmp.0.join("x.tar.gz");
+    let out = vivar(
+        dir,
+        &[
+            "pack",
+            "--target",
+            &here,
+            "--python",
+            "3.12",
+            "-o",
+            archive.to_str().unwrap(),
+        ],
+    );
+    if cfg!(windows) {
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("Windows"));
+        return;
+    }
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let dest = tmp.0.join("x-dest");
+    ok(
+        &tmp.0,
+        &["unpack", archive.to_str().unwrap(), dest.to_str().unwrap()],
+    );
+    let out = ok(
+        &dest,
+        &[
+            "run",
+            "python",
+            "-c",
+            "import six, pycodestyle, sys; print(sys.prefix)",
+        ],
+    );
+    assert!(stdout_of(&out).contains("x-dest"), "{}", stdout_of(&out));
+    let script = dest.join(".venv").join("bin").join("pycodestyle");
+    let out = Command::new(&script).arg("--version").output().unwrap();
+    assert!(
+        out.status.success(),
+        "console script from a cross-built bundle failed"
+    );
+    assert!(stdout_of(&ok(&dest, &["verify"])).contains("integrity: all bundled files match"));
+
+    // Another platform: built, listed, structurally right, never executed.
+    let other = if cfg!(target_os = "linux") {
+        "macos-aarch64"
+    } else {
+        "linux-x86_64"
+    };
+    let archive2 = tmp.0.join("other.tar.gz");
+    ok(
+        dir,
+        &[
+            "pack",
+            "--target",
+            other,
+            "--python",
+            "3.12",
+            "-o",
+            archive2.to_str().unwrap(),
+        ],
+    );
+    let listing = Command::new("tar")
+        .args(["-tzf", archive2.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&listing.stdout);
+    let expect_key = "cpython-3.12.";
+    assert!(
+        listing.contains(expect_key)
+            && listing.contains(".venv/bin/python")
+            && listing.contains("site-packages/six.py"),
+        "{listing}"
+    );
+    let diff = stdout_of(&ok(
+        &tmp.0,
+        &[
+            "diff",
+            archive.to_str().unwrap(),
+            archive2.to_str().unwrap(),
+        ],
+    ));
+    assert!(diff.contains("platform:"), "{diff}");
+}
+
+#[test]
+fn zstd_pack_when_available() {
+    let tmp = TempDir::new("zstd");
+    let dir = &tmp.0;
+    init(dir);
+    let archive = tmp.0.join("z.tar.zst");
+    let out = vivar(dir, &["pack", "--zstd", "-o", archive.to_str().unwrap()]);
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("zstd"), "unexpected failure: {err}");
+        return; // no zstd on this machine; the message says so
+    }
+    let dest = tmp.0.join("z-dest");
+    ok(
+        &tmp.0,
+        &["unpack", archive.to_str().unwrap(), dest.to_str().unwrap()],
+    );
+    ok(&dest, &["run", "python", "-c", "pass"]);
+}
+
+#[test]
+fn profiles_env_files_and_policy_env() {
+    let tmp = TempDir::new("profiles");
+    let dir = &tmp.0;
+    init(dir);
+    // mpmath is published on PyTorch's indexes too, and is tiny.
+    ok(dir, &["profile", "add", "cpu", "mpmath"]);
+    let text = read(&dir.join("pyproject.toml"));
+    assert!(
+        text.contains("download.pytorch.org/whl/cpu") && text.contains("profiles = [\"cpu\"]"),
+        "{text}"
+    );
+    let listing = stdout_of(&ok(dir, &["profile", "list"]));
+    assert!(
+        listing.contains("cpu") && listing.contains("this machine:"),
+        "{listing}"
+    );
+    ok(dir, &["sync", "--profile", "cpu"]);
+    ok(dir, &["run", "python", "-c", "import mpmath"]);
+    fails_with(dir, &["sync", "--profile", "nope"], "no profile named");
+    ok(dir, &["sync", "--profile", "auto"]);
+
+    // Explicit --cuda routes the named packages; none leaves PyPI alone.
+    ok(dir, &["add", "--cuda", "none", "six"]);
+    assert!(!read(&dir.join("pyproject.toml")).contains("six = {"));
+
+    // Policy env plus an env file reach the program.
+    append_policy(dir, "telemetry = \"off\"\nnetwork = \"offline\"");
+    fs::write(
+        dir.join(".env"),
+        "MYKEY=hello # comment\nexport QUOTED=\"a b\"\n",
+    )
+    .unwrap();
+    let out = ok(dir, &["run", "--env-file", ".env", "python", "-c",
+        "import os; print(os.environ['DO_NOT_TRACK'], os.environ['HF_HUB_OFFLINE'], os.environ['MYKEY'], os.environ['QUOTED'])"]);
+    assert_eq!(stdout_of(&out).trim(), "1 1 hello a b");
+    let policy = stdout_of(&ok(dir, &["policy", "--json"]));
+    assert!(policy.contains("\"require-hashes\""));
+}
+
+#[test]
+fn kernel_registration_and_cuda_docker_base() {
+    let tmp = TempDir::new("kernel");
+    let dir = &tmp.0;
+    init(dir);
+    let jupyter = tmp.0.join("jupyter");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_vivar"))
+            .current_dir(dir)
+            .env("JUPYTER_DATA_DIR", &jupyter)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let out = run(&["kernel", "install"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ipykernel is not installed"));
+    // Stand in for ipykernel: the check only needs the distribution to exist.
+    fs::create_dir_all(site_packages(dir).join("ipykernel-6.0.0.dist-info")).unwrap();
+    let out = run(&["kernel", "install", "--name", "My Demo"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let spec = read(&jupyter.join("kernels").join("my-demo").join("kernel.json"));
+    assert!(
+        spec.contains("ipykernel_launcher") && spec.contains("\"vivar\""),
+        "{spec}"
+    );
+    assert!(stdout_of(&run(&["kernel", "list"])).contains("my-demo"));
+    assert!(run(&["kernel", "uninstall", "my-demo"]).status.success());
+    assert!(!jupyter.join("kernels").join("my-demo").exists());
+
+    if cfg!(target_os = "linux") {
+        ok(dir, &["add", "nvidia-cuda-runtime-cu12"]);
+        let docker = stdout_of(&ok(dir, &["export", "docker", "-o", "-"]));
+        assert!(
+            docker.contains("nvidia/cuda:12.") && docker.contains("uv python install 3.12"),
+            "{docker}"
+        );
+    }
+}

@@ -16,7 +16,7 @@ pub use crate::venv::BIN as VENV_BIN;
 pub const CHECKSUMS: &str = "vivar-bundle.sha256";
 
 /// Mirrors the tar excludes in `pack` so the checksum list and the archive agree.
-fn excluded(rel: &Path, python_dir: &str, mm: &str, slim: bool) -> bool {
+fn excluded(rel: &Path, python_dir: &str, mm: &str, opts: PackOptions) -> bool {
     let parts: Vec<&str> = rel.iter().filter_map(|c| c.to_str()).collect();
     let name = parts.last().copied().unwrap_or("");
     if parts.iter().any(|p| {
@@ -30,6 +30,14 @@ fn excluded(rel: &Path, python_dir: &str, mm: &str, slim: bool) -> bool {
         return true;
     }
     if parts.first() == Some(&".venv") {
+        if opts.host_cuda {
+            let nvidia = parts.windows(4).any(|w| {
+                w[0] == "site-packages" && w[1] == "nvidia" && matches!(w[3], "lib" | "bin")
+            });
+            if nvidia {
+                return true;
+            }
+        }
         return parts.len() == 2 && matches!(parts[1], "CACHEDIR.TAG" | ".gitignore" | ".lock");
     }
     if parts.first() == Some(&python_dir) {
@@ -52,7 +60,7 @@ fn excluded(rel: &Path, python_dir: &str, mm: &str, slim: bool) -> bool {
         if parts.len() > 2 && parts[1] == "share" && parts[2] == "man" {
             return true;
         }
-        if slim && parts.len() == 3 && parts[1] == "lib" && name.starts_with("libpython") {
+        if opts.slim && parts.len() == 3 && parts[1] == "lib" && name.starts_with("libpython") {
             return true;
         }
     }
@@ -88,7 +96,7 @@ fn checksums(
     python_root: &Path,
     python_dir: &str,
     mm: &str,
-    slim: bool,
+    opts: PackOptions,
 ) -> Result<String> {
     let mut files = Vec::new();
     walk(root, Path::new(".venv"), &mut files)?;
@@ -102,7 +110,7 @@ fn checksums(
 
     let mut out = String::new();
     for rel in files {
-        if excluded(&rel, python_dir, mm, slim) || relocated(&rel) {
+        if excluded(&rel, python_dir, mm, opts) || relocated(&rel) {
             continue;
         }
         let base = if rel.starts_with(python_dir) {
@@ -155,7 +163,15 @@ pub fn verify_checksums(dir: &Path) -> Result<Vec<String>> {
     for rel in files {
         let member = rel.to_string_lossy().replace('\\', "/");
         // A slim bundle legitimately lacks libpython; anything else unlisted is foreign.
-        if !listed.contains(&member) && !excluded(&rel, python_dir, &mm, true) && !relocated(&rel) {
+        let lenient = PackOptions {
+            slim: true,
+            zstd: false,
+            host_cuda: true,
+        };
+        if !listed.contains(&member)
+            && !excluded(&rel, python_dir, &mm, lenient)
+            && !relocated(&rel)
+        {
             bad.push(format!("{member} (not in the bundle)"));
         }
     }
@@ -226,7 +242,7 @@ fn metadata_of(
     } else {
         fs::create_dir_all(scratch)?;
         let status = Command::new("tar")
-            .arg("-xzf")
+            .arg("-xf")
             .arg(path)
             .arg("-C")
             .arg(scratch)
@@ -309,7 +325,31 @@ fn python_root(home: &Path) -> Result<PathBuf> {
 
 /// Archives `<root>/.venv`, the project files, and the Python install the venv
 /// points at. Returns the archive path.
-pub fn pack(root: &Path, name: &str, output: Option<&Path>, slim: bool) -> Result<PathBuf> {
+/// What to leave out of a bundle and how to compress it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PackOptions {
+    /// Drop libpython (only embedders need it).
+    pub slim: bool,
+    /// zstd instead of gzip: several times faster on multi-GB environments.
+    pub zstd: bool,
+    /// Drop the NVIDIA libraries from `nvidia-*` wheels; the target supplies CUDA.
+    pub host_cuda: bool,
+}
+
+/// The files a bundle is made from.
+struct Tree {
+    root: PathBuf,
+    python_root: PathBuf,
+    python_dir: String,
+    version: String,
+    /// The venv and Python paths as recorded in the manifest, which `unpack`
+    /// rewrites to the destination.
+    venv: String,
+    home: String,
+    platform: String,
+}
+
+pub fn pack(root: &Path, name: &str, output: Option<&Path>, opts: PackOptions) -> Result<PathBuf> {
     let venv = root.join(".venv");
     let home = PathBuf::from(pyvenv_cfg(&venv, "home")?);
     let version = pyvenv_cfg(&venv, "version_info")?;
@@ -319,33 +359,177 @@ pub fn pack(root: &Path, name: &str, output: Option<&Path>, slim: bool) -> Resul
         .and_then(|n| n.to_str())
         .ok_or_else(|| anyhow!("unexpected Python root {}", python_root.display()))?
         .to_owned();
+    let tree = Tree {
+        root: root.to_path_buf(),
+        python_root,
+        python_dir,
+        version,
+        venv: venv.to_string_lossy().into_owned(),
+        home: home.to_string_lossy().into_owned(),
+        platform: platform(),
+    };
+    archive(&tree, name, output, opts)
+}
 
+/// Paths inside a cross-built bundle are recorded under this root; `unpack`
+/// rewrites them, exactly as it does for a bundle packed in place.
+const FAKE_ROOT: &str = "/vivar-bundle";
+
+/// Builds a bundle for another Linux or macOS machine: its Python build is
+/// downloaded, its wheels laid out by the backend, and the venv assembled by
+/// hand. Nothing from the target platform is executed.
+#[allow(clippy::too_many_arguments)]
+pub fn pack_for_target(
+    backend: &dyn crate::backend::Backend,
+    root: &Path,
+    name: &str,
+    output: Option<&Path>,
+    os: &str,
+    arch: &str,
+    python: &str,
+    opts: PackOptions,
+) -> Result<PathBuf> {
+    if os == "windows" {
+        bail!("Windows bundles need .exe launchers only a Windows host can produce; run `vivar pack` on a Windows machine");
+    }
+    if !cfg!(unix) {
+        bail!("cross-target bundles can be built on Linux or macOS hosts only");
+    }
+    let stage = std::env::temp_dir().join(format!("vivar-xpack-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&stage);
+    fs::create_dir_all(&stage)?;
+    let result = build_for_target(backend, root, name, output, os, arch, python, opts, &stage);
+    let _ = fs::remove_dir_all(&stage);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_for_target(
+    backend: &dyn crate::backend::Backend,
+    root: &Path,
+    name: &str,
+    output: Option<&Path>,
+    os: &str,
+    arch: &str,
+    python: &str,
+    opts: PackOptions,
+    stage: &Path,
+) -> Result<PathBuf> {
+    // 1. The interpreter the bundle will run on.
+    let (key, version) = crate::python::download_for(os, arch, python, stage)?;
+    let [major, minor, patch] = version;
+    let mm = format!("{major}.{minor}");
+
+    // 2. The locked packages, laid out for the target by the backend.
+    let venv_dir = stage.join(".venv");
+    let site = venv_dir
+        .join("lib")
+        .join(format!("python{mm}"))
+        .join("site-packages");
+    fs::create_dir_all(&site)?;
+    backend.install_for_target(root, &crate::python::triple_for(os, arch), &mm, &site)?;
+
+    // 3. A venv around them, with the paths unpack will rewrite.
+    let fake_venv = format!("{FAKE_ROOT}/.venv");
+    let fake_home = format!("{FAKE_ROOT}/{key}/bin");
+    let bin = venv_dir.join("bin");
+    fs::create_dir_all(&bin)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        symlink(format!("{fake_home}/python{mm}"), bin.join("python"))?;
+        symlink("python", bin.join("python3"))?;
+        symlink("python", bin.join(format!("python{mm}")))?;
+        if os == "linux" {
+            symlink("lib", venv_dir.join("lib64"))?;
+        }
+        // uv's --target writes console scripts under site-packages/bin with a
+        // host shebang; they belong in the venv's bin, pointing at its python.
+        if let Ok(entries) = fs::read_dir(site.join("bin")) {
+            for entry in entries.flatten() {
+                let dest = bin.join(entry.file_name());
+                let data = fs::read(entry.path())?;
+                if data.starts_with(b"#!") {
+                    let body = data.splitn(2, |b| *b == b'\n').nth(1).unwrap_or(&[]);
+                    let mut script = format!("#!{fake_venv}/bin/python\n").into_bytes();
+                    script.extend_from_slice(body);
+                    fs::write(&dest, script)?;
+                } else {
+                    fs::write(&dest, data)?;
+                }
+                fs::set_permissions(&dest, fs::Permissions::from_mode(0o755))?;
+            }
+            fs::remove_dir_all(site.join("bin"))?;
+        }
+    }
+    fs::write(
+        venv_dir.join("pyvenv.cfg"),
+        format!(
+            "home = {fake_home}\nimplementation = CPython\nversion = {v}\nversion_info = {v}\n\
+             include-system-site-packages = false\nprompt = {name}\ncreated-by = vivar {}\n",
+            env!("CARGO_PKG_VERSION"),
+            v = format!("{major}.{minor}.{patch}"),
+        ),
+    )?;
+    crate::venv::write_activate_scripts(&bin, &fake_venv, name, "bin", false)?;
+
+    // 4. The project files, so the bundle is a project too.
+    for file in ["pyproject.toml", "uv.lock", ".python-version"] {
+        if root.join(file).is_file() {
+            fs::copy(root.join(file), stage.join(file))?;
+        }
+    }
+
+    let tree = Tree {
+        root: stage.to_path_buf(),
+        python_root: stage.join(&key),
+        python_dir: key,
+        version: format!("{major}.{minor}.{patch}"),
+        venv: fake_venv,
+        home: fake_home,
+        platform: format!("{os}-{arch}"),
+    };
+    archive(&tree, name, output, opts)
+}
+
+fn archive(tree: &Tree, name: &str, output: Option<&Path>, opts: PackOptions) -> Result<PathBuf> {
+    let ext = if opts.zstd { "tar.zst" } else { "tar.gz" };
     let output = absolute(
         &output
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from(format!("{name}-{}.tar.gz", platform()))),
+            .unwrap_or_else(|| PathBuf::from(format!("{name}-{}.{ext}", tree.platform))),
     )?;
+    let python_dir = &tree.python_dir;
 
     let mut manifest = DocumentMut::new();
     manifest["name"] = value(name);
-    manifest["platform"] = value(platform());
-    manifest["python"] = value(&version);
-    manifest["python-dir"] = value(&python_dir);
-    manifest["python-home"] = value(home.to_string_lossy().as_ref());
-    manifest["venv"] = value(venv.to_string_lossy().as_ref());
+    manifest["platform"] = value(&tree.platform);
+    manifest["python"] = value(&tree.version);
+    manifest["python-dir"] = value(python_dir);
+    manifest["python-home"] = value(&tree.home);
+    manifest["venv"] = value(&tree.venv);
     manifest["created-by"] = value(concat!("vivar ", env!("CARGO_PKG_VERSION")));
+    if opts.host_cuda {
+        manifest["host-cuda"] = value(true);
+    }
 
     let staging = std::env::temp_dir().join(format!("vivar-pack-{}", std::process::id()));
     fs::create_dir_all(&staging)?;
     fs::write(staging.join(MANIFEST), manifest.to_string())?;
-    let mm = major_minor(&version);
+    let mm = major_minor(&tree.version);
     fs::write(
         staging.join(CHECKSUMS),
-        checksums(root, &python_root, &python_dir, &mm, slim)?,
+        checksums(&tree.root, &tree.python_root, python_dir, &mm, opts)?,
     )?;
 
     let mut tar = Command::new("tar");
-    tar.arg("-czf").arg(&output);
+    tar.arg("-c");
+    if opts.zstd {
+        tar.arg("--zstd");
+    } else {
+        tar.arg("-z");
+    }
+    tar.arg("-f").arg(&output);
     // A bundle is a frozen environment: no bytecode caches, tool caches, or the
     // runtime's own installer/IDE/test baggage. `lib/pythonX.Y` is the Unix
     // layout, `Lib` the Windows one.
@@ -373,9 +557,14 @@ pub fn pack(root: &Path, name: &str, output: Option<&Path>, slim: bool) -> Resul
     for demos in ["lib/*/demos", "tcl/*/demos"] {
         tar.arg(format!("--exclude={python_dir}/{demos}"));
     }
-    if slim {
+    if opts.slim {
         // The interpreter is statically linked; libpython only serves embedders.
         tar.arg(format!("--exclude={python_dir}/lib/libpython*"));
+    }
+    if opts.host_cuda {
+        for sub in ["lib", "bin"] {
+            tar.arg(format!("--exclude=site-packages/nvidia/*/{sub}"));
+        }
     }
     tar.arg(format!("--exclude={python_dir}/share/man"))
         .arg("-C")
@@ -383,20 +572,23 @@ pub fn pack(root: &Path, name: &str, output: Option<&Path>, slim: bool) -> Resul
         .arg(MANIFEST)
         .arg(CHECKSUMS)
         .arg("-C")
-        .arg(root)
+        .arg(&tree.root)
         .arg(".venv");
     for file in ["pyproject.toml", "uv.lock", ".python-version"] {
-        if root.join(file).is_file() {
+        if tree.root.join(file).is_file() {
             tar.arg(file);
         }
     }
     tar.arg("-C")
-        .arg(python_root.parent().unwrap_or(&python_root))
-        .arg(&python_dir);
+        .arg(tree.python_root.parent().unwrap_or(&tree.python_root))
+        .arg(python_dir);
 
     let status = tar.status().context("failed to run `tar`")?;
     let _ = fs::remove_dir_all(&staging);
     if !status.success() {
+        if opts.zstd {
+            bail!("tar exited with status {} (is zstd installed? `vivar pack` without --zstd uses gzip)", status.code().unwrap_or(1));
+        }
         bail!("tar exited with status {}", status.code().unwrap_or(1));
     }
     Ok(output)
@@ -415,7 +607,7 @@ pub fn unpack(archive: &Path, dest: &Path) -> Result<PathBuf> {
     }
 
     let status = Command::new("tar")
-        .arg("-xzf")
+        .arg("-xf")
         .arg(archive)
         .arg("-C")
         .arg(&dest)

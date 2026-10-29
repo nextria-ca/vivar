@@ -259,8 +259,9 @@ pub struct Resolver<'a> {
     python_floor: Version,
     cache: BTreeMap<(String, String), Metadata>,
     fetch: Option<&'a dyn Fetch>,
-    /// Direct references already fetched or built, by URL.
-    direct_cache: BTreeMap<String, Direct>,
+    /// Direct references already fetched or built, by (name, URL): the name
+    /// is part of the key because the artifact is checked against it.
+    direct_cache: BTreeMap<(String, String), Direct>,
 }
 
 /// A requirement on a package together with the environments it applies to.
@@ -792,11 +793,12 @@ impl<'a> Resolver<'a> {
                         req.name
                     )
                 })?;
-                let d = match self.direct_cache.get(&url) {
+                let cache_key = (req.name.clone(), url.clone());
+                let d = match self.direct_cache.get(&cache_key) {
                     Some(d) => d.clone(),
                     None => {
                         let d = fetch.direct(&req)?;
-                        self.direct_cache.insert(url.clone(), d.clone());
+                        self.direct_cache.insert(cache_key, d.clone());
                         d
                     }
                 };
@@ -810,11 +812,12 @@ impl<'a> Resolver<'a> {
                         );
                     }
                 }
+                let switching = !state.directs.contains_key(&req.name);
                 match state.assigned.iter().find(|(n, _)| *n == req.name) {
                     // Chosen from the index before the URL arrived: the same
                     // version keeps the assignment but takes the direct
-                    // source's metadata; another version is a conflict.
-                    Some((_, v)) if *v == d.version => reexpand_direct = true,
+                    // source's metadata (once); another version is a conflict.
+                    Some((_, v)) if *v == d.version => reexpand_direct = switching,
                     Some(_) => {
                         state = self.backtrack(&mut frames, &req.name)?;
                         continue;

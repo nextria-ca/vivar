@@ -417,14 +417,18 @@ fn safe_file_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\'])
 }
 
-/// `https://host/x.whl#sha256=abc` → (`https://host/x.whl`, `Some("abc")`).
-fn split_hash_fragment(url: &str) -> (String, Option<String>) {
+/// `https://host/x.whl#sha256=<64 hex>` → (`https://host/x.whl`, the digest).
+/// Anything else after `sha256=` is refused: the digest names a cache path.
+fn split_hash_fragment(url: &str) -> Result<(String, Option<String>)> {
     match url.split_once('#') {
-        Some((bare, frag)) => (
-            bare.to_owned(),
-            frag.strip_prefix("sha256=").map(|h| h.to_lowercase()),
-        ),
-        None => (url.to_owned(), None),
+        Some((bare, frag)) => match frag.strip_prefix("sha256=") {
+            Some(h) if h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()) => {
+                Ok((bare.to_owned(), Some(h.to_lowercase())))
+            }
+            Some(h) => bail!("{url}: `#sha256={h}` is not a 64-character hex digest"),
+            None => Ok((bare.to_owned(), None)),
+        },
+        None => Ok((url.to_owned(), None)),
     }
 }
 
@@ -617,10 +621,36 @@ fn direct_url_of(pkg: &Package) -> Option<String> {
     }
 }
 
+/// The parts of a PEP 610 record that identify a source: the URL, the
+/// archive hash, the VCS commit. Records written by pip, uv or vivar differ
+/// in whitespace, order and extras; these do not.
+fn direct_identity(json: &str) -> Option<(String, Option<String>, Option<String>)> {
+    let doc = crate::json::parse(json).ok()?;
+    let url = doc.get("url")?.as_str()?.to_owned();
+    let hash = doc
+        .get("archive_info")
+        .and_then(|a| a.get("hash"))
+        .and_then(|h| h.as_str())
+        .map(|h| h.trim_start_matches("sha256=").to_lowercase());
+    let commit = doc
+        .get("vcs_info")
+        .and_then(|v| v.get("commit_id"))
+        .and_then(|c| c.as_str())
+        .map(str::to_owned);
+    Some((url, hash, commit))
+}
+
 /// Whether what is installed is exactly this lock package: name, version and
 /// (for direct sources) the same URL, hash or commit.
 fn same_install(pkg: &Package, dist: &install::Installed) -> bool {
-    pkg.name == dist.name && pkg.version == dist.version && direct_url_of(pkg) == dist.direct_url
+    if pkg.name != dist.name || pkg.version != dist.version {
+        return false;
+    }
+    match (direct_url_of(pkg), &dist.direct_url) {
+        (None, None) => true,
+        (Some(want), Some(have)) => direct_identity(&want) == direct_identity(have),
+        _ => false,
+    }
 }
 
 /// An editable install: a `.pth` pointing at the package's source directory
@@ -1153,7 +1183,7 @@ impl Fetch for Builder<'_> {
             });
         }
         // `#sha256=…` on the URL is a promise to hold the download to.
-        let (url, expected) = split_hash_fragment(&url);
+        let (url, expected) = split_hash_fragment(&url)?;
         let filename = crate::lock::Artifact {
             url: url.clone(),
             hash: None,

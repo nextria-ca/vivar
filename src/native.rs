@@ -1,7 +1,8 @@
-//! The in-house backend: installs environments straight from `uv.lock`
-//! (wheels only, every artifact hash-checked), with no uv process. Resolution
-//! (`add`, `lock`, `upgrade`) still needs uv until the resolver lands; those
-//! operations say so.
+//! The in-house backend: resolves with `resolve.rs`, installs environments
+//! straight from `uv.lock` (wheels only, every artifact hash-checked), and
+//! builds through PEP 517, with no uv process. Projects using uv-specific
+//! features (workspaces, per-package sources, profiles) are refused rather
+//! than resolved differently.
 
 use crate::backend::Backend;
 use crate::index::Index;
@@ -66,6 +67,13 @@ impl NativeBackend {
         upgrade_all: bool,
         dry_run: bool,
     ) -> Result<(BTreeMap<String, String>, BTreeMap<String, String>)> {
+        let unsupported = project.uv_only_features();
+        if !unsupported.is_empty() {
+            bail!(
+                "this project uses {}, which vivar's resolver does not handle yet; install uv for it",
+                unsupported.join(" and ")
+            );
+        }
         let root = project.venv_root();
         let (deps, extras, groups) = project.requirement_sections();
         let parse_all = |v: &[String]| -> Result<Vec<Requirement>> {
@@ -84,8 +92,10 @@ impl NativeBackend {
                 .iter()
                 .map(|(k, v)| Ok((k.clone(), parse_all(v)?)))
                 .collect::<Result<_>>()?,
+            editable: project.is_package(),
         };
-        let floor = python_floor(project)?;
+        let machine = python_floor(project)?;
+        let floor = declared_floor(project).unwrap_or(machine);
         let old: BTreeMap<String, String> = Lock::read(root)
             .map(|l| {
                 l.packages
@@ -101,6 +111,7 @@ impl NativeBackend {
             .collect();
         let index = self.index();
         let resolution = Resolver::new(&index, floor, self.no_build)
+            .machine(machine)
             .prefer(prefer)
             .upgrade(upgrade, upgrade_all)
             .resolve(&roots)?;
@@ -121,8 +132,26 @@ impl NativeBackend {
     }
 }
 
-/// The Python the project targets: its pin, else the `requires-python` floor,
-/// else the env, else the newest installed.
+/// The lowest Python the project declares (`requires-python = ">=3.10"`):
+/// what a lock must serve, as opposed to what this machine runs.
+fn declared_floor(project: &Project) -> Option<[u32; 3]> {
+    let rp = project.requires_python()?;
+    let v = rp.split(',').find_map(|c| {
+        let c = c.trim();
+        c.strip_prefix(">=")
+            .or_else(|| c.strip_prefix("~="))
+            .or_else(|| c.strip_prefix("=="))
+    })?;
+    let mut it = v
+        .trim()
+        .trim_end_matches(".*")
+        .split('.')
+        .map(|p| p.parse::<u32>().ok());
+    Some([it.next()??, it.next()??, it.next().flatten().unwrap_or(0)])
+}
+
+/// The Python this machine installs with: the env, else the pin, else the
+/// `requires-python` floor, else the newest installed.
 fn python_floor(project: &Project) -> Result<[u32; 3]> {
     let root = project.venv_root();
     if let Ok(v) = env_version(&root.join(".venv")) {
@@ -264,7 +293,13 @@ fn fetch_wheel(
         }
     }
     println!("downloading {name}");
-    upgrade::fetch_to(&artifact.url, &dest)?;
+    // Index credentials go to the index's own host only, never to a CDN.
+    let url = if crate::index::same_origin(&artifact.url, &pkg.source) {
+        crate::backend::with_credentials(&artifact.url)
+    } else {
+        artifact.url.clone()
+    };
+    upgrade::fetch_to(&url, &dest)?;
     let actual = sha256::file(&dest)?;
     if actual != expected {
         let _ = fs::remove_file(&dest);
@@ -426,10 +461,20 @@ impl Backend for NativeBackend {
 
     fn remove(&self, dir: &Path, packages: &[String]) -> Result<()> {
         let project = Project::require(dir)?;
+        // Every name is checked before the manifest changes.
+        let declared: BTreeSet<String> = project
+            .declared_requirements()
+            .iter()
+            .map(|r| project::normalize(project::requirement_name(r)))
+            .collect();
+        if let Some(p) = packages
+            .iter()
+            .find(|p| !declared.contains(&project::normalize(p)))
+        {
+            bail!("{p} is not a declared dependency");
+        }
         for p in packages {
-            if !project::remove_dependency(&project.root, p)? {
-                bail!("{p} is not a declared dependency");
-            }
+            project::remove_dependency(&project.root, p)?;
         }
         let project = Project::require(dir)?;
         self.relock(&project, &[], false, false)?;
@@ -526,11 +571,13 @@ impl Backend for NativeBackend {
             ),
         };
         let backend_path = strings("backend-path");
-        if backend_path
-            .iter()
-            .any(|p| Path::new(p).is_absolute() || p.split(['/', '\\']).any(|c| c == ".."))
-        {
-            bail!("build-system.backend-path must stay inside the project");
+        let canonical_root = fs::canonicalize(&root)?;
+        for p in &backend_path {
+            let full = fs::canonicalize(root.join(p))
+                .with_context(|| format!("build-system.backend-path entry {p:?}"))?;
+            if Path::new(p).is_absolute() || !full.starts_with(&canonical_root) {
+                bail!("build-system.backend-path must stay inside the project ({p:?} does not)");
+            }
         }
 
         let version = python_floor(&project)?;
@@ -546,9 +593,17 @@ impl Backend for NativeBackend {
             }
             let dist = root.join("dist");
             fs::create_dir_all(&dist)?;
+            // Build tools the backend shells out to (ninja, meson, cython)
+            // live in the build env's bin: it goes first on PATH.
+            let mut dirs = vec![build_env.join(venv::BIN)];
+            if let Some(p) = std::env::var_os("PATH") {
+                dirs.extend(std::env::split_paths(&p));
+            }
+            let path = std::env::join_paths(dirs).context("PATH")?;
             let hook = |mode: &str| -> Result<String> {
                 let mut cmd = std::process::Command::new(&py);
                 cmd.current_dir(&root)
+                    .env("PATH", &path)
                     .args(["-c", BUILD_HOOK, mode, &backend])
                     .arg(&dist)
                     .args(&backend_path);
@@ -564,17 +619,20 @@ impl Backend for NativeBackend {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 Ok(stdout.lines().last().unwrap_or_default().trim().to_owned())
             };
-            // Dynamic requirements (setuptools asks for wheel, for instance).
+            // Dynamic requirements (setuptools asks for wheel, for instance),
+            // resolved together with the static ones so pins hold.
             let extra = hook("requires")?;
-            let extra: Vec<String> = extra
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .split(',')
-                .map(|s| s.trim().trim_matches('"').to_owned())
-                .filter(|s| !s.is_empty())
+            let extra: Vec<String> = crate::json::parse(&extra)
+                .context("the build backend's dynamic requirements are not a JSON list")?
+                .as_array()
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
                 .collect();
             if !extra.is_empty() {
-                self.install(&py, &extra)?;
+                let mut all = requires.clone();
+                all.extend(extra);
+                self.install(&py, &all)?;
             }
             for mode in ["sdist", "wheel"] {
                 let name = hook(mode)?;

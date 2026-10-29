@@ -463,7 +463,9 @@ fn main() -> Result<()> {
         Command::Remove { packages } => {
             let project = require(project, &cwd)?;
             venv::ensure(project.venv_root(), &project.name())?;
-            backend.remove(&cwd, &packages)?;
+            transact(&project, &*backend, &cwd, None, || {
+                backend.remove(&cwd, &packages)
+            })?;
             venv::mark_synced(project.venv_root());
         }
         Command::Import { file, python } => {

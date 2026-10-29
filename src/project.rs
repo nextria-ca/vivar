@@ -740,11 +740,79 @@ impl Project {
             .get("dependency-groups")
             .and_then(Item::as_table_like)
         {
-            for (k, item) in t.iter() {
-                groups.insert(k.to_owned(), strings(Some(item)));
+            // PEP 735: a group may include another; expand, guarding cycles.
+            let raw: std::collections::BTreeMap<String, Vec<toml_edit::Value>> = t
+                .iter()
+                .filter_map(|(k, item)| {
+                    item.as_array()
+                        .map(|a| (k.to_owned(), a.iter().cloned().collect()))
+                })
+                .collect();
+            fn expand(
+                name: &str,
+                raw: &std::collections::BTreeMap<String, Vec<toml_edit::Value>>,
+                stack: &mut Vec<String>,
+                out: &mut Vec<String>,
+            ) {
+                if stack.iter().any(|s| s == name) {
+                    return;
+                }
+                stack.push(name.to_owned());
+                for v in raw.get(name).into_iter().flatten() {
+                    if let Some(s) = v.as_str() {
+                        out.push(s.to_owned());
+                    } else if let Some(inc) = v
+                        .as_inline_table()
+                        .and_then(|t| t.get("include-group"))
+                        .and_then(|v| v.as_str())
+                    {
+                        expand(inc, raw, stack, out);
+                    }
+                }
+                stack.pop();
+            }
+            for k in raw.keys() {
+                let mut out = Vec::new();
+                expand(k, &raw, &mut Vec::new(), &mut out);
+                groups.insert(k.clone(), out);
             }
         }
         (deps, extras, groups)
+    }
+
+    /// Whether uv treats the project as an installable package (an editable
+    /// root in the lock): `[build-system]` present or `tool.uv.package = true`,
+    /// unless `tool.uv.package = false`.
+    pub fn is_package(&self) -> bool {
+        let uv = self.doc.get("tool").and_then(|t| t.get("uv"));
+        match uv.and_then(|u| u.get("package")).and_then(Item::as_bool) {
+            Some(b) => b,
+            None => self.doc.get("build-system").is_some(),
+        }
+    }
+
+    /// Project features the native resolver does not honour; it refuses
+    /// rather than silently resolving something else.
+    pub fn uv_only_features(&self) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if self.workspace.is_some() || self.is_workspace_root() {
+            v.push("workspaces");
+        }
+        let uv = self.doc.get("tool").and_then(|t| t.get("uv"));
+        if uv
+            .and_then(|u| u.get("sources"))
+            .and_then(Item::as_table_like)
+            .is_some_and(|t| !t.is_empty())
+        {
+            v.push("per-package sources (tool.uv.sources)");
+        }
+        if uv.and_then(|u| u.get("index")).is_some() {
+            v.push("extra indexes (tool.uv.index)");
+        }
+        if uv.and_then(|u| u.get("conflicts")).is_some() {
+            v.push("conflicting groups (profiles)");
+        }
+        v
     }
 
     /// `[tool.vivar] profiles`: dependency groups that are machine variants.

@@ -239,6 +239,11 @@ lock, universal markers, writes `uv.lock` that `uv lock --check` accepts), `nati
 (`NativeBackend`: sync/add/remove/lock/upgrade/install/export/cross-target layout, and
 `build` as a PEP 517 driver in a throwaway environment).
 `backend_for` picks uv when it is on PATH, native otherwise or with `VIVAR_BACKEND=native`.
+The native resolver keeps one version per package (a graph that needs a fork is reported
+as such), checks artifacts against every environment a dependency applies to, treats a
+wheelhouse `index-url` as the whole index (never PyPI behind it), and refuses projects
+using uv-only features (workspaces, `tool.uv.sources`, extra indexes, profiles) rather
+than resolving them differently.
 Bundle signatures moved from HMAC to Ed25519 (`sha512.rs`, `ed25519.rs`, RFC 8032
 vectors): `key generate` writes `bundle.key` + `bundle.pub`, verifiers trust
 `trusted-keys` in policy, `VIVAR_TRUSTED_KEYS`, or their own keys.

@@ -53,24 +53,45 @@ pub struct Metadata {
 
 pub struct Index {
     base: String,
+    /// A wheelhouse directory instead of a server: the only source, offline.
+    local: Option<std::path::PathBuf>,
     listings: std::cell::RefCell<BTreeMap<String, Vec<File>>>,
 }
 
 impl Index {
-    /// `index_url` from policy when it is an HTTP(S) URL, else PyPI.
+    /// `index_url` from policy: a mirror URL, or a wheelhouse directory that
+    /// is then the only source (never PyPI behind it); PyPI when unset.
     pub fn new(index_url: Option<&str>) -> Index {
-        let base = index_url
-            .filter(|u| u.contains("://"))
-            .map(|u| u.trim_end_matches('/').to_owned())
-            .unwrap_or_else(|| PYPI.to_owned());
-        Index {
-            base,
-            listings: Default::default(),
+        match index_url {
+            Some(u) if u.contains("://") => Index {
+                base: u.trim_end_matches('/').to_owned(),
+                local: None,
+                listings: Default::default(),
+            },
+            Some(dir) => Index {
+                base: dir.to_owned(),
+                local: Some(std::path::PathBuf::from(dir)),
+                listings: Default::default(),
+            },
+            None => Index {
+                base: PYPI.to_owned(),
+                local: None,
+                listings: Default::default(),
+            },
         }
     }
 
     pub fn url(&self) -> &str {
         &self.base
+    }
+
+    /// Credentials for the index go to the index's own host only.
+    fn authed(&self, url: &str) -> String {
+        if same_origin(url, &self.base) {
+            crate::backend::with_credentials(url)
+        } else {
+            url.to_owned()
+        }
     }
 
     /// Every file of `name`, newest listings cached for the process.
@@ -79,17 +100,24 @@ impl Index {
         if let Some(cached) = self.listings.borrow().get(&name) {
             return Ok(cached.clone());
         }
-        let url = crate::backend::with_credentials(&format!("{}/{name}/", self.base));
-        let body = upgrade::fetch(
-            &url,
-            Some("application/vnd.pypi.simple.v1+json, text/html;q=0.1"),
-        )
-        .with_context(|| format!("looking up {name} on {}", self.base))?;
-        let text = String::from_utf8_lossy(&body);
-        let files = if text.trim_start().starts_with('{') {
-            parse_json(&text)?
-        } else {
-            parse_html(&text, &url)
+        let files = match &self.local {
+            Some(dir) => local_files(dir, &name)?,
+            None => {
+                // Links resolve against the page without credentials: what the
+                // lock records must never carry them.
+                let page = format!("{}/{name}/", self.base);
+                let body = upgrade::fetch(
+                    &self.authed(&page),
+                    Some("application/vnd.pypi.simple.v1+json, text/html;q=0.1"),
+                )
+                .with_context(|| format!("looking up {name} on {}", self.base))?;
+                let text = String::from_utf8_lossy(&body);
+                if text.trim_start().starts_with('{') {
+                    parse_json(&text, &page)?
+                } else {
+                    parse_html(&text, &page)
+                }
+            }
         };
         self.listings.borrow_mut().insert(name, files.clone());
         Ok(files)
@@ -111,11 +139,17 @@ impl Index {
         let text = if let Ok(t) = fs::read_to_string(&cached) {
             t
         } else {
-            let text = if file.has_metadata {
-                String::from_utf8_lossy(&upgrade::fetch(&format!("{}.metadata", file.url), None)?)
-                    .into_owned()
+            let text = if let Some(path) = local_path(&file.url) {
+                metadata_from_wheel(&fs::read(&path)?)
+                    .with_context(|| format!("reading METADATA from {}", path.display()))?
+            } else if file.has_metadata {
+                String::from_utf8_lossy(&upgrade::fetch(
+                    &self.authed(&format!("{}.metadata", file.url)),
+                    None,
+                )?)
+                .into_owned()
             } else {
-                let data = upgrade::fetch(&file.url, None).with_context(|| {
+                let data = upgrade::fetch(&self.authed(&file.url), None).with_context(|| {
                     format!("downloading {} to read its metadata", file.filename)
                 })?;
                 if let Some(h) = &file.sha256 {
@@ -138,7 +172,71 @@ impl Index {
     }
 }
 
-fn parse_json(text: &str) -> Result<Vec<File>> {
+/// Whether two URLs share scheme and host (and port).
+pub fn same_origin(a: &str, b: &str) -> bool {
+    fn origin(u: &str) -> Option<String> {
+        let (scheme, rest) = u.split_once("://")?;
+        let host = rest.split('/').next()?;
+        let host = host.rsplit('@').next()?; // never compare userinfo
+        Some(format!(
+            "{}://{}",
+            scheme.to_lowercase(),
+            host.to_lowercase()
+        ))
+    }
+    matches!((origin(a), origin(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// A `file://` URL for a wheelhouse member, and back.
+fn file_url(path: &std::path::Path) -> String {
+    let p = path.display().to_string().replace('\\', "/");
+    format!("file:///{}", p.trim_start_matches('/'))
+}
+
+pub fn local_path(url: &str) -> Option<std::path::PathBuf> {
+    let rest = url.strip_prefix("file:///")?;
+    if cfg!(windows) {
+        Some(std::path::PathBuf::from(rest.replace('/', "\\")))
+    } else {
+        Some(std::path::PathBuf::from(format!("/{rest}")))
+    }
+}
+
+/// The wheelhouse's files for `name`, hashed so the lock can pin them.
+fn local_files(dir: &std::path::Path, name: &str) -> Result<Vec<File>> {
+    let mut out = Vec::new();
+    for entry in
+        fs::read_dir(dir).with_context(|| format!("reading wheelhouse {}", dir.display()))?
+    {
+        let entry = entry?;
+        let filename = entry.file_name().to_string_lossy().into_owned();
+        if !(filename.ends_with(".whl")
+            || filename.ends_with(".tar.gz")
+            || filename.ends_with(".zip"))
+        {
+            continue;
+        }
+        let probe = File {
+            filename: filename.clone(),
+            url: String::new(),
+            sha256: None,
+            requires_python: None,
+            yanked: false,
+            has_metadata: false,
+        };
+        if probe.version(name).is_none() {
+            continue;
+        }
+        out.push(File {
+            url: file_url(&entry.path()),
+            sha256: Some(sha256::file(&entry.path())?),
+            ..probe
+        });
+    }
+    Ok(out)
+}
+
+fn parse_json(text: &str, page_url: &str) -> Result<Vec<File>> {
     let doc = json::parse(text)?;
     let files = doc
         .get("files")
@@ -148,7 +246,7 @@ fn parse_json(text: &str) -> Result<Vec<File>> {
         .iter()
         .filter_map(|f| {
             let filename = f.get("filename")?.as_str()?.to_owned();
-            let url = f.get("url")?.as_str()?.to_owned();
+            let url = absolute(page_url, f.get("url")?.as_str()?);
             let sha256 = f
                 .get("hashes")
                 .and_then(|h| h.get("sha256"))
@@ -199,11 +297,7 @@ fn parse_html(text: &str, page_url: &str) -> Vec<File> {
         };
         let Some(href) = attr("href") else { continue };
         let (url, fragment) = href.split_once('#').unwrap_or((&href, ""));
-        let url = if url.contains("://") {
-            url.to_owned()
-        } else {
-            join_url(page_url, url)
-        };
+        let url = absolute(page_url, url);
         out.push(File {
             filename,
             url,
@@ -223,6 +317,14 @@ fn html_unescape(s: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&amp;", "&")
+}
+
+fn absolute(page: &str, url: &str) -> String {
+    if url.contains("://") {
+        url.to_owned()
+    } else {
+        join_url(page, url)
+    }
 }
 
 fn join_url(page: &str, rel: &str) -> String {
@@ -305,9 +407,22 @@ mod tests {
 
     #[test]
     fn parses_json_and_html_listings() {
-        let json = r#"{"files":[{"filename":"six-1.17.0-py2.py3-none-any.whl","url":"https://files/six.whl","hashes":{"sha256":"abc"},"requires-python":">=2.7","yanked":false,"core-metadata":{"sha256":"d"}},{"filename":"six-1.17.0.tar.gz","url":"https://files/six.tar.gz","hashes":{},"yanked":"broken"}]}"#;
-        let files = parse_json(json).unwrap();
+        let json = r#"{"files":[{"filename":"six-1.17.0-py2.py3-none-any.whl","url":"https://files/six.whl","hashes":{"sha256":"abc"},"requires-python":">=2.7","yanked":false,"core-metadata":{"sha256":"d"}},{"filename":"six-1.17.0.tar.gz","url":"../../packages/six.tar.gz","hashes":{},"yanked":"broken"}]}"#;
+        let files = parse_json(json, "https://mirror.example/simple/six/").unwrap();
         assert_eq!(files.len(), 2);
+        assert_eq!(files[1].url, "https://mirror.example/packages/six.tar.gz");
+        assert!(same_origin(
+            "https://User:pw@Mirror.example/simple/",
+            "https://mirror.example/packages/x.whl"
+        ));
+        assert!(!same_origin(
+            "https://mirror.example/simple/",
+            "https://files.pythonhosted.org/x.whl"
+        ));
+        assert!(!same_origin(
+            "https://mirror.example/",
+            "http://mirror.example/"
+        ));
         assert!(files[0].is_wheel() && files[0].has_metadata && !files[0].yanked);
         assert_eq!(files[0].sha256.as_deref(), Some("abc"));
         assert_eq!(files[0].version("Six").unwrap().to_string(), "1.17.0");
@@ -326,6 +441,29 @@ mod tests {
             "https://mirror.example/packages/six-1.17.0-py2.py3-none-any.whl"
         );
         assert!(files[1].has_metadata && files[1].yanked);
+    }
+
+    #[test]
+    fn a_wheelhouse_directory_is_the_whole_index() {
+        let dir = std::env::temp_dir().join(format!("vivar-wh-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("six-1.17.0-py2.py3-none-any.whl"), b"not really").unwrap();
+        fs::write(dir.join("Six-1.16.0.tar.gz"), b"src").unwrap();
+        fs::write(dir.join("other-1.0-py3-none-any.whl"), b"x").unwrap();
+        fs::write(dir.join("notes.txt"), b"x").unwrap();
+        let index = Index::new(Some(dir.to_str().unwrap()));
+        let files = index.files("six").unwrap();
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert!(files
+            .iter()
+            .all(|f| f.sha256.is_some() && f.url.starts_with("file:///")));
+        assert_eq!(
+            local_path(&files[0].url).unwrap(),
+            dir.join(&files[0].filename)
+        );
+        assert!(index.files("missing").unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

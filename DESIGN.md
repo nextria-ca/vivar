@@ -243,9 +243,11 @@ The native resolver keeps one version per package (a graph that needs a fork is 
 as such), works per Python minor within the project's `requires-python` (a marker that
 would split a minor at a patch level is reported, not guessed), checks artifacts against
 every environment a dependency applies to, treats a
-wheelhouse `index-url` as the whole index (never PyPI behind it), and refuses projects
-using uv-only features (workspaces, `tool.uv.sources`, extra indexes, profiles) rather
-than resolving them differently.
+wheelhouse `index-url` as the whole index (never PyPI behind it), honours
+`[[tool.uv.index]]` and `[tool.uv.sources]` (a package routed to an index, per group when
+asked), and resolves profiles (`tool.uv.conflicts` over groups) as a base plus one
+resolution per group merged into a lock whose variants are told apart by pinned edges.
+Workspaces are still refused rather than resolved differently.
 Bundle signatures moved from HMAC to Ed25519 (`sha512.rs`, `ed25519.rs`, RFC 8032
 vectors): `key generate` writes `bundle.key` + `bundle.pub`, verifiers trust
 `trusted-keys` in policy, `VIVAR_TRUSTED_KEYS`, or their own keys.

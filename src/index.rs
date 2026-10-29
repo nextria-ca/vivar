@@ -63,6 +63,16 @@ impl Index {
     /// is then the only source (never PyPI behind it); PyPI when unset.
     pub fn new(index_url: Option<&str>) -> Index {
         match index_url {
+            Some(u) if u.starts_with("file://") => {
+                let dir = local_path(u)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| u.trim_start_matches("file://").to_owned());
+                Index {
+                    base: dir.clone(),
+                    local: Some(std::path::PathBuf::from(dir)),
+                    listings: Default::default(),
+                }
+            }
             Some(u) if u.contains("://") => Index {
                 base: u.trim_end_matches('/').to_owned(),
                 local: None,

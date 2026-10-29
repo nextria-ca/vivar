@@ -34,12 +34,16 @@ pub struct ResolvedPackage {
     /// Dependencies with the markers they carry, as they go into the lock.
     pub dependencies: Vec<Requirement>,
     pub source: Source,
+    /// The version each dependency resolved to alongside this package, so a
+    /// lock holding several variants of a name can pin the edge.
+    pub resolved: BTreeMap<String, Version>,
 }
 
 /// Where a resolved package comes from: the lock's `source` table.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Source {
-    Registry,
+    /// A package index, by URL (or a wheelhouse directory).
+    Registry(String),
     /// A wheel or source distribution at a URL (`name @ https://…`).
     Url(String),
     /// A git checkout (`name @ git+https://…@rev`), pinned to a commit.
@@ -69,10 +73,79 @@ pub trait Fetch {
 
 pub struct Resolution {
     pub packages: Vec<ResolvedPackage>,
+    /// Every assigned version, by name.
+    pub assigned: BTreeMap<String, Version>,
+}
+
+/// What goes into a lock: one resolution, or a base plus one per profile
+/// (conflicting dependency groups) merged, where a name may have several
+/// variants and the edges into it are pinned.
+pub struct Lockable {
+    pub packages: Vec<ResolvedPackage>,
+    /// Pins for the root's edges: `None` for its dependencies and extras,
+    /// `Some(group)` for a dependency group resolved on its own.
+    pub root_pins: BTreeMap<Option<String>, BTreeMap<String, Version>>,
+}
+
+impl Lockable {
+    pub fn single(r: Resolution) -> Lockable {
+        Lockable {
+            packages: r.packages,
+            root_pins: BTreeMap::from([(None, r.assigned)]),
+        }
+    }
+
+    /// Merges a base resolution with the resolutions of conflicting groups.
+    /// Packages identical in name, version and source collapse into one.
+    pub fn merge(base: Resolution, profiles: Vec<(String, Resolution)>) -> Lockable {
+        let mut packages: Vec<ResolvedPackage> = Vec::new();
+        let mut root_pins = BTreeMap::new();
+        root_pins.insert(None, base.assigned);
+        let mut add = |rs: Vec<ResolvedPackage>| {
+            for p in rs {
+                if let Some(existing) = packages
+                    .iter_mut()
+                    .find(|q| q.name == p.name && q.version == p.version && q.source == p.source)
+                {
+                    // The same release seen from another profile: keep every
+                    // edge and pin it saw.
+                    for d in p.dependencies {
+                        if !existing.dependencies.iter().any(|e| {
+                            e.name == d.name && e.extras == d.extras && e.marker == d.marker
+                        }) {
+                            existing.dependencies.push(d);
+                        }
+                    }
+                    existing.resolved.extend(p.resolved);
+                } else {
+                    packages.push(p);
+                }
+            }
+        };
+        add(base.packages);
+        for (group, r) in profiles {
+            root_pins.insert(Some(group), r.assigned);
+            add(r.packages);
+        }
+        packages.sort_by(|a, b| (&a.name, &a.version).cmp(&(&b.name, &b.version)));
+        Lockable {
+            packages,
+            root_pins,
+        }
+    }
+
+    fn variants(&self, name: &str) -> usize {
+        self.packages.iter().filter(|p| p.name == name).count()
+    }
 }
 
 pub struct Resolver<'a> {
     index: &'a Index,
+    /// Packages routed to another index (`[tool.uv.sources]`).
+    routes: Vec<(String, Index)>,
+    /// Indexes searched before the main one for everything else
+    /// (`[[tool.uv.index]]` without `explicit`), first match wins.
+    defaults: Vec<Index>,
     /// Environments a marker may hold on; entry 0 is this machine.
     envs: Vec<(MarkerEnv, Target)>,
     /// The Python of each environment, for `requires-python` checks.
@@ -137,6 +210,8 @@ impl<'a> Resolver<'a> {
     pub fn new(index: &'a Index, python_floor: [u32; 3], wheels_only: bool) -> Resolver<'a> {
         let mut r = Resolver {
             index,
+            routes: Vec::new(),
+            defaults: Vec::new(),
             envs: Vec::new(),
             pythons: Vec::new(),
             patch_bounds: Vec::new(),
@@ -162,6 +237,30 @@ impl<'a> Resolver<'a> {
     pub fn fetch(mut self, fetch: &'a dyn Fetch) -> Self {
         self.fetch = Some(fetch);
         self
+    }
+
+    /// Routes packages to indexes of their own.
+    pub fn routes(mut self, routes: Vec<(String, Index)>) -> Self {
+        self.routes = routes;
+        self
+    }
+
+    /// Indexes to search before the main one, in order.
+    pub fn defaults(mut self, defaults: Vec<Index>) -> Self {
+        self.defaults = defaults;
+        self
+    }
+
+    /// The index `name` comes from: its route, else the first default index
+    /// that lists it, else the main one.
+    fn index_of(&self, name: &str) -> &Index {
+        if let Some((_, i)) = self.routes.iter().find(|(n, _)| n == name) {
+            return i;
+        }
+        self.defaults
+            .iter()
+            .find(|i| i.files(name).map(|f| !f.is_empty()).unwrap_or(false))
+            .unwrap_or(self.index)
     }
 
     fn set_envs(&mut self, floor: [u32; 3], machine: [u32; 3]) {
@@ -398,7 +497,7 @@ impl<'a> Resolver<'a> {
                 Vec::new()
             });
         }
-        let files = self.index.files(name)?;
+        let files = self.index_of(name).files(name)?;
         let mut by_version: BTreeMap<Version, Vec<&File>> = BTreeMap::new();
         for f in &files {
             if let Some(v) = f.version(name) {
@@ -468,7 +567,7 @@ impl<'a> Resolver<'a> {
         if let Some(d) = self.directs.get(name) {
             return Ok(d.metadata.clone());
         }
-        let files = self.index.files(name)?;
+        let files = self.index_of(name).files(name)?;
         let wheels: Vec<&File> = files
             .iter()
             .filter(|f| f.is_wheel() && f.version(name).as_ref() == Some(version))
@@ -480,7 +579,7 @@ impl<'a> Resolver<'a> {
             .or(wheels.first())
             .copied();
         let m = match file {
-            Some(file) => self.index.metadata(file)?,
+            Some(file) => self.index_of(name).metadata(file)?,
             None => {
                 // No wheel at all: build the source distribution once and read
                 // its metadata, unless builds are ruled out.
@@ -661,7 +760,7 @@ impl<'a> Resolver<'a> {
                             .collect::<Vec<_>>()
                             .join(" and "),
                         self.wheels_only,
-                        self.index.url()
+                        self.index_of(&req.name).url()
                     );
                 }
                 state = self.backtrack(&mut frames, &req.name)?;
@@ -688,7 +787,7 @@ impl<'a> Resolver<'a> {
             let files: Vec<File> = if self.directs.contains_key(name) {
                 Vec::new()
             } else {
-                self.index
+                self.index_of(name)
                     .files(name)?
                     .into_iter()
                     .filter(|f| {
@@ -707,18 +806,33 @@ impl<'a> Resolver<'a> {
             }
             let (files, source) = match self.directs.get(name) {
                 Some(d) => (d.files.clone(), d.source.clone()),
-                None => (files, Source::Registry),
+                None => (
+                    files,
+                    Source::Registry(self.index_of(name).url().to_owned()),
+                ),
             };
+            let resolved = dependencies
+                .iter()
+                .filter_map(|d| {
+                    state
+                        .assigned
+                        .iter()
+                        .find(|(n, _)| *n == d.name)
+                        .map(|(n, v)| (n.clone(), v.clone()))
+                })
+                .collect();
             packages.push(ResolvedPackage {
                 name: name.clone(),
                 version: version.clone(),
                 files,
                 dependencies,
                 source,
+                resolved,
             });
         }
         packages.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(Resolution { packages })
+        let assigned = state.assigned.iter().cloned().collect();
+        Ok(Resolution { packages, assigned })
     }
 
     /// Two constraints that never apply on the same environment: the
@@ -914,43 +1028,47 @@ pub fn split_extra(marker: &str) -> (Option<String>, Option<String>) {
 }
 
 /// Serialises a resolution as a uv.lock document (version 1).
-pub fn write_lock(roots: &Roots, resolution: &Resolution, registry: &str) -> String {
+pub fn write_lock(roots: &Roots, lock: &Lockable) -> String {
     use toml_edit::{value, Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table};
     // Root requirements that apply in no targeted environment were not
     // resolved; the graph leaves them out while the metadata keeps them.
-    let resolved: BTreeSet<&str> = resolution
-        .packages
-        .iter()
-        .map(|p| p.name.as_str())
-        .collect();
+    let resolved: BTreeSet<&str> = lock.packages.iter().map(|p| p.name.as_str()).collect();
     let mut doc = DocumentMut::new();
     doc["version"] = value(1);
     doc["revision"] = value(3);
     if let Some(rp) = &roots.requires_python {
         doc["requires-python"] = value(rp.as_str());
     }
-    let dep_entry = |r: &Requirement, marker: Option<&str>| {
-        let mut t = InlineTable::new();
-        t.insert("name", r.name.as_str().into());
-        if !r.extras.is_empty() {
-            let mut a = Array::new();
-            for e in &r.extras {
-                a.push(e.as_str());
+    // An edge into a name with several variants says which one.
+    let dep_entry =
+        |r: &Requirement, marker: Option<&str>, pins: Option<&BTreeMap<String, Version>>| {
+            let mut t = InlineTable::new();
+            t.insert("name", r.name.as_str().into());
+            if lock.variants(&r.name) > 1 {
+                if let Some(v) = pins.and_then(|p| p.get(&r.name)) {
+                    t.insert("version", v.to_string().into());
+                }
             }
-            t.insert("extra", a.into());
-        }
-        if let Some(m) = marker {
-            t.insert("marker", m.into());
-        }
-        t
-    };
-    let dep_array = |reqs: &[Requirement]| {
+            if !r.extras.is_empty() {
+                let mut a = Array::new();
+                for e in &r.extras {
+                    a.push(e.as_str());
+                }
+                t.insert("extra", a.into());
+            }
+            if let Some(m) = marker {
+                t.insert("marker", m.into());
+            }
+            t
+        };
+    let dep_array = |reqs: &[Requirement], pins: Option<&BTreeMap<String, Version>>| {
         let mut a = Array::new();
         for r in reqs.iter().filter(|r| resolved.contains(r.name.as_str())) {
-            a.push(dep_entry(r, r.marker.as_deref()));
+            a.push(dep_entry(r, r.marker.as_deref(), pins));
         }
         a
     };
+    let base_pins = lock.root_pins.get(&None);
     let spec_entry = |r: &Requirement, extra: Option<&str>| {
         let mut t = InlineTable::new();
         t.insert("name", r.name.as_str().into());
@@ -1005,19 +1123,20 @@ pub fn write_lock(roots: &Roots, resolution: &Resolution, registry: &str) -> Str
     );
     root["source"] = value(src);
     if !roots.dependencies.is_empty() {
-        root["dependencies"] = value(dep_array(&roots.dependencies));
+        root["dependencies"] = value(dep_array(&roots.dependencies, base_pins));
     }
     if !roots.extras.is_empty() {
         let mut t = Table::new();
         for (k, v) in &roots.extras {
-            t[k.as_str()] = value(dep_array(v));
+            t[k.as_str()] = value(dep_array(v, base_pins));
         }
         root["optional-dependencies"] = Item::Table(t);
     }
     if !roots.groups.is_empty() {
         let mut t = Table::new();
         for (k, v) in &roots.groups {
-            t[k.as_str()] = value(dep_array(v));
+            let pins = lock.root_pins.get(&Some(k.clone())).or(base_pins);
+            t[k.as_str()] = value(dep_array(v, pins));
         }
         root["dev-dependencies"] = Item::Table(t);
     }
@@ -1046,13 +1165,13 @@ pub fn write_lock(roots: &Roots, resolution: &Resolution, registry: &str) -> Str
     root["metadata"] = Item::Table(meta);
     packages.push(root);
 
-    for p in &resolution.packages {
+    for p in &lock.packages {
         let mut t = Table::new();
         t["name"] = value(p.name.as_str());
         t["version"] = value(p.version.to_string());
         let mut src = InlineTable::new();
         match &p.source {
-            Source::Registry => src.insert("registry", registry.into()),
+            Source::Registry(url) => src.insert("registry", url.as_str().into()),
             Source::Url(u) => src.insert("url", u.as_str().into()),
             Source::Git { url, rev, commit } => src.insert(
                 "git",
@@ -1070,11 +1189,12 @@ pub fn write_lock(roots: &Roots, resolution: &Resolution, registry: &str) -> Str
         let mut by_extra: BTreeMap<String, Array> = BTreeMap::new();
         for d in &p.dependencies {
             match d.marker.as_deref().map(split_extra) {
-                Some((Some(extra), rest)) => by_extra
-                    .entry(extra)
-                    .or_default()
-                    .push(dep_entry(d, rest.as_deref())),
-                _ => plain.push(dep_entry(d, d.marker.as_deref())),
+                Some((Some(extra), rest)) => by_extra.entry(extra).or_default().push(dep_entry(
+                    d,
+                    rest.as_deref(),
+                    Some(&p.resolved),
+                )),
+                _ => plain.push(dep_entry(d, d.marker.as_deref(), Some(&p.resolved))),
             }
         }
         if !plain.is_empty() {
@@ -1249,6 +1369,116 @@ mod tests {
     }
 
     #[test]
+    fn merged_profiles_pin_edges_into_variants() {
+        let pkg =
+            |name: &str, version: &str, deps: &[&str], resolved: &[(&str, &str)]| ResolvedPackage {
+                name: name.into(),
+                version: Version::parse(version).unwrap(),
+                files: vec![],
+                dependencies: deps
+                    .iter()
+                    .map(|d| Requirement::parse(d).unwrap())
+                    .collect(),
+                source: Source::Registry("https://pypi.org/simple".into()),
+                resolved: resolved
+                    .iter()
+                    .map(|(n, v)| (n.to_string(), Version::parse(v).unwrap()))
+                    .collect(),
+            };
+        let assigned = |pairs: &[(&str, &str)]| -> BTreeMap<String, Version> {
+            pairs
+                .iter()
+                .map(|(n, v)| (n.to_string(), Version::parse(v).unwrap()))
+                .collect()
+        };
+        let base = Resolution {
+            packages: vec![pkg("numpy", "2.0", &[], &[])],
+            assigned: assigned(&[("numpy", "2.0")]),
+        };
+        let cpu = Resolution {
+            packages: vec![
+                pkg("numpy", "2.0", &[], &[]),
+                pkg("torch", "2.5.0+cpu", &["numpy"], &[("numpy", "2.0")]),
+            ],
+            assigned: assigned(&[("numpy", "2.0"), ("torch", "2.5.0+cpu")]),
+        };
+        let cu = Resolution {
+            packages: vec![
+                pkg("numpy", "2.0", &[], &[]),
+                pkg(
+                    "torch",
+                    "2.5.0+cu124",
+                    &["numpy", "nvidia-cublas"],
+                    &[("numpy", "2.0"), ("nvidia-cublas", "12.4")],
+                ),
+                pkg("nvidia-cublas", "12.4", &[], &[]),
+            ],
+            assigned: assigned(&[
+                ("numpy", "2.0"),
+                ("torch", "2.5.0+cu124"),
+                ("nvidia-cublas", "12.4"),
+            ]),
+        };
+        let lock = Lockable::merge(base, vec![("cpu".into(), cpu), ("cu124".into(), cu)]);
+        assert_eq!(
+            lock.packages.iter().filter(|p| p.name == "torch").count(),
+            2
+        );
+        assert_eq!(
+            lock.packages.iter().filter(|p| p.name == "numpy").count(),
+            1
+        );
+        let roots = Roots {
+            name: "app".into(),
+            version: "0.1.0".into(),
+            dependencies: vec![Requirement::parse("numpy").unwrap()],
+            groups: BTreeMap::from([
+                ("cpu".to_owned(), vec![Requirement::parse("torch").unwrap()]),
+                (
+                    "cu124".to_owned(),
+                    vec![Requirement::parse("torch").unwrap()],
+                ),
+            ]),
+            ..Default::default()
+        };
+        let text = write_lock(&roots, &lock);
+        assert!(
+            text.contains("cpu = [{ name = \"torch\", version = \"2.5.0+cpu\" }]"),
+            "{text}"
+        );
+        assert!(
+            text.contains("cu124 = [{ name = \"torch\", version = \"2.5.0+cu124\" }]"),
+            "{text}"
+        );
+        assert!(
+            text.contains("dependencies = [{ name = \"numpy\" }]"),
+            "{text}"
+        );
+        let parsed = crate::lock::Lock::parse(&text).unwrap();
+        let cpu_env = MarkerEnv::current([3, 12, 0]);
+        let names = |groups: &[&str]| -> Vec<String> {
+            crate::native::plan(&parsed, &cpu_env, groups)
+                .unwrap()
+                .iter()
+                .map(|p| format!("{} {}", p.name, p.version))
+                .collect()
+        };
+        assert_eq!(
+            names(&["cpu"]),
+            vec!["app 0.1.0", "numpy 2.0", "torch 2.5.0+cpu"]
+        );
+        assert_eq!(
+            names(&["cu124"]),
+            vec![
+                "app 0.1.0",
+                "numpy 2.0",
+                "nvidia-cublas 12.4",
+                "torch 2.5.0+cu124"
+            ]
+        );
+    }
+
+    #[test]
     fn lock_puts_extra_edges_under_the_extra() {
         let roots = Roots {
             name: "app".into(),
@@ -1270,7 +1500,8 @@ mod tests {
                 Requirement::parse("urllib3<3").unwrap(),
                 Requirement::parse("PySocks>=1.5.6; extra == 'socks'").unwrap(),
             ],
-            source: Source::Registry,
+            source: Source::Registry("https://pypi.org/simple".into()),
+            resolved: BTreeMap::new(),
         };
         let direct = ResolvedPackage {
             name: "minipkg".into(),
@@ -1282,6 +1513,7 @@ mod tests {
                 rev: Some("main".into()),
                 commit: "abc123".into(),
             },
+            resolved: BTreeMap::new(),
         };
         assert_eq!(
             git_parts("git+https://example.com/minipkg.git@main#subdirectory=x"),
@@ -1296,10 +1528,10 @@ mod tests {
         );
         let text = write_lock(
             &roots,
-            &Resolution {
+            &Lockable::single(Resolution {
                 packages: vec![direct],
-            },
-            "https://pypi.org/simple",
+                assigned: BTreeMap::new(),
+            }),
         );
         assert!(
             text.contains("source = { git = \"https://example.com/minipkg.git?rev=main#abc123\" }"),
@@ -1307,10 +1539,10 @@ mod tests {
         );
         let text = write_lock(
             &roots,
-            &Resolution {
+            &Lockable::single(Resolution {
                 packages: vec![pkg],
-            },
-            "https://pypi.org/simple",
+                assigned: BTreeMap::new(),
+            }),
         );
         assert!(text.contains("source = { editable = \".\" }"), "{text}");
         // pytest was never resolved (its marker ruled it out): the graph skips

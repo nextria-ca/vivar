@@ -2694,6 +2694,79 @@ fn native_backend_syncs_from_the_lock_without_uv() {
     assert!(!native(dir, &["run", "python", "-c", "import minipkg"])
         .status
         .success());
+    // Profiles resolve natively: two conflicting groups route one package to
+    // a wheelhouse index (a file:// URL) at different versions, the lock holds
+    // both variants with pinned edges, and sync --profile switches between them.
+    let wh = tmp.0.join("wh");
+    fs::create_dir_all(&wh).unwrap();
+    for (version, value) in [("1.0", 42), ("2.0", 43)] {
+        let whl = wh.join(format!("variant-{version}-py3-none-any.whl"));
+        let script = format!(
+            "import zipfile\n\
+             with zipfile.ZipFile({:?}, 'w') as z:\n\
+             \x20   z.writestr('variant/__init__.py', 'VALUE = {value}\\n')\n\
+             \x20   z.writestr('variant-{version}.dist-info/METADATA', 'Metadata-Version: 2.1\\nName: variant\\nVersion: {version}\\n')\n\
+             \x20   z.writestr('variant-{version}.dist-info/WHEEL', 'Wheel-Version: 1.0\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n')\n\
+             \x20   z.writestr('variant-{version}.dist-info/RECORD', '')\n",
+            whl.to_str().unwrap()
+        );
+        ok(dir, &["run", "python", "-c", &script]);
+    }
+    let pyproject = dir.join("pyproject.toml");
+    let text = read(&pyproject)
+        + &format!(
+            "\n[dependency-groups]\nslow = [\"variant==1.0\"]\nfast = [\"variant==2.0\"]\n\n[[tool.uv.index]]\nname = \"wh\"\nurl = \"{}\"\nexplicit = true\n\n[tool.uv.sources]\nvariant = [{{ index = \"wh\", group = \"slow\" }}, {{ index = \"wh\", group = \"fast\" }}]\n\n[tool.uv]\nconflicts = [[{{ group = \"slow\" }}, {{ group = \"fast\" }}]]\n\n[tool.vivar]\nprofiles = [\"slow\", \"fast\"]\n",
+            file_url(&wh)
+        );
+    fs::write(&pyproject, text).unwrap();
+    okn(dir, &["lock"]);
+    let lock = read(&dir.join("uv.lock"));
+    assert_eq!(
+        lock.matches("[[package]]\nname = \"variant\"").count(),
+        2,
+        "{lock}"
+    );
+    assert!(
+        lock.contains("source = { registry = \"") && lock.contains("variant-2.0-py3-none-any.whl"),
+        "{lock}"
+    );
+    assert!(
+        lock.contains("slow = [{ name = \"variant\", version = \"1.0\" }]"),
+        "{lock}"
+    );
+    assert!(
+        lock.contains("fast = [{ name = \"variant\", version = \"2.0\" }]"),
+        "{lock}"
+    );
+    okn(dir, &["sync", "--profile", "slow"]);
+    okn(
+        dir,
+        &[
+            "run",
+            "python",
+            "-c",
+            "import variant; assert variant.VALUE == 42",
+        ],
+    );
+    okn(dir, &["sync", "--profile", "fast"]);
+    okn(
+        dir,
+        &[
+            "run",
+            "python",
+            "-c",
+            "import variant; assert variant.VALUE == 43",
+        ],
+    );
+    // Back to a plain project for the steps below.
+    let text = read(&pyproject);
+    let cut = text.find("\n[dependency-groups]\nslow").unwrap();
+    fs::write(&pyproject, &text[..cut]).unwrap();
+    okn(dir, &["lock"]);
+    okn(dir, &["sync"]);
+    assert!(!native(dir, &["run", "python", "-c", "import variant"])
+        .status
+        .success());
     // Building is native too: hatchling comes from the index into a throwaway env.
     let path = dir.join("pyproject.toml");
     let text = read(&path)

@@ -852,20 +852,120 @@ impl Project {
             v.push("workspaces");
         }
         let uv = self.doc.get("tool").and_then(|t| t.get("uv"));
-        if uv
+        // Sources are supported when they name an index; git/path/url
+        // sources and conflicts over extras are uv's alone.
+        if let Some(t) = uv
             .and_then(|u| u.get("sources"))
             .and_then(Item::as_table_like)
-            .is_some_and(|t| !t.is_empty())
         {
-            v.push("per-package sources (tool.uv.sources)");
+            let entries = t.iter().flat_map(|(_, item)| match item.as_array() {
+                Some(a) => a.iter().cloned().collect::<Vec<_>>(),
+                None => item.as_value().cloned().into_iter().collect(),
+            });
+            if entries.into_iter().any(|e| {
+                e.as_inline_table()
+                    .is_none_or(|t| t.get("index").and_then(|i| i.as_str()).is_none())
+            }) {
+                v.push("sources other than an index (tool.uv.sources with git/path/url)");
+            }
         }
-        if uv.and_then(|u| u.get("index")).is_some() {
-            v.push("extra indexes (tool.uv.index)");
-        }
-        if uv.and_then(|u| u.get("conflicts")).is_some() {
-            v.push("conflicting groups (profiles)");
+        if let Some(a) = uv.and_then(|u| u.get("conflicts")).and_then(Item::as_array) {
+            if a.iter().any(|set| {
+                set.as_array().is_some_and(|s| {
+                    s.iter().any(|m| {
+                        m.as_inline_table()
+                            .is_none_or(|t| t.get("group").and_then(|g| g.as_str()).is_none())
+                    })
+                })
+            }) {
+                v.push("conflicts over extras (tool.uv.conflicts)");
+            }
         }
         v
+    }
+
+    /// `[[tool.uv.index]]` entries: `(name, url, explicit)`.
+    pub fn uv_indexes(&self) -> Vec<(String, String, bool)> {
+        self.doc
+            .get("tool")
+            .and_then(|t| t.get("uv"))
+            .and_then(|u| u.get("index"))
+            .and_then(Item::as_array_of_tables)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| {
+                        Some((
+                            t.get("name").and_then(Item::as_str)?.to_owned(),
+                            t.get("url").and_then(Item::as_str)?.to_owned(),
+                            t.get("explicit").and_then(Item::as_bool).unwrap_or(false),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `[tool.uv.sources]` entries that name an index: normalized package →
+    /// `(index name, group)` list.
+    pub fn uv_sources(&self) -> std::collections::BTreeMap<String, Vec<(String, Option<String>)>> {
+        let mut out = std::collections::BTreeMap::new();
+        let Some(t) = self
+            .doc
+            .get("tool")
+            .and_then(|t| t.get("uv"))
+            .and_then(|u| u.get("sources"))
+            .and_then(Item::as_table_like)
+        else {
+            return out;
+        };
+        for (pkg, item) in t.iter() {
+            let values: Vec<toml_edit::Value> = match item.as_array() {
+                Some(a) => a.iter().cloned().collect(),
+                None => item.as_value().cloned().into_iter().collect(),
+            };
+            let entries: Vec<(String, Option<String>)> = values
+                .iter()
+                .filter_map(|v| {
+                    let t = v.as_inline_table()?;
+                    Some((
+                        t.get("index")?.as_str()?.to_owned(),
+                        t.get("group").and_then(|g| g.as_str()).map(str::to_owned),
+                    ))
+                })
+                .collect();
+            if !entries.is_empty() {
+                out.insert(normalize(pkg), entries);
+            }
+        }
+        out
+    }
+
+    /// `[tool.uv.conflicts]` sets made of groups: each set's groups exclude
+    /// each other (profiles).
+    pub fn conflict_groups(&self) -> Vec<Vec<String>> {
+        self.doc
+            .get("tool")
+            .and_then(|t| t.get("uv"))
+            .and_then(|u| u.get("conflicts"))
+            .and_then(Item::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|set| {
+                        let groups: Vec<String> = set
+                            .as_array()?
+                            .iter()
+                            .filter_map(|m| {
+                                m.as_inline_table()?
+                                    .get("group")?
+                                    .as_str()
+                                    .map(str::to_owned)
+                            })
+                            .collect();
+                        (!groups.is_empty()).then_some(groups)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// `[tool.vivar] profiles`: dependency groups that are machine variants.

@@ -10,7 +10,9 @@ use crate::index::{File, Metadata};
 use crate::lock::{Lock, Package};
 use crate::pep::{eval_marker, MarkerEnv, Requirement, Version};
 use crate::project::{self, Policy, Project};
-use crate::resolve::{write_lock, Direct, Fetch, Resolver, Roots, Source as ResolvedSource};
+use crate::resolve::{
+    write_lock, Direct, Fetch, Lockable, Resolution, Resolver, Roots, Source as ResolvedSource,
+};
 use crate::{dirs, install, sha256, upgrade, venv, wheelhouse};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -115,24 +117,88 @@ impl NativeBackend {
             backend: self,
             series: format!("{}.{}", machine[0], machine[1]),
         };
-        let resolution = Resolver::new(&index, floor, self.no_build)
-            .fetch(&builder)
-            .machine(machine)
-            .requires_python(roots.requires_python.as_deref())
-            .prefer(prefer)
-            .upgrade(upgrade, upgrade_all)
-            .resolve(&roots)?;
-        let new: BTreeMap<String, String> = resolution
-            .packages
-            .iter()
-            .map(|p| (p.name.clone(), p.version.to_string()))
-            .collect();
+        // `[[tool.uv.index]]` and `[tool.uv.sources]`: packages routed to an
+        // index of their own, possibly only inside one group.
+        let indexes = project.uv_indexes();
+        let sources = project.uv_sources();
+        let index_url = |name: &str| -> Result<String> {
+            indexes
+                .iter()
+                .find(|(n, _, _)| n == name)
+                .map(|(_, u, _)| u.clone())
+                .ok_or_else(|| anyhow!("[tool.uv.sources] names index {name:?}, which [[tool.uv.index]] does not declare"))
+        };
+        let routes_for = |group: Option<&str>| -> Result<Vec<(String, Index)>> {
+            let mut out = Vec::new();
+            for (pkg, entries) in &sources {
+                let pick = entries
+                    .iter()
+                    .find(|(_, g)| g.as_deref() == group && group.is_some())
+                    .or_else(|| entries.iter().find(|(_, g)| g.is_none()));
+                if let Some((idx, _)) = pick {
+                    out.push((pkg.clone(), Index::new(Some(&index_url(idx)?))));
+                }
+            }
+            Ok(out)
+        };
+        let defaults = || -> Vec<Index> {
+            indexes
+                .iter()
+                .filter(|(_, _, explicit)| !explicit)
+                .map(|(_, u, _)| Index::new(Some(u)))
+                .collect()
+        };
+        let resolve = |roots: &Roots,
+                       group: Option<&str>,
+                       prefer: BTreeMap<String, Version>|
+         -> Result<Resolution> {
+            Resolver::new(&index, floor, self.no_build)
+                .fetch(&builder)
+                .machine(machine)
+                .requires_python(roots.requires_python.as_deref())
+                .routes(routes_for(group)?)
+                .defaults(defaults())
+                .prefer(prefer)
+                .upgrade(upgrade, upgrade_all)
+                .resolve(roots)
+        };
+        // Profiles (conflicting groups) resolve one at a time on top of the
+        // base, each preferring what the base chose, and merge into one lock.
+        let profile_groups: Vec<String> = project.conflict_groups().into_iter().flatten().collect();
+        let lockable = if profile_groups.is_empty() {
+            Lockable::single(resolve(&roots, None, prefer)?)
+        } else {
+            let mut base_roots = roots.clone();
+            base_roots.groups.retain(|g, _| !profile_groups.contains(g));
+            let base = resolve(&base_roots, None, prefer.clone())?;
+            let mut profiles = Vec::new();
+            for g in &profile_groups {
+                let Some(reqs) = roots.groups.get(g) else {
+                    continue;
+                };
+                let mut pr = base_roots.clone();
+                pr.groups.insert(g.clone(), reqs.clone());
+                let mut keep = prefer.clone();
+                keep.extend(base.assigned.clone());
+                profiles.push((g.clone(), resolve(&pr, Some(g), keep)?));
+            }
+            Lockable::merge(base, profiles)
+        };
+        let mut new: BTreeMap<String, String> = BTreeMap::new();
+        for p in &lockable.packages {
+            new.entry(p.name.clone())
+                .and_modify(|v| {
+                    v.push_str(", ");
+                    v.push_str(&p.version.to_string());
+                })
+                .or_insert_with(|| p.version.to_string());
+        }
         if !dry_run {
-            let text = write_lock(&roots, &resolution, index.url());
+            let text = write_lock(&roots, &lockable);
             fs::write(root.join(crate::lock::LOCKFILE), text)?;
             println!(
                 "resolved {} package(s) (native resolver, wheels only)",
-                resolution.packages.len()
+                lockable.packages.len()
             );
         }
         Ok((old, new))
@@ -281,7 +347,9 @@ fn cache_dir() -> Result<PathBuf> {
 /// only, never to whatever a lock names) and an optional wheelhouse
 /// directory that is tried first.
 struct Source<'a> {
-    index_url: &'a str,
+    /// Every configured index (policy's and `[[tool.uv.index]]`): credentials
+    /// go to these hosts and no other.
+    index_urls: Vec<String>,
     wheelhouse_dir: Option<&'a Path>,
     /// Builds wheels from source distributions and git checkouts, for this
     /// machine only (a cross-target layout gets none).
@@ -364,7 +432,11 @@ fn fetch_wheel(pkg: &Package, target: &wheelhouse::Target, source: &Source) -> R
     println!("downloading {name}");
     // Index credentials go to the configured index's own host only: not to a
     // CDN, and not to whatever registry a lock happens to name.
-    let url = if crate::index::same_origin(&artifact.url, source.index_url) {
+    let url = if source
+        .index_urls
+        .iter()
+        .any(|u| crate::index::same_origin(&artifact.url, u))
+    {
         crate::backend::with_credentials(&artifact.url)
     } else {
         artifact.url.clone()
@@ -486,6 +558,18 @@ impl NativeBackend {
             .map(Path::to_path_buf)
     }
 
+    /// The policy index plus the project's `[[tool.uv.index]]` URLs, when a
+    /// project is at hand (sync runs inside one; tool envs do not).
+    fn index_urls_with(&self, main: &str) -> Vec<String> {
+        let mut urls = vec![main.to_owned()];
+        if let Ok(cwd) = std::env::current_dir() {
+            if let Ok(project) = Project::require(&cwd) {
+                urls.extend(project.uv_indexes().into_iter().map(|(_, u, _)| u));
+            }
+        }
+        urls
+    }
+
     /// Runs `f` with this backend's artifact source.
     fn with_source<T>(
         &self,
@@ -495,7 +579,7 @@ impl NativeBackend {
         let index = self.index();
         let wheelhouse = self.wheelhouse_dir();
         f(&Source {
-            index_url: index.url(),
+            index_urls: self.index_urls_with(index.url()),
             wheelhouse_dir: wheelhouse.as_deref(),
             builder: series.map(|s| Builder {
                 backend: self,
@@ -1065,7 +1149,7 @@ impl Backend for NativeBackend {
             .fetch(&builder)
             .single()
             .resolve(&roots)?;
-        let lock_text = write_lock(&roots, &resolution, index.url());
+        let lock_text = write_lock(&roots, &Lockable::single(resolution));
         let lock = Lock::parse(&lock_text)?;
         let env = MarkerEnv::current(version);
         let wanted = plan(&lock, &env, &[])?;

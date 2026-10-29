@@ -2191,25 +2191,45 @@ fn import_rolls_back_on_policy_and_handles_poetry_in_place() {
         "rolled-back import left a .venv behind"
     );
 
-    // A stray .venv directory that is not an environment: the failed import keeps
-    // its files and removes only the environment it had started to build there.
+    // A stray .venv directory that is not an environment is never built into or
+    // cleaned up: the import refuses it, the files and the manifest stay as they were.
     let d = tmp.0.join("stray");
-    fs::create_dir_all(d.join(".venv")).unwrap();
-    fs::write(d.join(".venv").join("keep.txt"), "mine").unwrap();
+    fs::create_dir_all(d.join(".venv").join("bin")).unwrap();
+    fs::write(d.join(".venv").join("bin").join("custom-tool"), "mine").unwrap();
     fs::write(d.join("pyproject.toml"), original).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
         .current_dir(&d)
+        .args(["import", "pyproject.toml"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not an environment"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        read(&d.join(".venv").join("bin").join("custom-tool")),
+        "mine"
+    );
+    assert!(!d.join(".venv").join("pyvenv.cfg").exists());
+    assert_eq!(read(&d.join("pyproject.toml")), original);
+    // An empty .venv directory is fine to fill, and is removed again on failure.
+    let e = tmp.0.join("empty");
+    fs::create_dir_all(e.join(".venv")).unwrap();
+    fs::write(e.join("pyproject.toml"), original).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
+        .current_dir(&e)
         .env("VIVAR_POLICY", &strict)
         .args(["import", "pyproject.toml"])
         .output()
         .unwrap();
     assert!(!out.status.success());
-    assert_eq!(read(&d.join(".venv").join("keep.txt")), "mine");
     assert!(
-        !d.join(".venv").join("pyvenv.cfg").exists(),
-        "environment left behind in a stray directory"
+        !e.join(".venv").exists(),
+        "failed import left its environment behind"
     );
-    assert_eq!(read(&d.join("pyproject.toml")), original);
+    assert_eq!(read(&e.join("pyproject.toml")), original);
 
     // A poetry-only pyproject in place gets [project] metadata and its deps.
     let b = tmp.0.join("poetry");

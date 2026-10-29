@@ -3,6 +3,8 @@ name = "vivar"
 version = "0.1.0"
 edition = "2021"
 description = "Fast, license-safe Python environment manager"
+license = "Apache-2.0"
+repository = "https://github.com/nextria-ca/vivar"
 
 [dependencies]
 anyhow = "1"

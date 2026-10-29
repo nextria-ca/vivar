@@ -399,3 +399,8 @@ Layout:
 - `src/bundle.rs`: `pack`/`unpack` portable bundles (shells out to `tar`).
 - `src/verify.rs` + `src/verify.py`: `verify`, a Python driver run by the env's own interpreter.
 - `tests/cli.rs`: end-to-end tests against the built binary.
+
+## License
+
+vivar is released under the [Apache License 2.0](LICENSE). Licenses of the Rust
+crates it is built from are listed in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).

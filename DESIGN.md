@@ -240,7 +240,9 @@ lock, universal markers, writes `uv.lock` that `uv lock --check` accepts), `nati
 `build` as a PEP 517 driver in a throwaway environment).
 `backend_for` picks uv when it is on PATH, native otherwise or with `VIVAR_BACKEND=native`.
 The native resolver keeps one version per package (a graph that needs a fork is reported
-as such), checks artifacts against every environment a dependency applies to, treats a
+as such), works per Python minor within the project's `requires-python` (a marker that
+would split a minor at a patch level is reported, not guessed), checks artifacts against
+every environment a dependency applies to, treats a
 wheelhouse `index-url` as the whole index (never PyPI behind it), and refuses projects
 using uv-only features (workspaces, `tool.uv.sources`, extra indexes, profiles) rather
 than resolving them differently.

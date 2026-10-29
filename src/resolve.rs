@@ -151,9 +151,9 @@ impl<'a> Resolver<'a> {
     }
 
     /// The Pythons environment `i` may run: its sample, and for a whole-minor
-    /// environment both ends of its patch range. A patch-level comparison is
-    /// taken to hold when it holds on any of them: an over-approximation that
-    /// can only bring a dependency in, never lose one.
+    /// environment both ends of its patch range. A patch-level comparison
+    /// must agree on all of them: the resolver works per minor and reports a
+    /// marker that would split one rather than guess.
     fn variants(&self, i: usize) -> Vec<Version> {
         let mut v = vec![self.pythons[i].clone()];
         if let Some((lo, hi)) = &self.patch_bounds[i] {
@@ -166,8 +166,9 @@ impl<'a> Resolver<'a> {
         v
     }
 
-    /// Whether a `requires-python` can hold on every environment in `envs`:
-    /// one version per package means it has to serve all of them.
+    /// Whether a `requires-python` holds on every environment in `envs`, at
+    /// every patch each stands for: one version per package means it has to
+    /// serve all of them.
     fn python_ok(&self, requires_python: Option<&str>, envs: &BTreeSet<usize>) -> bool {
         let Some(rp) = requires_python else {
             return true;
@@ -178,7 +179,7 @@ impl<'a> Resolver<'a> {
         envs.iter().all(|&i| {
             self.variants(i)
                 .iter()
-                .any(|p| spec.matches_allowing_pre(p))
+                .all(|p| spec.matches_allowing_pre(p))
         })
     }
 
@@ -280,30 +281,43 @@ impl<'a> Resolver<'a> {
         marker: Option<&str>,
         extras: &Extras,
         within: &BTreeSet<usize>,
-    ) -> BTreeSet<usize> {
+    ) -> Result<BTreeSet<usize>> {
         let Some(m) = marker else {
-            return within.clone();
+            return Ok(within.clone());
         };
-        within
-            .iter()
-            .copied()
-            .filter(|&i| {
-                let mut e = self.envs[i].0.clone();
-                // Only the extras requested in this very environment count.
-                e.extra = extras
-                    .iter()
-                    .filter(|(_, envs)| envs.contains(&i))
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                if !m.contains("python_full_version") {
-                    return eval_marker(m, &e).unwrap_or(false);
+        let mut out = BTreeSet::new();
+        for &i in within {
+            let mut e = self.envs[i].0.clone();
+            // Only the extras requested in this very environment count.
+            e.extra = extras
+                .iter()
+                .filter(|(_, envs)| envs.contains(&i))
+                .map(|(k, _)| k.clone())
+                .collect();
+            if !m.contains("python_full_version") {
+                if eval_marker(m, &e).unwrap_or(false) {
+                    out.insert(i);
                 }
-                self.variants(i).iter().any(|p| {
+                continue;
+            }
+            let verdicts: Vec<bool> = self
+                .variants(i)
+                .iter()
+                .map(|p| {
                     e.python_full_version = p.to_string();
                     eval_marker(m, &e).unwrap_or(false)
                 })
-            })
-            .collect()
+                .collect();
+            if verdicts.iter().all(|v| *v) {
+                out.insert(i);
+            } else if verdicts.iter().any(|v| *v) {
+                bail!(
+                    "the marker `{m}` distinguishes patch releases of Python {}; vivar's resolver works per minor (uv can fork such a lock)",
+                    e.python_version
+                );
+            }
+        }
+        Ok(out)
     }
 
     fn all_envs(&self) -> BTreeSet<usize> {
@@ -407,7 +421,7 @@ impl<'a> Resolver<'a> {
             .chain(roots.extras.values().flatten())
             .chain(roots.groups.values().flatten())
         {
-            let envs = self.where_holds(r.marker.as_deref(), &Extras::new(), &all);
+            let envs = self.where_holds(r.marker.as_deref(), &Extras::new(), &all)?;
             if envs.is_empty() {
                 continue;
             }
@@ -588,7 +602,7 @@ impl<'a> Resolver<'a> {
             return Ok(false);
         }
         for dep in &meta.requires_dist {
-            let envs = self.where_holds(dep.marker.as_deref(), &extras, &within);
+            let envs = self.where_holds(dep.marker.as_deref(), &extras, &within)?;
             if envs.is_empty() {
                 continue;
             }
@@ -944,20 +958,28 @@ mod tests {
         );
         let none = Extras::new();
         let all = r.all_envs();
-        // Patch-level markers are judged over the minor's in-range patches,
-        // so neither end of an interval is lost, nor an overlap between two.
-        assert!(!r
-            .where_holds(Some("python_full_version >= '3.12.10'"), &none, &all)
-            .is_empty());
-        let upper = r.where_holds(Some("python_full_version >= '3.12.1'"), &none, &all);
-        assert!(!r
-            .where_holds(Some("python_full_version < '3.12.5'"), &none, &upper)
-            .is_empty());
         let others: BTreeSet<usize> = all.iter().copied().filter(|&i| i != 0).collect();
-        assert!(r.python_ok(Some(">=3.12.1"), &others));
-        assert!(!r.python_ok(Some(">=3.12.1"), &all)); // this machine is exactly 3.12.0
+        // Patch-level comparisons must agree across a minor's in-range
+        // patches; one that would split a minor is reported, not guessed.
+        assert!(r
+            .where_holds(Some("python_full_version < '3.12'"), &none, &all)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            r.where_holds(Some("python_full_version >= '3.12'"), &none, &all)
+                .unwrap(),
+            all
+        );
+        let err = r
+            .where_holds(Some("python_full_version >= '3.12.10'"), &none, &all)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("patch releases of Python 3.12"), "{err}");
+        assert!(r.python_ok(Some(">=3.12"), &others));
+        assert!(!r.python_ok(Some(">=3.12.1"), &others)); // not on 3.12.0
         assert!(r
             .where_holds(Some("python_version >= '3.14'"), &none, &all)
+            .unwrap()
             .is_empty());
         // Nothing outside the project's range is considered.
         let narrow =
@@ -968,22 +990,27 @@ mod tests {
                 &none,
                 &narrow.all_envs()
             )
+            .unwrap()
             .is_empty());
         let bounded =
-            Resolver::new(&index, [3, 12, 0], true).requires_python(Some(">=3.12,<3.12.20"));
-        assert!(!bounded
-            .where_holds(
-                Some("python_full_version >= '3.12.10'"),
-                &none,
-                &bounded.all_envs()
-            )
-            .is_empty());
+            Resolver::new(&index, [3, 12, 5], true).requires_python(Some(">=3.12.5,<3.12.20"));
+        assert_eq!(
+            bounded
+                .where_holds(
+                    Some("python_full_version >= '3.12.5'"),
+                    &none,
+                    &bounded.all_envs()
+                )
+                .unwrap(),
+            bounded.all_envs()
+        );
         assert!(bounded
             .where_holds(
                 Some("python_full_version >= '3.12.20'"),
                 &none,
                 &bounded.all_envs()
             )
+            .unwrap()
             .is_empty());
         // A single interpreter is exactly its patch.
         let single = Resolver::new(&index, [3, 12, 0], true).single();
@@ -994,6 +1021,7 @@ mod tests {
                 &none,
                 &single.all_envs()
             )
+            .unwrap()
             .is_empty());
         assert!(!single.python_ok(Some(">=3.12.1"), &single.all_envs()));
     }

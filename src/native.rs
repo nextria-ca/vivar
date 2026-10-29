@@ -112,6 +112,7 @@ impl NativeBackend {
         let index = self.index();
         let resolution = Resolver::new(&index, floor, self.no_build)
             .machine(machine)
+            .requires_python(roots.requires_python.as_deref())
             .prefer(prefer)
             .upgrade(upgrade, upgrade_all)
             .resolve(&roots)?;
@@ -150,32 +151,30 @@ fn declared_floor(project: &Project) -> Option<[u32; 3]> {
     Some([it.next()??, it.next()??, it.next().flatten().unwrap_or(0)])
 }
 
-/// The Python this machine installs with: the env, else the pin, else the
-/// `requires-python` floor, else the newest installed.
-fn python_floor(project: &Project) -> Result<[u32; 3]> {
+/// The Python this machine installs with, when the project says: the env,
+/// else the pin, else the `requires-python` floor. No lookups, no installs.
+fn known_python(project: &Project) -> Option<[u32; 3]> {
     let root = project.venv_root();
     if let Ok(v) = env_version(&root.join(".venv")) {
-        return Ok(v);
+        return Some(v);
     }
     if let Ok(pin) = fs::read_to_string(root.join(".python-version")) {
         let mut it = pin.trim().split('.').map(|p| p.parse::<u32>().unwrap_or(0));
-        return Ok([
+        return Some([
             it.next().unwrap_or(3),
             it.next().unwrap_or(12),
             it.next().unwrap_or(0),
         ]);
     }
-    if let Some(rp) = project.requires_python() {
-        if let Some(v) = rp.split(',').find_map(|c| c.trim().strip_prefix(">=")) {
-            let mut it = v.trim().split('.').map(|p| p.parse::<u32>().unwrap_or(0));
-            return Ok([
-                it.next().unwrap_or(3),
-                it.next().unwrap_or(12),
-                it.next().unwrap_or(0),
-            ]);
-        }
+    declared_floor(project)
+}
+
+/// `known_python`, else the newest installed build (installing one if needed).
+fn python_floor(project: &Project) -> Result<[u32; 3]> {
+    match known_python(project) {
+        Some(v) => Ok(v),
+        None => Ok(venv::interpreter(None)?.version),
     }
-    Ok(venv::interpreter(None)?.version)
 }
 
 /// The set of lock packages an environment should contain for `env`, given
@@ -677,7 +676,9 @@ impl Backend for NativeBackend {
             ..Default::default()
         };
         let index = self.index();
-        let resolution = Resolver::new(&index, version, self.no_build).resolve(&roots)?;
+        let resolution = Resolver::new(&index, version, self.no_build)
+            .single()
+            .resolve(&roots)?;
         let lock_text = write_lock(&roots, &resolution, index.url());
         let lock = Lock::parse(&lock_text)?;
         let env = MarkerEnv::current(version);
@@ -723,14 +724,17 @@ impl Backend for NativeBackend {
         let project = crate::project::Project::require(dir)?;
         let lock = Lock::read(project.venv_root())?;
         let locked: BTreeSet<String> = lock.packages.iter().map(|p| p.name.clone()).collect();
-        let here = MarkerEnv::current(python_floor(&project)?);
+        // A check never provisions Python: with no known interpreter, marked
+        // requirements are given the benefit of the doubt.
+        let here = known_python(&project).map(MarkerEnv::current);
         let mut missing = Vec::new();
         for req in project.declared_requirements() {
             let name = crate::project::normalize(crate::project::requirement_name(&req));
-            let applies_here = Requirement::parse(&req)
-                .ok()
-                .and_then(|r| r.marker.map(|m| eval_marker(&m, &here).unwrap_or(true)))
-                .unwrap_or(true);
+            let applies_here = match (Requirement::parse(&req).ok().and_then(|r| r.marker), &here) {
+                (Some(m), Some(env)) => eval_marker(&m, env).unwrap_or(true),
+                (Some(_), None) => false,
+                (None, _) => true,
+            };
             if !locked.contains(&name) && applies_here {
                 missing.push(name);
             }

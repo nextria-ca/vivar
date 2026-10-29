@@ -69,11 +69,14 @@ struct Pending {
     envs: BTreeSet<usize>,
 }
 
+/// Extras requested of a package, each with the environments requesting it.
+type Extras = BTreeMap<String, BTreeSet<usize>>;
+
 #[derive(Clone, Default)]
 struct State {
     assigned: Vec<(String, Version)>,
     constraints: BTreeMap<String, Vec<Constraint>>,
-    extras: BTreeMap<String, BTreeSet<String>>,
+    extras: BTreeMap<String, Extras>,
     pending: VecDeque<Pending>,
     /// Edges (from, requirement) recorded for the lock.
     edges: Vec<(String, Requirement)>,
@@ -121,7 +124,9 @@ impl<'a> Resolver<'a> {
                     if let Ok(t) =
                         Target::new(Some(&format!("{os}-{arch}")), &format!("{maj}.{minor}"))
                     {
-                        envs.push((MarkerEnv::for_target(os, arch, [maj, minor, 0]), t));
+                        // The floor keeps its patch level (`>=3.10.1`); later minors start at .0.
+                        let patch = if minor == min { floor[2] } else { 0 };
+                        envs.push((MarkerEnv::for_target(os, arch, [maj, minor, patch]), t));
                     }
                 }
             }
@@ -144,6 +149,39 @@ impl<'a> Resolver<'a> {
         };
         envs.iter()
             .all(|&i| spec.matches_allowing_pre(&self.pythons[i]))
+    }
+
+    /// Keeps only the environments inside the project's `requires-python`
+    /// (this machine always stays): a `>=3.12,<3.13` project is not held to
+    /// what 3.13 would need.
+    pub fn requires_python(mut self, spec: Option<&str>) -> Self {
+        if let Some(spec) = spec.and_then(|s| Specifier::parse(s).ok()) {
+            let keep: Vec<bool> = self
+                .pythons
+                .iter()
+                .enumerate()
+                .map(|(i, p)| i == 0 || spec.matches_allowing_pre(p))
+                .collect();
+            let mut i = 0;
+            self.envs.retain(|_| {
+                i += 1;
+                keep[i - 1]
+            });
+            let mut j = 0;
+            self.pythons.retain(|_| {
+                j += 1;
+                keep[j - 1]
+            });
+        }
+        self
+    }
+
+    /// One environment only (this machine): for installs into an existing
+    /// interpreter, where no other platform or Python has to be served.
+    pub fn single(mut self) -> Self {
+        self.envs.truncate(1);
+        self.pythons.truncate(1);
+        self
     }
 
     /// The Python this machine installs with, when it differs from the floor.
@@ -177,7 +215,7 @@ impl<'a> Resolver<'a> {
     fn where_holds(
         &self,
         marker: Option<&str>,
-        extras: &BTreeSet<String>,
+        extras: &Extras,
         within: &BTreeSet<usize>,
     ) -> BTreeSet<usize> {
         let Some(m) = marker else {
@@ -188,7 +226,12 @@ impl<'a> Resolver<'a> {
             .copied()
             .filter(|&i| {
                 let mut e = self.envs[i].0.clone();
-                e.extra = extras.iter().cloned().collect();
+                // Only the extras requested in this very environment count.
+                e.extra = extras
+                    .iter()
+                    .filter(|(_, envs)| envs.contains(&i))
+                    .map(|(k, _)| k.clone())
+                    .collect();
                 eval_marker(m, &e).unwrap_or(false)
             })
             .collect()
@@ -295,7 +338,7 @@ impl<'a> Resolver<'a> {
             .chain(roots.extras.values().flatten())
             .chain(roots.groups.values().flatten())
         {
-            let envs = self.where_holds(r.marker.as_deref(), &BTreeSet::new(), &all);
+            let envs = self.where_holds(r.marker.as_deref(), &Extras::new(), &all);
             if envs.is_empty() {
                 continue;
             }
@@ -329,7 +372,15 @@ impl<'a> Resolver<'a> {
                 .get(&req.name)
                 .map(|cs| cs.iter().flat_map(|c| c.envs.iter().copied()).collect())
                 .unwrap_or_default();
-            let grew = !envs.is_subset(&known);
+            let mut grew = !envs.is_subset(&known);
+            let requested = state.extras.entry(req.name.clone()).or_default();
+            for e in &req.extras {
+                let scope = requested.entry(e.clone()).or_default();
+                if !envs.is_subset(scope) {
+                    scope.extend(envs.iter().copied());
+                    grew = true;
+                }
+            }
             state
                 .constraints
                 .entry(req.name.clone())
@@ -339,26 +390,13 @@ impl<'a> Resolver<'a> {
                     marker: req.marker.clone(),
                     envs,
                 });
-            let new_extras: Vec<String> = req
-                .extras
-                .iter()
-                .filter(|e| !state.extras.get(&req.name).is_some_and(|s| s.contains(*e)))
-                .cloned()
-                .collect();
-            state
-                .extras
-                .entry(req.name.clone())
-                .or_default()
-                .extend(req.extras.iter().cloned());
 
             if let Some((_, v)) = state.assigned.iter().find(|(n, _)| *n == req.name) {
                 let v = v.clone();
                 if req.specifier.matches(&v)
                     || req.specifier.matches_allowing_pre(&v) && v.is_prerelease()
                 {
-                    if (!new_extras.is_empty() || grew)
-                        && !self.enqueue_deps(&mut state, &req.name, &v)?
-                    {
+                    if grew && !self.enqueue_deps(&mut state, &req.name, &v)? {
                         state = self.backtrack(&mut frames, &req.name)?;
                     }
                     continue;
@@ -521,8 +559,10 @@ impl<'a> Resolver<'a> {
 /// An actual pin to one release (`==1.2.3`, `===x`), not `==1.*` or a range.
 fn exact_pin(constraints: &[Constraint]) -> bool {
     constraints.iter().any(|c| {
-        let s = c.specifier.to_string();
-        s.starts_with("==") && !s.contains(',') && !s.ends_with(".*")
+        c.specifier
+            .to_string()
+            .split(',')
+            .any(|clause| clause.starts_with("==") && !clause.ends_with(".*"))
     })
 }
 

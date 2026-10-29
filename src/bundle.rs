@@ -1095,8 +1095,14 @@ pub fn make_delta(old: &Path, new: &Path, output: &Path) -> Result<String> {
             .filter(|m| !new_names.contains(m) && *m != MANIFEST && safe_member(m))
             .collect();
 
-        // pyvenv.cfg always travels: it is tiny and it is what relocation rewrites.
-        let always = [".venv/pyvenv.cfg".to_owned()];
+        // Everything in the inventory always travels: launchers, activate scripts,
+        // pyvenv.cfg and symlinks are small, get rewritten by relocation, and
+        // this way the whole executable surface is replaced and verified.
+        let always: Vec<String> = parse_checksums(&new_inv)
+            .into_iter()
+            .map(|(m, _)| strip(m))
+            .filter(|m| m != MANIFEST && !changed.contains(m))
+            .collect();
         for member in changed.iter().chain(always.iter()) {
             let (from, to) = (new_dir.join(member), stage.join(member));
             let Ok(meta) = fs::symlink_metadata(&from) else {
@@ -1229,14 +1235,9 @@ pub fn apply_delta(delta: &Path, dir: &Path, require_signature: bool) -> Result<
             let _ = fs::remove_file(dir.join(crate::sign::SIGNATURE));
         }
         let mut bad = verify_checksums(&dir)?;
-        // Relocated files from the base are stale until relocation runs again, so
-        // the inventory is checked on the delta's own copies.
-        bad.extend(
-            verify_inventory(&tmp)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|b| !b.ends_with("(missing)")),
-        );
+        // Every inventory member travelled in the delta and was just copied in,
+        // so the destination is checked against the new inventory before relocation.
+        bad.extend(verify_inventory(&dir)?);
         if !bad.is_empty() {
             bail!(
                 "the updated bundle fails its integrity check ({} file(s)):\n  {}",

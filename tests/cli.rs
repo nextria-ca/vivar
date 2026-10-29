@@ -2077,7 +2077,14 @@ fn signatures_cover_launchers_and_deltas_cannot_escape() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(read(&tmp.0.join("canary.txt")), "still here");
-    // The untouched base still applies the honest delta.
+    // A tampered activate script in the base is replaced, not kept, by the delta.
+    let base_activate = base
+        .join(".venv")
+        .join(if cfg!(windows) { "Scripts" } else { "bin" })
+        .join("activate");
+    let mut hacked = read(&base_activate);
+    hacked.push_str("\n# hacked\n");
+    fs::write(&base_activate, hacked).unwrap();
     assert!(run(
         &tmp.0,
         &[
@@ -2089,6 +2096,7 @@ fn signatures_cover_launchers_and_deltas_cannot_escape() {
     )
     .status
     .success());
+    assert!(!read(&base_activate).contains("# hacked"));
     ok(&base, &["run", "python", "-c", "import pycodestyle"]);
 }
 

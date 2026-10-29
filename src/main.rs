@@ -459,30 +459,13 @@ fn main() -> Result<()> {
         }
         Command::Import { file, python } => {
             let imported = import::read(&file)?;
-            let project = match project {
-                Some(p) if p.has_project_table() => p,
-                Some(p) => {
-                    // A poetry-only pyproject: give it PEP 621 metadata, keep the rest.
-                    let name = imported.name.clone().unwrap_or_else(|| p.name());
-                    let python = python.clone().or(imported.python.clone());
-                    project::ensure_pep621(&p.root, &name, python.as_deref())?;
-                    if !p.root.join(".python-version").exists() {
-                        let interpreter = venv::interpreter(python.as_deref())?;
-                        let [major, minor, _] = interpreter.version;
-                        std::fs::write(
-                            p.root.join(".python-version"),
-                            format!("{major}.{minor}\n"),
-                        )?;
-                    }
-                    project::write_defaults(&p.root)?;
-                    println!(
-                        "added [project] metadata to {}",
-                        p.root.join(project::PYPROJECT).display()
-                    );
-                    Project::require(&p.root)?
-                }
+            // A poetry-only pyproject is converted inside the transaction below,
+            // so a failed import leaves the original file behind.
+            let (project, convert) = match project {
+                Some(p) if p.has_project_table() => (p, false),
+                Some(p) => (p, true),
                 None => {
-                    let python = python.or(imported.python.clone());
+                    let python = python.clone().or(imported.python.clone());
                     let interpreter = venv::interpreter(python.as_deref())?;
                     let name = imported
                         .name
@@ -493,26 +476,44 @@ fn main() -> Result<()> {
                         "Initialized project `{name}` on CPython {}",
                         interpreter.version_string()
                     );
-                    Project::require(&cwd)?
+                    (Project::require(&cwd)?, false)
                 }
             };
             let policy = project.policy()?;
             let backend = UvBackend::new(&policy);
-            venv::ensure(project.venv_root(), &project.name())?;
             let all: Vec<String> = imported
                 .requirements
                 .iter()
                 .map(|(_, r)| r.clone())
                 .collect();
-            project.check_requirements(&all)?;
+            policy.check_deny(&all)?;
             let mut groups: Vec<Option<String>> = Vec::new();
             for (g, _) in &imported.requirements {
                 if !groups.contains(g) {
                     groups.push(g.clone());
                 }
             }
-            // One transaction for the whole import: a policy rejection undoes all of it.
-            transact(&project, &backend, &project.root, None, || {
+            let root = project.root.clone();
+            transact(&project, &backend, &root, None, || {
+                let project = if convert {
+                    let name = imported.name.clone().unwrap_or_else(|| project.name());
+                    let python = python.clone().or(imported.python.clone());
+                    project::ensure_pep621(&root, &name, python.as_deref())?;
+                    if !root.join(".python-version").exists() {
+                        let interpreter = venv::interpreter(python.as_deref())?;
+                        let [major, minor, _] = interpreter.version;
+                        std::fs::write(root.join(".python-version"), format!("{major}.{minor}\n"))?;
+                    }
+                    project::write_defaults(&root)?;
+                    println!(
+                        "added [project] metadata to {}",
+                        root.join(project::PYPROJECT).display()
+                    );
+                    Project::require(&root)?
+                } else {
+                    Project::require(&root)?
+                };
+                venv::ensure(project.venv_root(), &project.name())?;
                 for group in &groups {
                     let reqs: Vec<String> = imported
                         .requirements
@@ -536,7 +537,7 @@ fn main() -> Result<()> {
                     let list = std::env::temp_dir()
                         .join(format!("vivar-import-{}.txt", std::process::id()));
                     std::fs::write(&list, reqs.join("\n") + "\n")?;
-                    let added = backend.add_requirements(&project.root, &list, group.as_deref());
+                    let added = backend.add_requirements(&root, &list, group.as_deref());
                     let _ = std::fs::remove_file(&list);
                     added?;
                     println!(
@@ -1315,6 +1316,7 @@ fn transact(
     let files = [
         project.root.join(project::PYPROJECT),
         project.venv_root().join(lock::LOCKFILE),
+        project.venv_root().join(".python-version"),
     ];
     let snapshot: Vec<Option<Vec<u8>>> = files.iter().map(|p| std::fs::read(p).ok()).collect();
     let env_before = venv::fingerprint(&venv_dir);

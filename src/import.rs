@@ -316,10 +316,18 @@ fn poetry_markers(item: &Item) -> String {
     if let Some(platform) = item.get("platform").and_then(Item::as_str) {
         parts.push(format!("sys_platform == \"{platform}\""));
     }
-    if parts.is_empty() {
-        String::new()
-    } else {
-        format!("; {}", parts.join(" and "))
+    match parts.len() {
+        0 => String::new(),
+        1 => format!("; {}", parts[0]),
+        // `a or b` joined with `and c` must not rebind: wrap every part.
+        _ => format!(
+            "; {}",
+            parts
+                .iter()
+                .map(|p| format!("({p})"))
+                .collect::<Vec<_>>()
+                .join(" and ")
+        ),
     }
 }
 
@@ -519,13 +527,14 @@ mod tests {
             ]
         );
         assert_eq!(p.skipped.len(), 2);
-        let p = poetry("[tool.poetry.dependencies]\npywin32 = {version = \"^306\", platform = \"win32\"}\nold = {version = \"1\", python = \"<3.12\"}\nmk = {version = \"2\", markers = \"extra == 'x'\"}\n").unwrap();
+        let p = poetry("[tool.poetry.dependencies]\npywin32 = {version = \"^306\", platform = \"win32\"}\nold = {version = \"1\", python = \"<3.12\"}\nmk = {version = \"2\", markers = \"extra == 'x'\"}\nboth = {version = \"3\", markers = \"sys_platform == 'linux' or sys_platform == 'darwin'\", python = \"<3.12\"}\n").unwrap();
         assert_eq!(
             names(&p),
             vec![
                 "main:pywin32>=306,<307; sys_platform == \"win32\"",
                 "main:old==1; python_full_version < \"3.12\"",
                 "main:mk==2; extra == 'x'",
+                "main:both==3; (sys_platform == 'linux' or sys_platform == 'darwin') and (python_full_version < \"3.12\")",
             ]
         );
         assert_eq!(poetry_constraint("^0.2.1"), ">=0.2.1,<0.3");

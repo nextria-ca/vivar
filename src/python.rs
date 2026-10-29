@@ -209,7 +209,7 @@ pub fn select(spec: Option<&str>) -> Result<Installed> {
             return Ok(p);
         }
     }
-    for (version, _) in available()? {
+    for (version, _, _) in available()? {
         if satisfies_spec(version, spec)? {
             let [a, b, c] = version;
             return install(&format!("{a}.{b}.{c}"));
@@ -219,14 +219,15 @@ pub fn select(spec: Option<&str>) -> Result<Installed> {
 }
 
 /// Downloads for this machine in the latest python-build-standalone release:
-/// `(version, file name)`, newest first. Pre-releases are left out.
-fn available() -> Result<Vec<([u32; 3], String)>> {
+/// `(version, file name, sha256)`, newest first. Pre-releases are left out.
+fn available() -> Result<Vec<([u32; 3], String, String)>> {
     let sums = crate::upgrade::fetch(&format!("{RELEASES}/latest/download/SHA256SUMS"), None)
         .context("fetching the list of Python downloads")?;
     let suffix = format!("-{}-install_only_stripped.tar.gz", triple()?);
     let mut out = Vec::new();
     for line in String::from_utf8_lossy(&sums).lines() {
-        let Some(file) = line.split_whitespace().nth(1) else {
+        let mut fields = line.split_whitespace();
+        let (Some(digest), Some(file)) = (fields.next(), fields.next()) else {
             continue;
         };
         let version = file
@@ -235,10 +236,10 @@ fn available() -> Result<Vec<([u32; 3], String)>> {
             .and_then(|f| f.split_once('+'))
             .and_then(|(v, _)| parse_version(v));
         if let Some(version) = version {
-            out.push((version, file.to_owned()));
+            out.push((version, file.to_owned(), digest.to_owned()));
         }
     }
-    out.sort_by_key(|(v, _)| std::cmp::Reverse(*v));
+    out.sort_by_key(|(v, _, _)| std::cmp::Reverse(*v));
     Ok(out)
 }
 
@@ -253,9 +254,9 @@ pub fn install(request: &str) -> Result<Installed> {
         return Ok(have);
     }
     let triple = triple()?;
-    let (version, file) = available()?
+    let (version, file, digest) = available()?
         .into_iter()
-        .find(|(v, _)| satisfies(*v, &wanted))
+        .find(|(v, _, _)| satisfies(*v, &wanted))
         .ok_or_else(|| anyhow!("no standalone CPython {request} build for {triple}"))?;
     // The release tag is the date after `+` in the file name.
     let tag = file
@@ -273,6 +274,10 @@ pub fn install(request: &str) -> Result<Installed> {
         println!("downloading {file}");
         let archive = tmp.join("python.tar.gz");
         crate::upgrade::fetch_to(&url, &archive)?;
+        let actual = crate::sha256::file(&archive)?;
+        if actual != digest {
+            bail!("{file} failed its checksum (got {actual}, expected {digest}); refusing to install it");
+        }
         let status = Command::new("tar")
             .arg("-xzf")
             .arg(&archive)
@@ -293,13 +298,44 @@ pub fn install(request: &str) -> Result<Installed> {
     result
 }
 
+/// Removes an installed build (and uv's minor-version link to it, if any).
+pub fn uninstall(request: &str) -> Result<()> {
+    let wanted = parse_request(request)?;
+    let matching: Vec<Installed> = installed()?
+        .into_iter()
+        .filter(|p| satisfies(p.version, &wanted))
+        .collect();
+    if matching.is_empty() {
+        bail!("no installed CPython matches {request}");
+    }
+    if matching.len() > 1 && wanted.len() < 3 {
+        let keys: Vec<&str> = matching.iter().map(|p| p.key.as_str()).collect();
+        bail!(
+            "{request} matches several builds ({}); name one exactly",
+            keys.join(", ")
+        );
+    }
+    let build = &matching[0];
+    let dir = dir()?;
+    for entry in fs::read_dir(&dir)?.flatten() {
+        let path = entry.path();
+        if path.is_symlink() && fs::read_link(&path).is_ok_and(|t| t == build.root) {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    fs::remove_dir_all(&build.root)
+        .with_context(|| format!("removing {}", build.root.display()))?;
+    println!("removed {}", build.key);
+    Ok(())
+}
+
 pub fn list(all: bool) -> Result<()> {
     let installed = installed()?;
     for p in &installed {
         println!("{:<44} {}", p.key, p.executable().display());
     }
     if all {
-        for (version, _) in available()? {
+        for (version, _, _) in available()? {
             if !installed.iter().any(|p| p.version == version) {
                 println!("{:<44} <download available>", key(version)?);
             }

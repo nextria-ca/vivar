@@ -22,6 +22,27 @@ pub struct Package {
     pub dependencies: Vec<Dep>,
     /// Every artifact has a hash (registry packages always do with uv).
     pub hashed: bool,
+    pub wheels: Vec<Artifact>,
+    pub sdist: Option<Artifact>,
+}
+
+/// A downloadable file the lock pins, with its `sha256:` hash when present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Artifact {
+    pub url: String,
+    pub hash: Option<String>,
+}
+
+impl Artifact {
+    /// The file name at the end of the URL.
+    pub fn filename(&self) -> &str {
+        self.url.rsplit('/').next().unwrap_or(&self.url)
+    }
+
+    /// The hex digest without the `sha256:` prefix.
+    pub fn sha256(&self) -> Option<&str> {
+        self.hash.as_deref().and_then(|h| h.strip_prefix("sha256:"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -90,25 +111,38 @@ impl Lock {
             dependencies.sort();
             dependencies.dedup();
 
-            let mut artifacts = 0;
-            let mut hashed = 0;
-            if let Some(sdist) = table.get("sdist").and_then(Item::as_inline_table) {
-                artifacts += 1;
-                hashed += sdist.get("hash").is_some() as usize;
-            }
-            if let Some(wheels) = table.get("wheels").and_then(Item::as_array) {
-                for w in wheels.iter().filter_map(|v| v.as_inline_table()) {
-                    artifacts += 1;
-                    hashed += w.get("hash").is_some() as usize;
-                }
-            }
+            let artifact = |t: &toml_edit::InlineTable| Artifact {
+                url: t
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+                hash: t.get("hash").and_then(|v| v.as_str()).map(str::to_owned),
+            };
+            let sdist = table
+                .get("sdist")
+                .and_then(Item::as_inline_table)
+                .map(artifact);
+            let wheels: Vec<Artifact> = table
+                .get("wheels")
+                .and_then(Item::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_inline_table())
+                        .map(artifact)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let artifacts: Vec<&Artifact> = sdist.iter().chain(wheels.iter()).collect();
             packages.push(Package {
                 name: str_of("name"),
                 version: str_of("version"),
                 source_kind,
                 source,
                 dependencies,
-                hashed: artifacts > 0 && artifacts == hashed,
+                hashed: !artifacts.is_empty() && artifacts.iter().all(|a| a.hash.is_some()),
+                wheels,
+                sdist,
             });
         }
         Ok(Lock { packages })
@@ -301,6 +335,10 @@ wheels = [{ url = "w", hash = "sha256:c" }]
         let names: Vec<&str> = app.dependencies.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, vec!["pytest", "six"]);
         assert!(lock.get("pytest").unwrap().hashed);
+        let pytest = lock.get("pytest").unwrap();
+        assert_eq!(pytest.wheels.len(), 1);
+        assert_eq!(pytest.sdist.as_ref().unwrap().sha256(), Some("a"));
+        assert_eq!(pytest.wheels[0].filename(), "w");
         assert!(!lock.get("pluggy").unwrap().hashed);
         assert!(!lock.get("iniconfig").unwrap().hashed);
         assert_eq!(lock.get("iniconfig").unwrap().source_kind, "git");

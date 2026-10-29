@@ -7,7 +7,8 @@ permissions:
 env:
   # Pinned so the offline bundles ship the same uv the workflow resolves Python downloads with.
   UV_VERSION: "0.13.6"
-  PYTHON: "3.12"
+  # Every version here goes into the offline bundles (~35 MB each).
+  PYTHONS: "3.12 3.13"
   COPYFILE_DISABLE: "1"
 jobs:
   build:
@@ -67,17 +68,19 @@ jobs:
             cp target/$t/release/vivar install.sh dist/$name/
           fi
           curl -LsSf https://raw.githubusercontent.com/astral-sh/uv/$UV_VERSION/LICENSE-MIT -o dist/$name/LICENSE-uv
-          # the CPython build uv itself would download for this target, laid out as uv keeps it
+          # the CPython builds uv itself would download for this target, laid out as uv keeps them
           set -- ${{ matrix.python }}
-          uv python list --all-platforms --all-arches --only-downloads --output-format json "cpython@$PYTHON" \
-            | jq -r --arg os "$1" --arg arch "$2" --arg libc "$3" \
-              'first(.[] | select(.os == $os and .arch == $arch and .libc == $libc and .variant == "default")) | .key, .url' \
-            > python.txt
-          read -r key < python.txt; url=$(sed -n 2p python.txt)
-          echo "bundling $key from $url"
-          curl -LsSf "$url" -o python.tar.gz
-          tar -xzf python.tar.gz -C dist/$name/python
-          mv dist/$name/python/python dist/$name/python/$key
+          for PYTHON in $PYTHONS; do
+            uv python list --all-platforms --all-arches --only-downloads --output-format json "cpython@$PYTHON" \
+              | jq -r --arg os "$1" --arg arch "$2" --arg libc "$3" \
+                'first(.[] | select(.os == $os and .arch == $arch and .libc == $libc and .variant == "default")) | .key, .url' \
+              > python.txt
+            read -r key < python.txt; url=$(sed -n 2p python.txt)
+            echo "bundling $key from $url"
+            curl -LsSf "$url" -o python.tar.gz
+            tar -xzf python.tar.gz -C dist/$name/python
+            mv dist/$name/python/python dist/$name/python/$key
+          done
           if [ "${{ runner.os }}" = Windows ]; then
             (cd dist && 7z a -tzip $name.zip $name > /dev/null)
           else
@@ -85,6 +88,40 @@ jobs:
           fi
           rm -r dist/$name
           ls -la dist
+      - name: Linux packages (deb, rpm)
+        if: runner.os == 'Linux'
+        run: |
+          set -eu
+          sudo apt-get install -y rpm
+          t=${{ matrix.target }}
+          version=${GITHUB_REF_NAME#v}
+          case $t in x86_64-*) deb_arch=amd64; rpm_arch=x86_64 ;; aarch64-*) deb_arch=arm64; rpm_arch=aarch64 ;; esac
+          pkg=pkg/vivar_${version}_$deb_arch
+          mkdir -p $pkg/DEBIAN $pkg/usr/bin
+          install -m 755 target/$t/release/vivar $pkg/usr/bin/vivar
+          cat > $pkg/DEBIAN/control <<EOF
+          Package: vivar
+          Version: $version
+          Architecture: $deb_arch
+          Maintainer: Nextria <zachary.hamel@nextria.ca>
+          Description: Fast, license-safe Python environment manager
+           Single static binary; uv is used for dependency resolution.
+          EOF
+          dpkg-deb --build --root-owner-group $pkg dist/vivar_${version}_$deb_arch.deb
+          rpmbuild -bb packaging/vivar.spec --define "_topdir $PWD/rpm" --define "version $version" \
+            --define "arch $rpm_arch" --define "binary $PWD/target/$t/release/vivar" --target $rpm_arch
+          cp rpm/RPMS/*/vivar-*.rpm dist/
+      - name: Windows installer (msi)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -eu
+          t=${{ matrix.target }}
+          version=${GITHUB_REF_NAME#v}
+          wix="/c/Program Files (x86)/WiX Toolset v3.14/bin"
+          [ -d "$wix" ] || wix=$(dirname "$(which candle.exe)")
+          "$wix/candle.exe" -nologo -arch x64 -dVersion=$version -dSource=target/$t/release/vivar.exe -o vivar.wixobj packaging/vivar.wxs
+          "$wix/light.exe" -nologo -o dist/vivar-$version-$t.msi vivar.wixobj
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}

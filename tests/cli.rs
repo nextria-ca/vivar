@@ -1110,3 +1110,247 @@ fn workspace_members_share_the_root_env() {
     // The root's policy reaches members.
     fails_with(&member, &["add", "left-pad"], "deny list");
 }
+
+#[test]
+fn wheelhouse_export_feeds_an_offline_project() {
+    let tmp = TempDir::new("wheelhouse-export");
+    let src = tmp.0.join("src");
+    fs::create_dir_all(&src).unwrap();
+    init(&src);
+    ok(&src, &["add", "six", "pycodestyle"]);
+    let wh = tmp.0.join("wh");
+    let out = ok(&src, &["export", "wheelhouse", "-o", wh.to_str().unwrap()]);
+    assert!(
+        stdout_of(&out).contains("2 wheel(s)"),
+        "{}",
+        stdout_of(&out)
+    );
+    let names: Vec<String> = fs::read_dir(&wh)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        names
+            .iter()
+            .any(|n| n.starts_with("six-") && n.ends_with(".whl")),
+        "{names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n.starts_with("pycodestyle-")),
+        "{names:?}"
+    );
+    // Re-exporting for another machine reuses what's already correct on disk.
+    ok(
+        &src,
+        &[
+            "export",
+            "wheelhouse",
+            "-o",
+            wh.to_str().unwrap(),
+            "--target",
+            "windows-x86_64",
+            "--python",
+            "3.12",
+        ],
+    );
+
+    // A second project installs from the wheelhouse with the network disabled.
+    let dst = tmp.0.join("dst");
+    fs::create_dir_all(&dst).unwrap();
+    init(&dst);
+    append_policy(&dst, &format!("index-url = {:?}", wh.to_str().unwrap()));
+    let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
+        .current_dir(&dst)
+        .env("UV_OFFLINE", "1")
+        .env("UV_NO_CACHE", "1")
+        .args(["add", "six", "pycodestyle"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    ok(&dst, &["run", "python", "-c", "import six, pycodestyle"]);
+}
+
+#[test]
+fn drift_note_policy_view_and_json_reports() {
+    let tmp = TempDir::new("drift");
+    let dir = &tmp.0;
+    init(dir);
+    ok(dir, &["add", "six"]);
+    let out = ok(dir, &["run", "python", "-c", "pass"]);
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("uv.lock changed"));
+    let lock = dir.join("uv.lock");
+    let mut text = read(&lock);
+    text.push_str("\n# touched\n");
+    fs::write(&lock, text).unwrap();
+    let out = ok(dir, &["run", "python", "-c", "pass"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("uv.lock changed since the last sync"));
+    ok(dir, &["sync"]);
+    let out = ok(dir, &["run", "python", "-c", "pass"]);
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("uv.lock changed"));
+
+    let policy = stdout_of(&ok(dir, &["policy"]));
+    assert!(
+        policy.contains("effective policy") && policy.contains("pyproject.toml"),
+        "{policy}"
+    );
+    let json = stdout_of(&ok(dir, &["policy", "--json"]));
+    assert!(
+        json.starts_with("{\"deny\":[]") && json.contains("\"sources\""),
+        "{json}"
+    );
+    let licenses = stdout_of(&ok(dir, &["licenses", "--json"]));
+    assert!(
+        licenses.contains("{\"name\":\"six\"") && licenses.contains("\"license\":\"MIT\""),
+        "{licenses}"
+    );
+    let verify = stdout_of(&ok(dir, &["verify", "--json"]));
+    assert!(
+        verify.trim_start().starts_with('{') && verify.contains("\"findings\": []"),
+        "{verify}"
+    );
+    let out = ok(dir, &["export", "requirements"]);
+    assert!(stdout_of(&out).contains("requirements.txt"));
+    let reqs = read(&dir.join("requirements.txt"));
+    assert!(
+        reqs.contains("six==") && reqs.contains("--hash=sha256:"),
+        "{reqs}"
+    );
+}
+
+#[test]
+fn python_pin_and_uninstall() {
+    let tmp = TempDir::new("pypin");
+    let dir = &tmp.0;
+    init(dir);
+    let out = ok(dir, &["python", "pin", "3.12"]);
+    assert!(
+        stdout_of(&out).contains("pinned demo to CPython 3.12."),
+        "{}",
+        stdout_of(&out)
+    );
+    assert_eq!(read(&dir.join(".python-version")).trim(), "3.12");
+    assert!(dir.join(".venv").join("pyvenv.cfg").is_file());
+
+    // Uninstall works on a managed build directory, and only on a unique match.
+    let (os, libc) = if cfg!(target_os = "linux") {
+        ("linux", "gnu")
+    } else if cfg!(windows) {
+        ("windows", "none")
+    } else {
+        ("macos", "none")
+    };
+    let arch = std::env::consts::ARCH;
+    let store = tmp.0.join("pythons");
+    for v in ["3.9.98", "3.9.99"] {
+        fs::create_dir_all(store.join(format!("cpython-{v}-{os}-{arch}-{libc}"))).unwrap();
+    }
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_vivar"))
+            .current_dir(dir)
+            .env("UV_PYTHON_INSTALL_DIR", &store)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let out = run(&["python", "uninstall", "3.9"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("several builds"));
+    let out = run(&["python", "uninstall", "3.9.99"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!store
+        .join(format!("cpython-3.9.99-{os}-{arch}-{libc}"))
+        .exists());
+    assert!(store
+        .join(format!("cpython-3.9.98-{os}-{arch}-{libc}"))
+        .exists());
+    assert!(!run(&["python", "uninstall", "3.8"]).status.success());
+}
+
+#[test]
+fn shell_slim_pack_init_lib_and_cuda_routing() {
+    let tmp = TempDir::new("misc2");
+    let dir = &tmp.0;
+    let out = ok(dir, &["init", "demo", "--python", "3.12", "--lib"]);
+    assert!(stdout_of(&out).contains("Initialized"));
+    assert!(read(&dir.join("pyproject.toml")).contains("hatchling"));
+    assert!(dir.join("src").join("demo").join("__init__.py").is_file());
+    ok(dir, &["add", "six"]);
+
+    // `shell` runs the user's shell with the env active; feed it one command.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_vivar"));
+    cmd.current_dir(dir)
+        .arg("shell")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    #[cfg(unix)]
+    cmd.env("SHELL", "/bin/sh");
+    #[cfg(windows)]
+    cmd.env("SHELL", "")
+        .env("COMSPEC", r"C:\Windows\System32\cmd.exe");
+    let mut child = cmd.spawn().unwrap();
+    {
+        use std::io::Write;
+        let stdin = child.stdin.as_mut().unwrap();
+        #[cfg(unix)]
+        stdin
+            .write_all(b"echo shell-sees $VIRTUAL_ENV\nexit\n")
+            .unwrap();
+        #[cfg(windows)]
+        stdin
+            .write_all(b"echo shell-sees %VIRTUAL_ENV%\r\nexit\r\n")
+            .unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("shell-sees") && stdout.contains(".venv"),
+        "{stdout}"
+    );
+
+    // A slim bundle drops libpython on Unix and still unpacks, verifies and runs.
+    let archive = tmp.0.join("slim.tar.gz");
+    ok(dir, &["pack", "--slim", "-o", archive.to_str().unwrap()]);
+    let listing = Command::new("tar")
+        .args(["-tzf", archive.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&listing.stdout);
+    if cfg!(unix) {
+        assert!(
+            !listing.contains("/lib/libpython"),
+            "libpython still in slim bundle"
+        );
+    }
+    let dest = tmp.0.join("slim-dest");
+    ok(
+        &tmp.0,
+        &["unpack", archive.to_str().unwrap(), dest.to_str().unwrap()],
+    );
+    assert!(stdout_of(&ok(&dest, &["verify"])).contains("integrity: all bundled files match"));
+    ok(&dest, &["run", "python", "-c", "import six"]);
+
+    // --cuda routes the package to the PyTorch index; mpmath lives there too.
+    ok(dir, &["add", "--cuda", "12.4", "mpmath"]);
+    let text = read(&dir.join("pyproject.toml"));
+    assert!(
+        text.contains("download.pytorch.org/whl/cu124")
+            && text.contains("mpmath = { index = \"pytorch-cu124\" }"),
+        "{text}"
+    );
+    ok(dir, &["run", "python", "-c", "import mpmath"]);
+
+    // No release exists yet, so --check must fail with a clear message, not a panic.
+    let out = vivar(dir, &["upgrade", "--check"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("release"));
+}

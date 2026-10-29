@@ -16,7 +16,7 @@ pub use crate::venv::BIN as VENV_BIN;
 pub const CHECKSUMS: &str = "vivar-bundle.sha256";
 
 /// Mirrors the tar excludes in `pack` so the checksum list and the archive agree.
-fn excluded(rel: &Path, python_dir: &str, mm: &str) -> bool {
+fn excluded(rel: &Path, python_dir: &str, mm: &str, slim: bool) -> bool {
     let parts: Vec<&str> = rel.iter().filter_map(|c| c.to_str()).collect();
     let name = parts.last().copied().unwrap_or("");
     if parts.iter().any(|p| {
@@ -52,6 +52,9 @@ fn excluded(rel: &Path, python_dir: &str, mm: &str) -> bool {
         if parts.len() > 2 && parts[1] == "share" && parts[2] == "man" {
             return true;
         }
+        if slim && parts.len() == 3 && parts[1] == "lib" && name.starts_with("libpython") {
+            return true;
+        }
     }
     false
 }
@@ -80,7 +83,13 @@ fn walk(base: &Path, rel: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 }
 
 /// Checksum list for everything `pack` archives, as members would appear.
-fn checksums(root: &Path, python_root: &Path, python_dir: &str, mm: &str) -> Result<String> {
+fn checksums(
+    root: &Path,
+    python_root: &Path,
+    python_dir: &str,
+    mm: &str,
+    slim: bool,
+) -> Result<String> {
     let mut files = Vec::new();
     walk(root, Path::new(".venv"), &mut files)?;
     for file in ["pyproject.toml", "uv.lock", ".python-version"] {
@@ -93,7 +102,7 @@ fn checksums(root: &Path, python_root: &Path, python_dir: &str, mm: &str) -> Res
 
     let mut out = String::new();
     for rel in files {
-        if excluded(&rel, python_dir, mm) || relocated(&rel) {
+        if excluded(&rel, python_dir, mm, slim) || relocated(&rel) {
             continue;
         }
         let base = if rel.starts_with(python_dir) {
@@ -145,7 +154,8 @@ pub fn verify_checksums(dir: &Path) -> Result<Vec<String>> {
     }
     for rel in files {
         let member = rel.to_string_lossy().replace('\\', "/");
-        if !listed.contains(&member) && !excluded(&rel, python_dir, &mm) && !relocated(&rel) {
+        // A slim bundle legitimately lacks libpython; anything else unlisted is foreign.
+        if !listed.contains(&member) && !excluded(&rel, python_dir, &mm, true) && !relocated(&rel) {
             bad.push(format!("{member} (not in the bundle)"));
         }
     }
@@ -299,7 +309,7 @@ fn python_root(home: &Path) -> Result<PathBuf> {
 
 /// Archives `<root>/.venv`, the project files, and the Python install the venv
 /// points at. Returns the archive path.
-pub fn pack(root: &Path, name: &str, output: Option<&Path>) -> Result<PathBuf> {
+pub fn pack(root: &Path, name: &str, output: Option<&Path>, slim: bool) -> Result<PathBuf> {
     let venv = root.join(".venv");
     let home = PathBuf::from(pyvenv_cfg(&venv, "home")?);
     let version = pyvenv_cfg(&venv, "version_info")?;
@@ -331,7 +341,7 @@ pub fn pack(root: &Path, name: &str, output: Option<&Path>) -> Result<PathBuf> {
     let mm = major_minor(&version);
     fs::write(
         staging.join(CHECKSUMS),
-        checksums(root, &python_root, &python_dir, &mm)?,
+        checksums(root, &python_root, &python_dir, &mm, slim)?,
     )?;
 
     let mut tar = Command::new("tar");
@@ -362,6 +372,10 @@ pub fn pack(root: &Path, name: &str, output: Option<&Path>) -> Result<PathBuf> {
     }
     for demos in ["lib/*/demos", "tcl/*/demos"] {
         tar.arg(format!("--exclude={python_dir}/{demos}"));
+    }
+    if slim {
+        // The interpreter is statically linked; libpython only serves embedders.
+        tar.arg(format!("--exclude={python_dir}/lib/libpython*"));
     }
     tar.arg(format!("--exclude={python_dir}/share/man"))
         .arg("-C")

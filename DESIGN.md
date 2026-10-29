@@ -210,10 +210,16 @@ Everything below is in, pure Rust on the existing three crates plus `clap_comple
 | Provenance | `require-hashes` | `main.rs` |
 | Ops | `doctor`, `env list`, `clean`, `completions` | `doctor.rs`, `envs.rs` |
 
-Deferred, in order: native dependencies via conda-forge (phase 2), GPU-aware
-resolution (`add torch --cuda`), SHA-256 verification of Python downloads against
-python-build-standalone's `SHA256SUMS`, fish/csh activate scripts, and the in-process
-resolver that removes the `uv` binary.
+Follow-up batch (2026-10-29), also done: `export wheelhouse` (lock → exact wheels per
+target, hash-checked), checksum verification of Python downloads and release archives,
+`run` drift note, `policy` with sources, `--json` on audit/licenses/verify/policy, two
+Python versions per offline bundle, `python uninstall|pin`, `shell`, fish/csh activate,
+MSI/deb/rpm packages, `SSL_CERT_FILE`/`VIVAR_CA_BUNDLE` for private CAs, org policy
+delivered by the installers, `upgrade --check`, `add --cuda` (PyTorch index routing) and a
+driver-version check in `verify`, `export requirements`, `pack --slim`, `init --lib`.
+
+Deferred: native dependencies via conda-forge (phase 2), full GPU-aware resolution
+beyond index routing, the in-process resolver that removes the `uv` binary, man pages.
 
 ## 13. Open questions
 

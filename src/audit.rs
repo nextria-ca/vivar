@@ -67,17 +67,21 @@ pub fn run(root: &Path) -> Result<Vec<Finding>> {
 fn post(url: &str, body: &str) -> Result<Value> {
     let tmp = env::temp_dir().join(format!("vivar-audit-{}.json", std::process::id()));
     fs::write(&tmp, body)?;
-    let out = Command::new("curl")
-        .args([
-            "-sSf",
-            "-X",
-            "POST",
-            "-H",
-            "Content-Type: application/json",
-            "--data-binary",
-        ])
-        .arg(format!("@{}", tmp.display()))
-        .arg(url)
+    let mut cmd = Command::new("curl");
+    cmd.args([
+        "-sSf",
+        "-X",
+        "POST",
+        "-H",
+        "Content-Type: application/json",
+        "--data-binary",
+    ])
+    .arg(format!("@{}", tmp.display()))
+    .arg(url);
+    if let Some(ca) = crate::upgrade::ca_bundle() {
+        cmd.arg("--cacert").arg(ca);
+    }
+    let out = cmd
         .output()
         .context("running curl (needed to reach the vulnerability database)")?;
     let _ = fs::remove_file(&tmp);

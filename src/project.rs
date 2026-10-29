@@ -7,8 +7,10 @@ use toml_edit::{value, Array, DocumentMut, Item, Table};
 
 pub const PYPROJECT: &str = "pyproject.toml";
 
-/// Writes `pyproject.toml`, `.python-version` and the vivar defaults for a new project.
-pub fn init_files(root: &Path, name: &str, version: [u32; 3]) -> Result<()> {
+/// Writes `pyproject.toml`, `.python-version` and the vivar defaults for a new
+/// project. A library also gets a build backend and a `src/<package>/` layout,
+/// which is what `vivar build` needs.
+pub fn init_files(root: &Path, name: &str, version: [u32; 3], lib: bool) -> Result<()> {
     let [major, minor, _] = version;
     let mut doc = DocumentMut::new();
     let mut project = Table::new();
@@ -17,9 +19,87 @@ pub fn init_files(root: &Path, name: &str, version: [u32; 3]) -> Result<()> {
     project["requires-python"] = value(format!(">={major}.{minor}"));
     project["dependencies"] = value(Array::new());
     doc["project"] = Item::Table(project);
+    if lib {
+        let mut build = Table::new();
+        let mut requires = Array::new();
+        requires.push("hatchling");
+        build["requires"] = value(requires);
+        build["build-backend"] = value("hatchling.build");
+        doc["build-system"] = Item::Table(build);
+        let package = root.join("src").join(name.replace('-', "_"));
+        fs::create_dir_all(&package)?;
+        let init = package.join("__init__.py");
+        if !init.exists() {
+            fs::write(init, "")?;
+        }
+    }
     fs::write(root.join(PYPROJECT), doc.to_string())?;
     fs::write(root.join(".python-version"), format!("{major}.{minor}\n"))?;
     write_defaults(root)
+}
+
+/// Routes `packages` to the PyTorch index for a CUDA version: an explicit
+/// `[[tool.uv.index]]` plus `[tool.uv.sources]` entries, so uv (and anyone
+/// without vivar) resolves them from there and nothing else from it.
+pub fn route_to_cuda_index(root: &Path, packages: &[String], cuda: &str) -> Result<()> {
+    let tag = format!("cu{}", cuda.replace('.', ""));
+    let index_name = format!("pytorch-{tag}");
+    let path = root.join(PYPROJECT);
+    let mut doc: DocumentMut = fs::read_to_string(&path)?.parse()?;
+    let mut implicit = Table::new();
+    implicit.set_implicit(true);
+    let tool = doc
+        .entry("tool")
+        .or_insert(Item::Table(implicit.clone()))
+        .as_table_mut()
+        .context("`tool` is not a table")?;
+    let uv = tool
+        .entry("uv")
+        .or_insert(Item::Table(implicit))
+        .as_table_mut()
+        .context("`tool.uv` is not a table")?;
+
+    let indexes = uv
+        .entry("index")
+        .or_insert(Item::ArrayOfTables(toml_edit::ArrayOfTables::new()))
+        .as_array_of_tables_mut()
+        .context("`tool.uv.index` is not an array of tables")?;
+    if !indexes
+        .iter()
+        .any(|t| t.get("name").and_then(Item::as_str) == Some(&index_name))
+    {
+        let mut index = Table::new();
+        index["name"] = value(&index_name);
+        index["url"] = value(format!("https://download.pytorch.org/whl/{tag}"));
+        index["explicit"] = value(true);
+        indexes.push(index);
+    }
+    let sources = uv
+        .entry("sources")
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .context("`tool.uv.sources` is not a table")?;
+    for package in packages {
+        let mut source = toml_edit::InlineTable::new();
+        source.insert("index", index_name.as_str().into());
+        sources[&normalize(requirement_name(package))] = value(source);
+    }
+    fs::write(&path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Pins the project's Python series in `.python-version` and `requires-python`'s floor.
+pub fn pin_python(root: &Path, version: [u32; 3]) -> Result<()> {
+    let [major, minor, _] = version;
+    fs::write(root.join(".python-version"), format!("{major}.{minor}\n"))?;
+    let path = root.join(PYPROJECT);
+    let mut doc: DocumentMut = fs::read_to_string(&path)?.parse()?;
+    if let Some(project) = doc.get_mut("project").and_then(Item::as_table_mut) {
+        if project.contains_key("requires-python") {
+            project["requires-python"] = value(format!(">={major}.{minor}"));
+        }
+    }
+    fs::write(&path, doc.to_string())?;
+    Ok(())
 }
 
 /// A valid project name derived from the directory name.
@@ -648,6 +728,49 @@ lint = ["ruff"]
             ..Default::default()
         });
         assert_eq!(disjoint.allow_licenses, Some(Vec::new()));
+    }
+
+    #[test]
+    fn routes_packages_to_a_cuda_index() {
+        let tmp = TempDir::new("cuda");
+        fs::write(
+            tmp.0.join(PYPROJECT),
+            "[project]\nname = \"t\"\ndependencies = []\n",
+        )
+        .unwrap();
+        route_to_cuda_index(&tmp.0, &["torch>=2".into(), "torchvision".into()], "12.4").unwrap();
+        route_to_cuda_index(&tmp.0, &["torchaudio".into()], "12.4").unwrap();
+        let text = fs::read_to_string(tmp.0.join(PYPROJECT)).unwrap();
+        assert_eq!(
+            text.matches("download.pytorch.org/whl/cu124").count(),
+            1,
+            "{text}"
+        );
+        assert!(text.contains("explicit = true"), "{text}");
+        for pkg in ["torch", "torchvision", "torchaudio"] {
+            assert!(
+                text.contains(&format!("{pkg} = {{ index = \"pytorch-cu124\" }}")),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn pins_python_series() {
+        let tmp = TempDir::new("pin");
+        fs::write(
+            tmp.0.join(PYPROJECT),
+            "[project]\nname = \"t\"\nrequires-python = \">=3.10\"\n",
+        )
+        .unwrap();
+        pin_python(&tmp.0, [3, 13, 2]).unwrap();
+        assert_eq!(
+            fs::read_to_string(tmp.0.join(".python-version")).unwrap(),
+            "3.13\n"
+        );
+        assert!(fs::read_to_string(tmp.0.join(PYPROJECT))
+            .unwrap()
+            .contains("requires-python = \">=3.13\""));
     }
 
     #[test]

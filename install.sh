@@ -16,6 +16,8 @@
 #   VIVAR_ARCHIVE      local file or URL of a release archive to install instead
 #   GITHUB_TOKEN       used for private-repo downloads when gh isn't logged in
 #   VIVAR_SKIP_UV=1    don't install uv
+#   VIVAR_POLICY_URL   org policy file to install as ~/.config/vivar/policy.toml
+#                      (an offline bundle may carry one as policy.toml next to this script)
 set -eu
 
 REPO=nextria-ca/vivar
@@ -94,6 +96,19 @@ if [ -d "$HERE/python" ]; then
       echo "installed python $name to $PYDIR"
     fi
   done
+fi
+
+# Org policy: from the bundle, or from a URL given by whoever rolls vivar out.
+CONF=${XDG_CONFIG_HOME:-$HOME/.config}/vivar
+if [ -f "$HERE/policy.toml" ] || [ -n "${VIVAR_POLICY_URL:-}" ]; then
+  mkdir -p "$CONF"
+  if [ -f "$CONF/policy.toml" ]; then
+    echo "keeping existing $CONF/policy.toml"
+  elif [ -f "$HERE/policy.toml" ]; then
+    cp "$HERE/policy.toml" "$CONF/policy.toml" && echo "installed org policy to $CONF/policy.toml"
+  else
+    curl -LsSf "$VIVAR_POLICY_URL" -o "$CONF/policy.toml" && echo "installed org policy to $CONF/policy.toml"
+  fi
 fi
 
 case ":$PATH:" in

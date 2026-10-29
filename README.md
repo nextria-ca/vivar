@@ -78,18 +78,39 @@ Expand-Archive vivar-offline-x86_64-pc-windows-msvc.zip -DestinationPath .
 powershell -ExecutionPolicy Bypass -File vivar-offline-x86_64-pc-windows-msvc\install.ps1
 ```
 
-The runtime lands in uv's managed-Python directory, so `vivar init` and
-`vivar python list` find it right away. Packages come from one of two places:
+The bundle carries Python 3.12 and 3.13 (the list is one line in the release
+workflow). The runtimes land in uv's managed-Python directory, so `vivar init` and
+`vivar python list` find them right away. Drop a `policy.toml` next to the installer
+before distributing the bundle and every machine gets the org policy too
+(`VIVAR_POLICY_URL` does the same for the online installer). Packages come from one
+of two places:
 
 - **Whole environments**: `vivar pack` on a connected machine, `vivar unpack` on the
   offline one. The bundle includes the interpreter and needs nothing else.
-- **A wheelhouse**: a directory of wheels. Set `index-url` in `[tool.vivar.policy]` to that
-  directory (absolute, or relative to the project) and vivar resolves from it alone,
-  never PyPI. Fill it on a connected machine with pip, for example
-  `uvx pip download -d wheelhouse numpy pandas` (add `--platform`/`--python-version`
-  `--only-binary=:all:` when the target machine differs).
+- **A wheelhouse**: a directory of wheels. On a connected machine with the project,
+  `vivar export wheelhouse --target linux-x86_64 --python 3.12` downloads the exact
+  wheels `uv.lock` pins for that machine and checks each against the lock's hash. Copy
+  the folder over, set `index-url` in `[tool.vivar.policy]` to it (absolute, or relative
+  to the project), and vivar resolves from it alone, never PyPI.
 
 From source, with a Rust toolchain: `cargo install --git https://github.com/nextria-ca/vivar`.
+
+### IT rollout
+
+Each release also carries a per-machine **MSI** (`vivar-<version>-<target>.msi`, adds
+`C:\Program Files\vivar` to the system PATH; suitable for Intune or Group Policy) and
+**.deb** / **.rpm** packages that install `/usr/bin/vivar`. uv and Python runtimes are
+still fetched on first use, or come from an offline bundle.
+
+### Proxies and private CAs
+
+Downloads go through `curl` and `uv`; both honour `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY`.
+For a corporate CA set `SSL_CERT_FILE=/path/to/ca-bundle.pem` once: curl, uv and
+Python all read it (`VIVAR_CA_BUNDLE` overrides it for vivar's own downloads only).
+`vivar doctor` shows what is in effect.
+
+Release archives are checked against the release's `SHA256SUMS` by `vivar upgrade`,
+and Python runtimes against python-build-standalone's published checksums.
 
 ### Platforms
 
@@ -122,6 +143,7 @@ vivar python list               # --all adds what can be downloaded
 More, all from the same binary:
 
 ```sh
+vivar shell                     # an interactive shell with the env activated
 vivar run test                  # a [tool.vivar.scripts] task; extra args are appended
 vivar run tool.py               # a PEP 723 script: its inline deps get a cached env of their own
 vivar tool run ruff check .     # tools in isolated envs (pipx-style); `tool install` links them into ~/.local/bin
@@ -133,12 +155,21 @@ vivar licenses                  # every installed package with its license
 vivar audit                     # known vulnerabilities (OSV) for the locked packages
 vivar build                     # sdist + wheel into dist/
 vivar export docker             # a Dockerfile that installs exactly what uv.lock pins
+vivar export requirements       # pinned, hashed requirements.txt for pip-only consumers
+vivar export wheelhouse --target windows-x86_64 --python 3.12   # the lock's wheels, for offline installs
+vivar policy                    # the effective policy and which file each rule came from
+vivar add torch --cuda 12.4     # route packages to the PyTorch index for that CUDA version
+vivar python pin 3.13           # repin the project and rebuild .venv on it
 vivar diff a.tar.gz b.tar.gz    # what changed between two bundles
 vivar doctor                    # what's installed, configured, broken
 vivar env list / vivar clean    # what vivar keeps on disk; drop script envs and caches
 vivar completions zsh           # shell completion (bash, zsh, fish, powershell, elvish)
-vivar upgrade                   # vivar itself
+vivar upgrade                   # vivar itself (`--check` only reports)
 ```
+
+`audit`, `licenses`, `verify` and `policy` take `--json` for CI and compliance tooling.
+`vivar run` prints a one-line note when `uv.lock` changed since the last sync.
+Activate scripts exist for sh/bash/zsh, fish, csh/tcsh, PowerShell and cmd.
 
 Tasks live in `pyproject.toml`:
 

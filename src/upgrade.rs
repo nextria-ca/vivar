@@ -29,6 +29,19 @@ pub fn target() -> Result<String> {
     }
 }
 
+/// `vivar upgrade --check`: report the latest release without installing it.
+pub fn check() -> Result<()> {
+    let api = format!("https://api.github.com/repos/{REPO}/releases/latest");
+    let release = String::from_utf8_lossy(&fetch(&api, None)?).into_owned();
+    let tag = json_str(&release, "tag_name").ok_or_else(|| anyhow!("no release found at {api}"))?;
+    if tag.trim_start_matches('v') == VERSION {
+        println!("vivar {VERSION} is the latest release");
+    } else {
+        println!("vivar {VERSION} installed; {tag} is available (run `vivar upgrade`)");
+    }
+    Ok(())
+}
+
 pub fn run(version: Option<&str>, from: Option<&str>) -> Result<()> {
     let current = env::current_exe().context("locating the running vivar")?;
     let tmp = env::temp_dir().join(format!("vivar-upgrade-{}", std::process::id()));
@@ -75,6 +88,24 @@ fn upgrade(current: &Path, version: Option<&str>, from: Option<&str>, tmp: &Path
             println!("downloading vivar {tag} for {target}");
             let archive = tmp.join(&asset);
             fs::write(&archive, fetch(&url, Some("application/octet-stream"))?)?;
+            // Every release ships SHA256SUMS; the archive must match it.
+            if let Some(sums_url) = asset_url(&release, "SHA256SUMS") {
+                let sums =
+                    String::from_utf8_lossy(&fetch(&sums_url, Some("application/octet-stream"))?)
+                        .into_owned();
+                let expected = sums
+                    .lines()
+                    .filter_map(|l| l.split_once("  "))
+                    .find(|(_, name)| *name == asset)
+                    .map(|(digest, _)| digest.to_owned())
+                    .ok_or_else(|| anyhow!("SHA256SUMS of {tag} does not list {asset}"))?;
+                let actual = crate::sha256::file(&archive)?;
+                if actual != expected {
+                    bail!("{asset} failed its checksum (got {actual}, expected {expected}); not installing it");
+                }
+            } else {
+                println!("warning: release {tag} has no SHA256SUMS; archive not verified");
+            }
             extract(&archive, tmp)?
         }
     };
@@ -128,6 +159,9 @@ fn fetcher(url: &str, accept: Option<&str>, output: Option<&Path>) -> Result<std
     } else {
         cmd = Command::new("curl");
         cmd.args(["-LsSf", url]);
+        if let Some(ca) = ca_bundle() {
+            cmd.arg("--cacert").arg(ca);
+        }
         if let Some(path) = output {
             cmd.arg("-o").arg(path);
         }
@@ -151,6 +185,12 @@ fn fetcher(url: &str, accept: Option<&str>, output: Option<&Path>) -> Result<std
         bail!("fetching {url} failed: {err}{hint}");
     }
     Ok(out)
+}
+
+/// A private CA bundle for curl: `VIVAR_CA_BUNDLE`, else `SSL_CERT_FILE` (which
+/// uv and Python honour too, so one variable covers every download).
+pub fn ca_bundle() -> Option<std::ffi::OsString> {
+    env::var_os("VIVAR_CA_BUNDLE").or_else(|| env::var_os("SSL_CERT_FILE"))
 }
 
 /// Value of the first `"key": "value"` in a JSON document (no escapes needed

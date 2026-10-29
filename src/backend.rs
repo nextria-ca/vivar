@@ -25,6 +25,8 @@ pub trait Backend {
     fn build(&self, dir: &Path) -> Result<()>;
     /// Installs requirement specs into the environment whose interpreter is `python`.
     fn install(&self, python: &Path, specs: &[String]) -> Result<()>;
+    /// Writes the lock as a pinned, hashed `requirements.txt`.
+    fn export_requirements(&self, dir: &Path, output: &Path) -> Result<()>;
 }
 
 const UV_INSTALL_HINT: &str = "install it with `curl -LsSf https://astral.sh/uv/install.sh | sh`";
@@ -136,6 +138,21 @@ impl Backend for UvBackend {
     fn build(&self, dir: &Path) -> Result<()> {
         let mut cmd = self.uv(dir);
         cmd.arg("build");
+        Self::check(cmd)
+    }
+
+    fn export_requirements(&self, dir: &Path, output: &Path) -> Result<()> {
+        let mut cmd = self.uv(dir);
+        cmd.args([
+            "export",
+            "--format",
+            "requirements.txt",
+            "--no-dev",
+            "--frozen",
+            "--quiet",
+            "--output-file",
+        ])
+        .arg(output);
         Self::check(cmd)
     }
 

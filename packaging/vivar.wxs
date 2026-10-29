@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Per-machine MSI for IT rollout (Intune, Group Policy). Installs vivar.exe
+     under Program Files and adds it to the system PATH. Version and source are
+     passed by the release workflow: candle -dVersion=… -dSource=… -->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="vivar" Language="1033" Version="$(var.Version)"
+           Manufacturer="Nextria" UpgradeCode="7d1f2c4e-5b3a-4c0e-9f61-2a8b4e6c0d11">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine"
+             Description="vivar: Python environment manager" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of vivar is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="vivar">
+          <Component Id="Binary" Guid="3c9e8a52-6f1d-4b7e-8a2c-5d0e1f6b7a21" Win64="yes">
+            <File Id="vivar.exe" Source="$(var.Source)" KeyPath="yes" />
+            <Environment Id="Path" Name="PATH" Value="[INSTALLFOLDER]" Permanent="no"
+                         Part="last" Action="set" System="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+    <Feature Id="Main" Level="1">
+      <ComponentRef Id="Binary" />
+    </Feature>
+  </Product>
+</Wix>

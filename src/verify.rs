@@ -23,7 +23,7 @@ pub fn find_venv(path: &Path) -> Result<PathBuf> {
 }
 
 /// Returns the exit code: 0 when everything works, 1 when something is broken.
-pub fn run(venv: &Path, allow_missing_gpu: bool, verbose: bool) -> Result<i32> {
+pub fn run(venv: &Path, allow_missing_gpu: bool, verbose: bool, json: bool) -> Result<i32> {
     let python = if cfg!(windows) {
         venv.join("Scripts").join("python.exe")
     } else {
@@ -36,6 +36,9 @@ pub fn run(venv: &Path, allow_missing_gpu: bool, verbose: bool) -> Result<i32> {
     }
     if verbose {
         cmd.arg("--verbose");
+    }
+    if json {
+        cmd.arg("--json");
     }
     let mut child = cmd.spawn().with_context(|| {
         format!(

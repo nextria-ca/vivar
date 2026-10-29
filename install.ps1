@@ -16,6 +16,8 @@
 #   GITHUB_TOKEN       used for private-repo downloads when gh isn't logged in
 #   VIVAR_SKIP_UV=1    don't install uv
 #   VIVAR_SKIP_PATH=1  don't add the install dir to the user PATH
+#   VIVAR_POLICY_URL   org policy file to install as %APPDATA%\vivar\policy.toml
+#                      (an offline bundle may carry one as policy.toml next to this script)
 $ErrorActionPreference = "Stop"
 
 function Test-GhLogin {
@@ -93,6 +95,17 @@ if (Test-Path $pythons) {
     if (Test-Path $dest) { Write-Host "python $($p.Name) already installed" }
     else { Copy-Item $p.FullName $dest -Recurse; Write-Host "installed python $($p.Name) to $pyDir" }
   }
+}
+
+# Org policy: from the bundle, or from a URL given by whoever rolls vivar out.
+$bundledPolicy = Join-Path $Here "policy.toml"
+if ((Test-Path $bundledPolicy) -or $env:VIVAR_POLICY_URL) {
+  $conf = Join-Path $env:APPDATA "vivar"
+  New-Item -ItemType Directory -Path $conf -Force | Out-Null
+  $dest = Join-Path $conf "policy.toml"
+  if (Test-Path $dest) { Write-Host "keeping existing $dest" }
+  elseif (Test-Path $bundledPolicy) { Copy-Item $bundledPolicy $dest; Write-Host "installed org policy to $dest" }
+  else { Invoke-WebRequest $env:VIVAR_POLICY_URL -OutFile $dest; Write-Host "installed org policy to $dest" }
 }
 
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")

@@ -13,6 +13,10 @@ pub const BIN: &str = if cfg!(windows) { "Scripts" } else { "bin" };
 
 const ACTIVATE_SH: &str = include_str!("venv/activate");
 const ACTIVATE_PS1: &str = include_str!("venv/Activate.ps1");
+const ACTIVATE_FISH: &str = include_str!("venv/activate.fish");
+const ACTIVATE_CSH: &str = include_str!("venv/activate.csh");
+/// Hash of the lockfile the env was last synced from, for drift warnings.
+const SYNCED: &str = "vivar-synced.sha256";
 #[cfg(windows)]
 const ACTIVATE_BAT: &str = include_str!("venv/activate.bat");
 #[cfg(windows)]
@@ -78,6 +82,8 @@ pub fn create(venv: &Path, python: &Installed, prompt: &str) -> Result<()> {
     };
     fs::write(bin.join("activate"), fill(ACTIVATE_SH))?;
     fs::write(bin.join("Activate.ps1"), fill(ACTIVATE_PS1))?;
+    fs::write(bin.join("activate.fish"), fill(ACTIVATE_FISH))?;
+    fs::write(bin.join("activate.csh"), fill(ACTIVATE_CSH))?;
     #[cfg(windows)]
     {
         fs::write(bin.join("activate.bat"), fill(ACTIVATE_BAT))?;
@@ -109,6 +115,66 @@ pub fn interpreter(request: Option<&str>) -> Result<Installed> {
         Some(p) => Ok(p),
         None => python::install(request.unwrap_or("3")),
     }
+}
+
+/// Records that `root/.venv` matches `root/uv.lock` right now.
+pub fn mark_synced(root: &Path) {
+    let venv = root.join(".venv");
+    if let Ok(digest) = crate::sha256::file(&root.join(crate::lock::LOCKFILE)) {
+        let _ = fs::write(venv.join(SYNCED), digest);
+    }
+}
+
+/// One line on stderr when the lockfile changed since the last vivar sync.
+/// Silent when vivar never synced this env (someone else may keep it current).
+pub fn warn_if_stale(root: &Path) {
+    let venv = root.join(".venv");
+    let (Ok(recorded), Ok(current)) = (
+        fs::read_to_string(venv.join(SYNCED)),
+        crate::sha256::file(&root.join(crate::lock::LOCKFILE)),
+    ) else {
+        return;
+    };
+    if recorded.trim() != current {
+        eprintln!("note: uv.lock changed since the last sync; run `vivar sync` to update .venv");
+    }
+}
+
+/// `vivar shell`: an interactive shell with the env activated.
+pub fn shell(root: &Path, prompt: &str) -> Result<i32> {
+    let venv = root.join(".venv");
+    if !venv.join("pyvenv.cfg").exists() {
+        bail!("{} has no .venv yet; run `vivar sync`", root.display());
+    }
+    let bin = venv.join(BIN);
+    let mut path = OsString::from(bin.as_os_str());
+    path.push(if cfg!(windows) { ";" } else { ":" });
+    path.push(env::var_os("PATH").unwrap_or_default());
+
+    let shell = env::var_os("SHELL")
+        .filter(|s| !s.is_empty())
+        .or_else(|| env::var_os("COMSPEC"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }));
+    let mut cmd = Command::new(&shell);
+    cmd.env("VIRTUAL_ENV", &venv)
+        .env("VIRTUAL_ENV_PROMPT", format!("({prompt}) "))
+        .env("PATH", path)
+        .env_remove("PYTHONHOME");
+    let name = shell.file_stem().and_then(|n| n.to_str()).unwrap_or("");
+    if matches!(name, "bash" | "zsh" | "sh" | "dash") {
+        cmd.env("PS1", format!(r"({prompt}) \u@\h:\w\$ "));
+    } else if name == "cmd" {
+        cmd.env("PROMPT", format!("({prompt}) $P$G"));
+    }
+    println!(
+        "entering the {} environment; exit the shell to leave",
+        venv.display()
+    );
+    let status = cmd
+        .status()
+        .with_context(|| format!("failed to start {}", shell.display()))?;
+    Ok(status.code().unwrap_or(1))
 }
 
 /// The env's interpreter.

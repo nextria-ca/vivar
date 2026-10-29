@@ -9,16 +9,35 @@ See [DESIGN.md](DESIGN.md) for the why and the roadmap, and
 
 ## Status
 
-Phase 0 (MVP) is implemented and tested. Projects, virtual environments, Python
-builds, running, bundles, verification and upgrades are vivar's own code; only
-dependency resolution and installation (`add`, `remove`, `lock`, `sync`) are
-delegated to [`uv`](https://docs.astral.sh/uv/) for now. A vivar project is a
-plain, standards-based Python project: `pyproject.toml` (PEP 621),
-`.python-version`, a normal `.venv`, and `uv.lock`. Anyone without vivar can
-still use it with `uv` or `pip`.
+**Usable today, pre-1.0.** Phases 0, 3 and 4 of the [design](DESIGN.md) are implemented,
+tested on Linux, macOS and Windows in CI (72 tests), and reviewed. No release has been
+tagged yet; see Install for how to get it in the meantime.
 
-Later phases swap `uv` out for an in-process engine (and add conda-forge native
-dependencies) behind the same CLI. See the roadmap in DESIGN.md.
+What works:
+
+- **Projects and environments**: `init`, `add`, `remove`, `lock`, `sync`, `run`, `shell`,
+  tasks, PEP 723 scripts, tools, workspaces, Python install/pin/uninstall, Jupyter kernels.
+- **Portable bundles**: `pack`/`unpack` with checksums, `pack --target` for another
+  machine, slim and zstd variants, `verify` on the destination (imports, native libs,
+  CUDA driver and a real torch GPU check), `diff` between bundles.
+- **Offline**: offline installer bundles (vivar + uv + Python), wheelhouse export from the
+  lockfile, org policy delivered with the installer.
+- **Policy**: deny list, mirror, license allowlist, hash and wheels-only requirements,
+  telemetry/offline switches, org-wide policy file, OSV audit, machine-readable reports.
+- **AI/GPU**: GPU detection, PyTorch index selection, machine profiles (`cpu`, `cu124`…)
+  sharing one lockfile, CUDA-aware Docker export.
+- **Rollout**: online installers, MSI/deb/rpm packages, self-upgrade with verified
+  downloads, shell completions, `doctor`.
+
+How it is built: projects, virtual environments, Python builds, running, bundles,
+verification, policy and upgrades are vivar's own code; dependency resolution and
+installation (`add`, `remove`, `lock`, `sync`) are delegated to
+[`uv`](https://docs.astral.sh/uv/) for now. A vivar project is a plain, standards-based
+Python project: `pyproject.toml` (PEP 621), `.python-version`, a normal `.venv`, and
+`uv.lock`. Anyone without vivar can still use it with `uv` or `pip`.
+
+Not yet: native (conda-forge) dependencies, delta bundles, an in-process resolver that
+removes the `uv` binary, and model-weight management (out of scope by decision).
 
 ## Install
 

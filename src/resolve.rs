@@ -45,6 +45,9 @@ pub struct Resolver<'a> {
     envs: Vec<(MarkerEnv, Target)>,
     /// The Python of each environment, for `requires-python` checks.
     pythons: Vec<Version>,
+    /// For environments standing in for a whole minor: the lowest and highest
+    /// patch of that minor inside the project's range (none for this machine).
+    patch_bounds: Vec<Option<(Version, Version)>>,
     wheels_only: bool,
     /// Versions to keep when still acceptable (the current lock).
     prefer: BTreeMap<String, Version>,
@@ -98,6 +101,7 @@ impl<'a> Resolver<'a> {
             index,
             envs: Vec::new(),
             pythons: Vec::new(),
+            patch_bounds: Vec::new(),
             wheels_only,
             prefer: BTreeMap::new(),
             upgrade: BTreeSet::new(),
@@ -117,6 +121,7 @@ impl<'a> Resolver<'a> {
         let series = format!("{}.{}", machine[0], machine[1]);
         let here = Target::new(None, &series).expect("current platform is supported");
         let mut envs = vec![(MarkerEnv::current(machine), here)];
+        let mut bounds = vec![None];
         let [maj, min, _] = floor;
         for os in ["linux", "macos", "windows"] {
             for arch in ["x86_64", "aarch64"] {
@@ -124,20 +129,15 @@ impl<'a> Resolver<'a> {
                     if let Ok(t) =
                         Target::new(Some(&format!("{os}-{arch}")), &format!("{maj}.{minor}"))
                     {
-                        // Two samples per minor, its lowest patch (the floor keeps
-                        // its own, `>=3.10.1`) and a high one, so markers comparing
-                        // patch levels (`>= '3.12.1'`) land on one of them. The
-                        // project's requires-python filters them afterwards.
+                        // One sample per minor, at its lowest patch (the floor
+                        // keeps its own, `>=3.10.1`); the environment stands
+                        // for the minor's whole patch range, see `variants`.
                         let low = if minor == min { floor[2] } else { 0 };
-                        for patch in [low, 99] {
-                            if patch == low && low == 99 {
-                                continue;
-                            }
-                            envs.push((
-                                MarkerEnv::for_target(os, arch, [maj, minor, patch]),
-                                t.clone(),
-                            ));
-                        }
+                        envs.push((MarkerEnv::for_target(os, arch, [maj, minor, low]), t));
+                        bounds.push(Some((
+                            Version::parse(&format!("{maj}.{minor}.{low}")).expect("numeric"),
+                            Version::parse(&format!("{maj}.{minor}.99")).expect("numeric"),
+                        )));
                     }
                 }
             }
@@ -147,10 +147,27 @@ impl<'a> Resolver<'a> {
             .map(|(e, _)| Version::parse(&e.python_full_version).expect("numeric version"))
             .collect();
         self.envs = envs;
+        self.patch_bounds = bounds;
     }
 
-    /// Whether a `requires-python` holds on every environment in `envs`: one
-    /// version per package means it has to serve all of them.
+    /// The Pythons environment `i` may run: its sample, and for a whole-minor
+    /// environment both ends of its patch range. A patch-level comparison is
+    /// taken to hold when it holds on any of them: an over-approximation that
+    /// can only bring a dependency in, never lose one.
+    fn variants(&self, i: usize) -> Vec<Version> {
+        let mut v = vec![self.pythons[i].clone()];
+        if let Some((lo, hi)) = &self.patch_bounds[i] {
+            for p in [lo, hi] {
+                if !v.contains(p) {
+                    v.push(p.clone());
+                }
+            }
+        }
+        v
+    }
+
+    /// Whether a `requires-python` can hold on every environment in `envs`:
+    /// one version per package means it has to serve all of them.
     fn python_ok(&self, requires_python: Option<&str>, envs: &BTreeSet<usize>) -> bool {
         let Some(rp) = requires_python else {
             return true;
@@ -158,62 +175,75 @@ impl<'a> Resolver<'a> {
         let Ok(spec) = Specifier::parse(rp) else {
             return true;
         };
-        envs.iter()
-            .all(|&i| spec.matches_allowing_pre(&self.pythons[i]))
+        envs.iter().all(|&i| {
+            self.variants(i)
+                .iter()
+                .any(|p| spec.matches_allowing_pre(p))
+        })
     }
 
     /// Keeps only the environments inside the project's `requires-python`
-    /// (this machine always stays): a `>=3.12,<3.13` project is not held to
-    /// what 3.13 would need.
+    /// (this machine always stays), each narrowed to the patches of its minor
+    /// that are in range: a `>=3.12,<3.13` project is not held to what 3.13
+    /// would need, and `!=3.13.0` does not rule 3.13 out.
     pub fn requires_python(mut self, spec: Option<&str>) -> Self {
-        if let Some(spec) = spec.and_then(|s| Specifier::parse(s).ok()) {
-            // A minor stays when any patch of it is in range (`!=3.13.0` does
-            // not rule out 3.13): the environment then samples that patch.
-            let mut keep = Vec::with_capacity(self.pythons.len());
-            for i in 0..self.pythons.len() {
-                if i == 0 || spec.matches_allowing_pre(&self.pythons[i]) {
+        let Some(spec) = spec.and_then(|s| Specifier::parse(s).ok()) else {
+            return self;
+        };
+        let mut keep = Vec::with_capacity(self.pythons.len());
+        for i in 0..self.pythons.len() {
+            let Some((lo, _)) = self.patch_bounds[i].clone() else {
+                keep.push(true);
+                continue;
+            };
+            let s = lo.to_string();
+            let mut it = s.split('.');
+            let (maj, min) = (
+                it.next().unwrap_or("3").to_owned(),
+                it.next().unwrap_or("0").to_owned(),
+            );
+            let at = |patch: u32| Version::parse(&format!("{maj}.{min}.{patch}")).ok();
+            let first = (0..=99)
+                .filter_map(at)
+                .find(|v| spec.matches_allowing_pre(v));
+            let last = (0..=99)
+                .rev()
+                .filter_map(at)
+                .find(|v| spec.matches_allowing_pre(v));
+            match (first, last) {
+                (Some(lo), Some(hi)) => {
+                    self.envs[i].0.python_full_version = lo.to_string();
+                    self.pythons[i] = lo.clone();
+                    self.patch_bounds[i] = Some((lo, hi));
                     keep.push(true);
-                    continue;
                 }
-                let (maj, min) = {
-                    let s = self.pythons[i].to_string();
-                    let mut it = s.split('.');
-                    (
-                        it.next().unwrap_or("3").to_owned(),
-                        it.next().unwrap_or("0").to_owned(),
-                    )
-                };
-                let fallback = (0..=30)
-                    .filter_map(|patch| Version::parse(&format!("{maj}.{min}.{patch}")).ok())
-                    .find(|v| spec.matches_allowing_pre(v));
-                match fallback {
-                    Some(v) => {
-                        self.envs[i].0.python_full_version = v.to_string();
-                        self.pythons[i] = v;
-                        keep.push(true);
-                    }
-                    None => keep.push(false),
-                }
+                _ => keep.push(false),
             }
-            let mut i = 0;
-            self.envs.retain(|_| {
-                i += 1;
-                keep[i - 1]
-            });
-            let mut j = 0;
-            self.pythons.retain(|_| {
-                j += 1;
-                keep[j - 1]
-            });
         }
+        let mut i = 0;
+        self.envs.retain(|_| {
+            i += 1;
+            keep[i - 1]
+        });
+        let mut j = 0;
+        self.pythons.retain(|_| {
+            j += 1;
+            keep[j - 1]
+        });
+        let mut k = 0;
+        self.patch_bounds.retain(|_| {
+            k += 1;
+            keep[k - 1]
+        });
         self
     }
 
-    /// One environment only (this machine): for installs into an existing
-    /// interpreter, where no other platform or Python has to be served.
+    /// One environment only (this machine, at its exact patch): for installs
+    /// into an existing interpreter, where nothing else has to be served.
     pub fn single(mut self) -> Self {
         self.envs.truncate(1);
         self.pythons.truncate(1);
+        self.patch_bounds.truncate(1);
         self
     }
 
@@ -265,7 +295,13 @@ impl<'a> Resolver<'a> {
                     .filter(|(_, envs)| envs.contains(&i))
                     .map(|(k, _)| k.clone())
                     .collect();
-                eval_marker(m, &e).unwrap_or(false)
+                if !m.contains("python_full_version") {
+                    return eval_marker(m, &e).unwrap_or(false);
+                }
+                self.variants(i).iter().any(|p| {
+                    e.python_full_version = p.to_string();
+                    eval_marker(m, &e).unwrap_or(false)
+                })
             })
             .collect()
     }
@@ -903,30 +939,27 @@ mod tests {
         let pythons: BTreeSet<String> = r.pythons.iter().skip(1).map(|p| p.to_string()).collect();
         assert_eq!(
             pythons,
-            BTreeSet::from([
-                "3.12.0".to_owned(),
-                "3.12.99".to_owned(),
-                "3.13.1".to_owned(),
-                "3.13.99".to_owned()
-            ]),
+            BTreeSet::from(["3.12.0".to_owned(), "3.13.1".to_owned()]),
             "{pythons:?}"
         );
-        assert!(r
-            .envs
-            .iter()
-            .skip(1)
-            .all(|(e, _)| e.python_full_version != "3.13.0"));
-        let single = Resolver::new(&index, [3, 12, 0], true).single();
-        assert_eq!(single.envs.len(), 1);
-
-        // Patch-level markers land on one of the two samples per minor, and
-        // only within the project's range.
-        let r = Resolver::new(&index, [3, 12, 0], true).requires_python(Some(">=3.12,<3.13"));
-        let all = r.all_envs();
         let none = Extras::new();
+        let all = r.all_envs();
+        // Patch-level markers are judged over the minor's in-range patches,
+        // so neither end of an interval is lost, nor an overlap between two.
         assert!(!r
-            .where_holds(Some("python_full_version >= '3.12.1'"), &none, &all)
+            .where_holds(Some("python_full_version >= '3.12.10'"), &none, &all)
             .is_empty());
+        let upper = r.where_holds(Some("python_full_version >= '3.12.1'"), &none, &all);
+        assert!(!r
+            .where_holds(Some("python_full_version < '3.12.5'"), &none, &upper)
+            .is_empty());
+        let others: BTreeSet<usize> = all.iter().copied().filter(|&i| i != 0).collect();
+        assert!(r.python_ok(Some(">=3.12.1"), &others));
+        assert!(!r.python_ok(Some(">=3.12.1"), &all)); // this machine is exactly 3.12.0
+        assert!(r
+            .where_holds(Some("python_version >= '3.14'"), &none, &all)
+            .is_empty());
+        // Nothing outside the project's range is considered.
         let narrow =
             Resolver::new(&index, [3, 12, 0], true).requires_python(Some(">=3.12,<3.12.1"));
         assert!(narrow
@@ -936,12 +969,33 @@ mod tests {
                 &narrow.all_envs()
             )
             .is_empty());
-        assert!(r
-            .where_holds(Some("python_full_version < '3.12'"), &none, &all)
+        let bounded =
+            Resolver::new(&index, [3, 12, 0], true).requires_python(Some(">=3.12,<3.12.20"));
+        assert!(!bounded
+            .where_holds(
+                Some("python_full_version >= '3.12.10'"),
+                &none,
+                &bounded.all_envs()
+            )
             .is_empty());
-        assert!(r
-            .where_holds(Some("python_version >= '3.13'"), &none, &all)
+        assert!(bounded
+            .where_holds(
+                Some("python_full_version >= '3.12.20'"),
+                &none,
+                &bounded.all_envs()
+            )
             .is_empty());
+        // A single interpreter is exactly its patch.
+        let single = Resolver::new(&index, [3, 12, 0], true).single();
+        assert_eq!(single.envs.len(), 1);
+        assert!(single
+            .where_holds(
+                Some("python_full_version >= '3.12.1'"),
+                &none,
+                &single.all_envs()
+            )
+            .is_empty());
+        assert!(!single.python_ok(Some(">=3.12.1"), &single.all_envs()));
     }
 
     #[test]

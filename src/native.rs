@@ -11,7 +11,8 @@ use crate::lock::{Lock, Package};
 use crate::pep::{eval_marker, MarkerEnv, Requirement, Version};
 use crate::project::{self, Policy, Project};
 use crate::resolve::{
-    write_lock, Direct, Fetch, Lockable, Resolution, Resolver, Roots, Source as ResolvedSource,
+    resolve_with_forks, write_lock, Direct, Fetch, ForkNeeded, Lockable, Resolution, Resolver,
+    Roots, Source as ResolvedSource,
 };
 use crate::{dirs, install, sha256, upgrade, venv, wheelhouse};
 use anyhow::{anyhow, bail, Context, Result};
@@ -192,24 +193,58 @@ impl NativeBackend {
                 .map(|i| Index::new(Some(&i.url)))
                 .collect()
         };
-        let resolve = |roots: &Roots,
-                       group: Option<&str>,
-                       prefer: BTreeMap<String, Version>|
-         -> Result<Resolution> {
-            Resolver::new(&index, floor, self.no_build)
+        let build = |roots: &Roots,
+                     group: Option<&str>,
+                     prefer: BTreeMap<String, Version>,
+                     restrictions: &[(String, bool)]|
+         -> Result<Resolver<'_>> {
+            let mut r = Resolver::new(&index, floor, self.no_build)
                 .fetch(&builder)
                 .machine(machine)
                 .requires_python(roots.requires_python.as_deref())
                 .routes(routes_for(group)?)
                 .defaults(defaults())
                 .prefer(prefer)
-                .upgrade(upgrade, upgrade_all)
-                .resolve(roots)
+                .upgrade(upgrade, upgrade_all);
+            for (m, holds) in restrictions {
+                r = r.restrict(m, *holds);
+            }
+            Ok(r)
         };
-        // Profiles (conflicting groups) resolve one at a time on top of the
-        // base, each preferring what the base chose, and merge into one lock.
+        let resolve = |roots: &Roots,
+                       group: Option<&str>,
+                       prefer: BTreeMap<String, Version>|
+         -> Result<Resolution> {
+            build(roots, group, prefer, &[])?
+                .resolve(roots)
+                .map_err(|e| match e.downcast_ref::<ForkNeeded>() {
+                    Some(f) => anyhow!("{f}; a lock with profiles cannot also fork (uv can)"),
+                    None => e,
+                })
+        };
+        // Without profiles the lock may fork on a marker where the graph needs
+        // it. Profiles (conflicting groups) resolve one at a time on top of
+        // the base, each preferring what the base chose, and merge into one lock.
         let lockable = if profile_groups.is_empty() {
-            Lockable::single(resolve(&roots, None, prefer)?)
+            let prefer_ref = &prefer;
+            let sides = resolve_with_forks(
+                &|restrictions| build(&roots, None, prefer_ref.clone(), restrictions),
+                &roots,
+                Vec::new(),
+            )?;
+            if sides.len() == 1 {
+                Lockable::single(sides.into_iter().next().map(|(_, r)| r).unwrap())
+            } else {
+                println!(
+                    "lock forks on {}",
+                    sides
+                        .iter()
+                        .map(|(m, _)| format!("`{m}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                Lockable::merge_forks(sides)
+            }
         } else {
             let mut base_roots = roots.clone();
             base_roots.groups.retain(|g, _| !profile_groups.contains(g));
@@ -624,9 +659,19 @@ fn direct_url_of(pkg: &Package) -> Option<String> {
 /// The parts of a PEP 610 record that identify a source: the URL, the
 /// archive hash, the VCS commit. Records written by pip, uv or vivar differ
 /// in whitespace, order and extras; these do not.
-fn direct_identity(json: &str) -> Option<(String, Option<String>, Option<String>)> {
+/// (url, archive hash, vcs commit, subdirectory)
+type SourceIdentity = (String, Option<String>, Option<String>, Option<String>);
+
+fn direct_identity(json: &str) -> Option<SourceIdentity> {
     let doc = crate::json::parse(json).ok()?;
     let url = doc.get("url")?.as_str()?.to_owned();
+    // A build from a repository subdirectory is another package than the
+    // root's, even at the same commit; vivar never writes one itself.
+    let subdirectory = doc
+        .get("subdirectory")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
     let hash = doc
         .get("archive_info")
         .and_then(|a| a.get("hash"))
@@ -637,7 +682,7 @@ fn direct_identity(json: &str) -> Option<(String, Option<String>, Option<String>
         .and_then(|v| v.get("commit_id"))
         .and_then(|c| c.as_str())
         .map(str::to_owned);
-    Some((url, hash, commit))
+    Some((url, hash, commit, subdirectory))
 }
 
 /// Whether what is installed is exactly this lock package: name, version and

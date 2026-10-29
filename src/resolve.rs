@@ -84,6 +84,8 @@ pub struct ResolvedPackage {
     /// What each dependency resolved to alongside this package, so a lock
     /// holding several variants of a name can pin the edge.
     pub resolved: BTreeMap<String, Pin>,
+    /// The fork sides this variant belongs to (empty: all of them).
+    pub resolution_markers: Vec<String>,
 }
 
 /// One chosen variant of a package: its version and where it came from.
@@ -141,6 +143,11 @@ pub struct Lockable {
     /// Pins for the root's edges: `None` for its dependencies and extras,
     /// `Some(group)` for a dependency group resolved on its own.
     pub root_pins: BTreeMap<Option<String>, BTreeMap<String, Pin>>,
+    /// The markers the lock forks on, when it does.
+    pub fork_markers: Vec<String>,
+    /// Whether edges into a multi-variant name carry a version (profiles) or
+    /// the variants are told apart by `resolution-markers` alone (forks).
+    pub pin_edges: bool,
 }
 
 impl Lockable {
@@ -148,6 +155,62 @@ impl Lockable {
         Lockable {
             packages: r.packages,
             root_pins: BTreeMap::from([(None, r.pins)]),
+            fork_markers: Vec::new(),
+            pin_edges: true,
+        }
+    }
+
+    /// Merges the sides of a fork: a release present on several sides is one
+    /// package carrying each side's marker; a name with a single variant
+    /// across all sides needs no markers at all.
+    pub fn merge_forks(sides: Vec<(String, Resolution)>) -> Lockable {
+        let mut packages: Vec<ResolvedPackage> = Vec::new();
+        let mut root_pins = None;
+        let mut fork_markers = Vec::new();
+        for (marker, r) in sides {
+            if root_pins.is_none() {
+                root_pins = Some(r.pins);
+            }
+            for mut p in r.packages {
+                if let Some(existing) = packages
+                    .iter_mut()
+                    .find(|q| q.name == p.name && q.version == p.version && q.source == p.source)
+                {
+                    existing.resolution_markers.push(marker.clone());
+                    for d in p.dependencies {
+                        if !existing.dependencies.iter().any(|e| {
+                            e.name == d.name && e.extras == d.extras && e.marker == d.marker
+                        }) {
+                            existing.dependencies.push(d);
+                        }
+                    }
+                } else {
+                    p.resolution_markers = vec![marker.clone()];
+                    packages.push(p);
+                }
+            }
+            fork_markers.push(marker);
+        }
+        let counts: BTreeMap<&str, usize> = packages.iter().fold(BTreeMap::new(), |mut m, p| {
+            *m.entry(p.name.as_str()).or_default() += 1;
+            m
+        });
+        let single: Vec<String> = counts
+            .iter()
+            .filter(|(_, n)| **n == 1)
+            .map(|(k, _)| k.to_string())
+            .collect();
+        for p in &mut packages {
+            if single.contains(&p.name) {
+                p.resolution_markers.clear();
+            }
+        }
+        packages.sort_by(|a, b| (&a.name, &a.version).cmp(&(&b.name, &b.version)));
+        Lockable {
+            packages,
+            root_pins: BTreeMap::from([(None, root_pins.unwrap_or_default())]),
+            fork_markers,
+            pin_edges: false,
         }
     }
 
@@ -216,6 +279,8 @@ impl Lockable {
         Ok(Lockable {
             packages,
             root_pins,
+            fork_markers: Vec::new(),
+            pin_edges: true,
         })
     }
 
@@ -233,8 +298,170 @@ impl Lockable {
     }
 }
 
+/// Two requirements on one package that can never hold together; the lock
+/// has to fork on `marker` (resolved once where it holds, once where it
+/// does not) to satisfy both.
+#[derive(Debug, Clone)]
+pub struct ForkNeeded {
+    pub name: String,
+    pub marker: String,
+}
+
+impl std::fmt::Display for ForkNeeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is required at incompatible versions on either side of `{}`",
+            self.name, self.marker
+        )
+    }
+}
+
+impl std::error::Error for ForkNeeded {}
+
+/// The negation of a PEP 508 marker, for the other side of a fork: operators
+/// invert, `and`/`or` swap (De Morgan). Anything the splitter does not
+/// recognise is an error rather than a guess.
+pub fn negate_marker(marker: &str) -> Result<String> {
+    let m = marker.trim();
+    let inner = m
+        .strip_prefix('(')
+        .and_then(|r| r.strip_suffix(')'))
+        .filter(|r| balanced(r));
+    if let Some(inner) = inner {
+        return negate_marker(inner);
+    }
+    for (op, swapped) in [(" or ", " and "), (" and ", " or ")] {
+        let parts = split_top(m, op);
+        if parts.len() > 1 {
+            let negated: Result<Vec<String>> = parts
+                .iter()
+                .map(|p| negate_marker(p).map(|n| format!("({n})")))
+                .collect();
+            return Ok(negated?.join(swapped));
+        }
+    }
+    for (op, inv) in [
+        ("===", "!=="),
+        ("<=", ">"),
+        (">=", "<"),
+        ("==", "!="),
+        ("!=", "=="),
+        ("<", ">="),
+        (">", "<="),
+        (" not in ", " in "),
+        (" in ", " not in "),
+    ] {
+        if let Some((l, r)) = m.split_once(op) {
+            if inv == "!==" {
+                bail!("cannot negate `{m}` for a fork");
+            }
+            return Ok(format!("{} {} {}", l.trim(), inv.trim(), r.trim()));
+        }
+    }
+    bail!("cannot negate `{m}` for a fork")
+}
+
+fn balanced(s: &str) -> bool {
+    let mut depth = 0i32;
+    for c in s.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+/// Splits on `sep` outside parentheses and quotes.
+fn split_top<'s>(s: &'s str, sep: &str) -> Vec<&'s str> {
+    let mut parts = Vec::new();
+    let (mut depth, mut quote, mut start) = (0i32, None::<char>, 0usize);
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < s.len() {
+        let c = bytes[i] as char;
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ if depth == 0 && s[i..].starts_with(sep) => {
+                    parts.push(s[start..i].trim());
+                    i += sep.len();
+                    start = i;
+                    continue;
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    parts.push(s[start..].trim());
+    parts
+}
+
+/// Resolves `roots`, forking on markers where the graph needs it: each side
+/// is resolved with the environments narrowed to that side, recursively, and
+/// comes back with the marker that selects it.
+/// Builds a resolver for one side of a fork, given the restrictions so far.
+pub type ForkBuilder<'a> = dyn Fn(&[(String, bool)]) -> Result<Resolver<'a>> + 'a;
+
+pub fn resolve_with_forks<'a>(
+    build: &ForkBuilder<'a>,
+    roots: &Roots,
+    restrictions: Vec<(String, bool)>,
+) -> Result<Vec<(String, Resolution)>> {
+    match build(&restrictions)?.resolve(roots) {
+        Ok(r) => {
+            let marker = restrictions
+                .iter()
+                .map(|(m, holds)| {
+                    if *holds {
+                        if m.contains(" or ") {
+                            format!("({m})")
+                        } else {
+                            m.clone()
+                        }
+                    } else {
+                        negate_marker(m).unwrap_or_else(|_| m.clone())
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" and ");
+            Ok(vec![(marker, r)])
+        }
+        Err(e) => match e.downcast_ref::<ForkNeeded>() {
+            Some(f) if restrictions.len() < 4 => {
+                negate_marker(&f.marker)?;
+                let mut yes = restrictions.clone();
+                yes.push((f.marker.clone(), true));
+                let mut no = restrictions;
+                no.push((f.marker.clone(), false));
+                let mut out = resolve_with_forks(build, roots, yes)?;
+                out.extend(resolve_with_forks(build, roots, no)?);
+                Ok(out)
+            }
+            _ => Err(e),
+        },
+    }
+}
+
 pub struct Resolver<'a> {
     index: &'a Index,
+    /// Whether environment 0 is this machine (a fork may leave it out).
+    machine_included: bool,
     /// Packages routed to another index (`[tool.uv.sources]`).
     routes: Vec<(String, Index)>,
     /// Indexes searched before the main one for everything else
@@ -308,6 +535,7 @@ impl<'a> Resolver<'a> {
     pub fn new(index: &'a Index, python_floor: [u32; 3], wheels_only: bool) -> Resolver<'a> {
         let mut r = Resolver {
             index,
+            machine_included: true,
             routes: Vec::new(),
             defaults: Vec::new(),
             envs: Vec::new(),
@@ -496,6 +724,35 @@ impl<'a> Resolver<'a> {
         self
     }
 
+    /// One side of a fork: keeps the environments where `marker` evaluates to
+    /// `holds` (this machine included only when it is on that side).
+    pub fn restrict(mut self, marker: &str, holds: bool) -> Self {
+        let keep: Vec<bool> = self
+            .envs
+            .iter()
+            .map(|(e, _)| eval_marker(marker, e).unwrap_or(false) == holds)
+            .collect();
+        if !keep.first().copied().unwrap_or(false) {
+            self.machine_included = false;
+        }
+        let mut i = 0;
+        self.envs.retain(|_| {
+            i += 1;
+            keep[i - 1]
+        });
+        let mut j = 0;
+        self.pythons.retain(|_| {
+            j += 1;
+            keep[j - 1]
+        });
+        let mut k = 0;
+        self.patch_bounds.retain(|_| {
+            k += 1;
+            keep[k - 1]
+        });
+        self
+    }
+
     /// The Python this machine installs with, when it differs from the floor.
     pub fn machine(mut self, version: [u32; 3]) -> Self {
         let floor = {
@@ -658,7 +915,7 @@ impl<'a> Resolver<'a> {
                 .iter()
                 .any(|f| f.is_wheel() && self.envs[i].1.score(&f.filename).is_some())
         };
-        if envs.contains(&0) {
+        if self.machine_included && envs.contains(&0) {
             return fits(0);
         }
         envs.iter().any(|&i| fits(i))
@@ -864,7 +1121,25 @@ impl<'a> Resolver<'a> {
                     }
                     continue;
                 }
-                // Conflict with an earlier choice: backtrack.
+                // Conflict with an earlier choice. When no version could ever
+                // satisfy every constraint and two of them never apply
+                // together, the lock has to fork; otherwise backtrack.
+                let constraints = state
+                    .constraints
+                    .get(&req.name)
+                    .cloned()
+                    .unwrap_or_default();
+                if self
+                    .candidates(&req.name, &constraints, &state.directs)?
+                    .is_empty()
+                {
+                    if let Some(marker) = self.fork(&constraints) {
+                        return Err(anyhow::Error::new(ForkNeeded {
+                            name: req.name.clone(),
+                            marker,
+                        }));
+                    }
+                }
                 state = self.backtrack(&mut frames, &req.name)?;
                 continue;
             }
@@ -875,11 +1150,11 @@ impl<'a> Resolver<'a> {
                 .unwrap_or_default();
             let candidates = self.candidates(&req.name, &constraints, &state.directs)?;
             if candidates.is_empty() {
-                if let Some(fork) = self.fork(&constraints) {
-                    bail!(
-                        "{} is required at incompatible versions under different conditions ({fork}); vivar's resolver keeps one version per package, uv can fork the lock",
-                        req.name
-                    );
+                if let Some(marker) = self.fork(&constraints) {
+                    return Err(anyhow::Error::new(ForkNeeded {
+                        name: req.name.clone(),
+                        marker,
+                    }));
                 }
                 if frames.is_empty() {
                     bail!(
@@ -949,6 +1224,7 @@ impl<'a> Resolver<'a> {
                 dependencies,
                 source,
                 resolved: BTreeMap::new(),
+                resolution_markers: Vec::new(),
             });
         }
         packages.sort_by(|a, b| a.name.cmp(&b.name));
@@ -981,23 +1257,13 @@ impl<'a> Resolver<'a> {
 
     /// Two constraints that never apply on the same environment: the
     /// description of the fork, if the constraints form one.
+    /// The marker a fork would split on: that of the first of two constraints
+    /// that never apply together.
     fn fork(&self, constraints: &[Constraint]) -> Option<String> {
         for (i, a) in constraints.iter().enumerate() {
             for b in &constraints[i + 1..] {
                 if !a.envs.is_empty() && !b.envs.is_empty() && a.envs.is_disjoint(&b.envs) {
-                    return Some(format!(
-                        "{}{} vs {}{}",
-                        a.specifier,
-                        a.marker
-                            .as_deref()
-                            .map(|m| format!(" when {m}"))
-                            .unwrap_or_default(),
-                        b.specifier,
-                        b.marker
-                            .as_deref()
-                            .map(|m| format!(" when {m}"))
-                            .unwrap_or_default()
-                    ));
+                    return a.marker.clone().or_else(|| b.marker.clone());
                 }
             }
         }
@@ -1193,13 +1459,20 @@ pub fn write_lock(roots: &Roots, lock: &Lockable) -> String {
     if let Some(rp) = &roots.requires_python {
         doc["requires-python"] = value(rp.as_str());
     }
+    if !lock.fork_markers.is_empty() {
+        let mut a = Array::new();
+        for m in &lock.fork_markers {
+            a.push(m.as_str());
+        }
+        doc["resolution-markers"] = value(a);
+    }
     // An edge into a name with several variants says which one: by version,
     // and by source when the same version comes from two places.
     let dep_entry =
         |r: &Requirement, marker: Option<&str>, pins: Option<&BTreeMap<String, Pin>>| {
             let mut t = InlineTable::new();
             t.insert("name", r.name.as_str().into());
-            if lock.variants(&r.name) > 1 {
+            if lock.pin_edges && lock.variants(&r.name) > 1 {
                 if let Some(pin) = pins.and_then(|p| p.get(&r.name)) {
                     t.insert("version", pin.version.to_string().into());
                     if lock.same_version_variants(&r.name, &pin.version) > 1 {
@@ -1356,6 +1629,13 @@ pub fn write_lock(roots: &Roots, lock: &Lockable) -> String {
         let mut t = Table::new();
         t["name"] = value(p.name.as_str());
         t["version"] = value(p.version.to_string());
+        if !p.resolution_markers.is_empty() {
+            let mut a = Array::new();
+            for m in &p.resolution_markers {
+                a.push(m.as_str());
+            }
+            t["resolution-markers"] = value(a);
+        }
         let mut src = InlineTable::new();
         match &p.source {
             Source::Registry(url) => src.insert("registry", url.as_str().into()),
@@ -1576,6 +1856,7 @@ mod tests {
                     .iter()
                     .map(|(n, v)| (n.to_string(), pin(v)))
                     .collect(),
+                resolution_markers: Vec::new(),
             };
         let assigned = |pairs: &[(&str, &str)]| -> BTreeMap<String, Version> {
             pairs
@@ -1680,6 +1961,124 @@ mod tests {
         );
     }
 
+    /// A zip with stored (uncompressed) entries: enough for a wheel the
+    /// resolver only reads METADATA from.
+    fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for (name, data) in entries {
+            let offset = out.len() as u32;
+            let name_b = name.as_bytes();
+            let mut local = vec![0x50, 0x4b, 0x03, 0x04, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            local.extend_from_slice(&0u32.to_le_bytes()); // crc (not checked)
+            local.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            local.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            local.extend_from_slice(&(name_b.len() as u16).to_le_bytes());
+            local.extend_from_slice(&0u16.to_le_bytes());
+            local.extend_from_slice(name_b);
+            local.extend_from_slice(data);
+            out.extend_from_slice(&local);
+            let mut c = vec![0x50, 0x4b, 0x01, 0x02, 20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            c.extend_from_slice(&0u32.to_le_bytes());
+            c.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            c.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            c.extend_from_slice(&(name_b.len() as u16).to_le_bytes());
+            c.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+            c.extend_from_slice(&0u32.to_le_bytes());
+            c.extend_from_slice(&offset.to_le_bytes());
+            c.extend_from_slice(name_b);
+            central.extend_from_slice(&c);
+        }
+        let cd_offset = out.len() as u32;
+        out.extend_from_slice(&central);
+        let mut eocd = vec![0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0];
+        eocd.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        eocd.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        eocd.extend_from_slice(&(central.len() as u32).to_le_bytes());
+        eocd.extend_from_slice(&cd_offset.to_le_bytes());
+        eocd.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&eocd);
+        out
+    }
+
+    #[test]
+    fn markers_negate_and_locks_fork() {
+        assert_eq!(
+            negate_marker("python_version < '3.13'").unwrap(),
+            "python_version >= '3.13'"
+        );
+        assert_eq!(
+            negate_marker("sys_platform == 'win32' and python_version >= '3.12'").unwrap(),
+            "(sys_platform != 'win32') or (python_version < '3.12')"
+        );
+        assert_eq!(
+            negate_marker("(extra == 'a' or extra == 'b')").unwrap(),
+            "(extra != 'a') and (extra != 'b')"
+        );
+
+        let dir = std::env::temp_dir().join(format!("vivar-fork-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for v in ["1.0", "2.0"] {
+            let meta = format!("Metadata-Version: 2.1\nName: fk\nVersion: {v}\n");
+            let whl = stored_zip(&[
+                (&format!("fk-{v}.dist-info/METADATA"), meta.as_bytes()),
+                (
+                    &format!("fk-{v}.dist-info/WHEEL"),
+                    b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+                ),
+            ]);
+            std::fs::write(dir.join(format!("fk-{v}-py3-none-any.whl")), whl).unwrap();
+        }
+        let index = Index::new(Some(dir.to_str().unwrap()));
+        let roots = Roots {
+            name: "app".into(),
+            version: "0.1.0".into(),
+            requires_python: Some(">=3.12".into()),
+            dependencies: vec![
+                Requirement::parse("fk<2; python_version < '3.13'").unwrap(),
+                Requirement::parse("fk>=2; python_version >= '3.13'").unwrap(),
+            ],
+            ..Default::default()
+        };
+        let build = |restrictions: &[(String, bool)]| -> Result<Resolver<'_>> {
+            let mut r = Resolver::new(&index, [3, 12, 0], true).requires_python(Some(">=3.12"));
+            for (m, holds) in restrictions {
+                r = r.restrict(m, *holds);
+            }
+            Ok(r)
+        };
+        // One version per package cannot satisfy both: a plain resolve says so.
+        let err = match build(&[]).unwrap().resolve(&roots) {
+            Ok(_) => panic!("resolved without a fork"),
+            Err(e) => e,
+        };
+        assert!(err.downcast_ref::<ForkNeeded>().is_some(), "{err:#}");
+        let sides = resolve_with_forks(&build, &roots, Vec::new()).unwrap();
+        assert_eq!(
+            sides.len(),
+            2,
+            "{:?}",
+            sides.iter().map(|(m, _)| m).collect::<Vec<_>>()
+        );
+        let lock = Lockable::merge_forks(sides);
+        assert_eq!(lock.packages.len(), 2);
+        let text = write_lock(&roots, &lock);
+        assert!(text.contains("resolution-markers = ["), "{text}");
+        assert!(text.contains("dependencies = [{ name = \"fk\", marker = \"python_version < '3.13'\" }, { name = \"fk\", marker = \"python_version >= '3.13'\" }]"), "{text}");
+        let parsed = crate::lock::Lock::parse(&text).unwrap();
+        let names = |v: [u32; 3]| -> Vec<String> {
+            crate::native::plan(&parsed, &MarkerEnv::for_target("linux", "x86_64", v), &[])
+                .unwrap()
+                .iter()
+                .map(|p| format!("{} {}", p.name, p.version))
+                .collect()
+        };
+        assert_eq!(names([3, 12, 0]), vec!["app 0.1.0", "fk 1.0"]);
+        assert_eq!(names([3, 13, 0]), vec!["app 0.1.0", "fk 2.0"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn lock_puts_extra_edges_under_the_extra() {
         let roots = Roots {
@@ -1704,6 +2103,7 @@ mod tests {
             ],
             source: Source::Registry("https://pypi.org/simple".into()),
             resolved: BTreeMap::new(),
+            resolution_markers: Vec::new(),
         };
         let direct = ResolvedPackage {
             name: "minipkg".into(),
@@ -1716,6 +2116,7 @@ mod tests {
                 commit: "abc123".into(),
             },
             resolved: BTreeMap::new(),
+            resolution_markers: Vec::new(),
         };
         assert_eq!(
             git_parts("git+https://example.com/minipkg.git@main#subdirectory=x"),

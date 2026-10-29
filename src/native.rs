@@ -249,13 +249,17 @@ fn cache_dir() -> Result<PathBuf> {
     Ok(dirs::cache()?.join("wheels"))
 }
 
+/// Where wheels come from: the configured index (credentials go to its host
+/// only, never to whatever a lock names) and an optional wheelhouse
+/// directory that is tried first.
+struct Source<'a> {
+    index_url: &'a str,
+    wheelhouse_dir: Option<&'a Path>,
+}
+
 /// Fetches the wheel for `pkg` on `target`, hash-checked, from the cache or
-/// the URL the lock records. The wheelhouse (`index-url` directory) is tried first.
-fn fetch_wheel(
-    pkg: &Package,
-    target: &wheelhouse::Target,
-    wheelhouse_dir: Option<&Path>,
-) -> Result<PathBuf> {
+/// the URL the lock records.
+fn fetch_wheel(pkg: &Package, target: &wheelhouse::Target, source: &Source) -> Result<PathBuf> {
     let (artifact, is_wheel) = target.pick(pkg).ok_or_else(|| {
         anyhow!(
             "{} {} has no artifact for this platform in uv.lock",
@@ -285,7 +289,7 @@ fn fetch_wheel(
         return Ok(dest);
     }
     fs::create_dir_all(dest.parent().context("cache path")?)?;
-    if let Some(dir) = wheelhouse_dir {
+    if let Some(dir) = source.wheelhouse_dir {
         let local = dir.join(&name);
         if local.is_file() && sha256::file(&local)? == expected {
             fs::copy(&local, &dest)?;
@@ -293,8 +297,9 @@ fn fetch_wheel(
         }
     }
     println!("downloading {name}");
-    // Index credentials go to the index's own host only, never to a CDN.
-    let url = if crate::index::same_origin(&artifact.url, &pkg.source) {
+    // Index credentials go to the configured index's own host only: not to a
+    // CDN, and not to whatever registry a lock happens to name.
+    let url = if crate::index::same_origin(&artifact.url, source.index_url) {
         crate::backend::with_credentials(&artifact.url)
     } else {
         artifact.url.clone()
@@ -315,7 +320,7 @@ fn apply(
     wanted: &[&Package],
     layout: &install::Layout,
     target: &wheelhouse::Target,
-    wheelhouse_dir: Option<&Path>,
+    source: &Source,
 ) -> Result<(usize, usize)> {
     let present = install::installed(&layout.site)?;
     let want_names: BTreeSet<&str> = wanted.iter().map(|p| p.name.as_str()).collect();
@@ -340,7 +345,7 @@ fn apply(
         }
         match pkg.source_kind.as_str() {
             "registry" => {
-                let wheel = fetch_wheel(pkg, target, wheelhouse_dir)?;
+                let wheel = fetch_wheel(pkg, target, source)?;
                 install::install_wheel(&wheel, layout)?;
                 installed += 1;
             }
@@ -416,6 +421,16 @@ impl NativeBackend {
             .map(Path::to_path_buf)
     }
 
+    /// Runs `f` with this backend's artifact source.
+    fn with_source<T>(&self, f: impl FnOnce(&Source) -> Result<T>) -> Result<T> {
+        let index = self.index();
+        let wheelhouse = self.wheelhouse_dir();
+        f(&Source {
+            index_url: index.url(),
+            wheelhouse_dir: wheelhouse.as_deref(),
+        })
+    }
+
     fn sync_into(&self, lock_root: &Path, venv_dir: &Path, groups: &[&str]) -> Result<()> {
         let lock = Lock::read(lock_root)?;
         let version = env_version(venv_dir)?;
@@ -427,13 +442,8 @@ impl NativeBackend {
             &format!("{}.{}", version[0], version[1]),
             cfg!(windows),
         );
-        let (installed, removed) = apply(
-            lock_root,
-            &wanted,
-            &layout,
-            &target,
-            self.wheelhouse_dir().as_deref(),
-        )?;
+        let (installed, removed) =
+            self.with_source(|source| apply(lock_root, &wanted, &layout, &target, source))?;
         println!(
             "native sync: {} package(s) installed, {} removed, {} in the environment",
             installed,
@@ -688,7 +698,7 @@ impl Backend for NativeBackend {
             if let Some(old) = present.iter().find(|d| d.name == pkg.name) {
                 install::uninstall(old)?;
             }
-            let wheel = fetch_wheel(pkg, &target, self.wheelhouse_dir().as_deref())?;
+            let wheel = self.with_source(|source| fetch_wheel(pkg, &target, source))?;
             install::install_wheel(&wheel, &layout)?;
             installed += 1;
         }
@@ -707,14 +717,21 @@ impl Backend for NativeBackend {
     }
 
     fn lock_check(&self, dir: &Path) -> Result<()> {
-        // Without a resolver: the lock exists and declares every requirement the project does.
+        // Structural: the lock exists and covers every declared requirement
+        // that applies on this machine (one that applies nowhere is rightly
+        // absent; one that applies elsewhere is present).
         let project = crate::project::Project::require(dir)?;
         let lock = Lock::read(project.venv_root())?;
         let locked: BTreeSet<String> = lock.packages.iter().map(|p| p.name.clone()).collect();
+        let here = MarkerEnv::current(python_floor(&project)?);
         let mut missing = Vec::new();
         for req in project.declared_requirements() {
             let name = crate::project::normalize(crate::project::requirement_name(&req));
-            if !locked.contains(&name) {
+            let applies_here = Requirement::parse(&req)
+                .ok()
+                .and_then(|r| r.marker.map(|m| eval_marker(&m, &here).unwrap_or(true)))
+                .unwrap_or(true);
+            if !locked.contains(&name) && applies_here {
                 missing.push(name);
             }
         }
@@ -785,17 +802,13 @@ impl Backend for NativeBackend {
             python: "python".to_owned(),
             windows: os == "windows",
         };
-        let (installed, _) = apply(
-            project.venv_root(),
-            &wanted
-                .iter()
-                .copied()
-                .filter(|p| p.source_kind == "registry")
-                .collect::<Vec<_>>(),
-            &layout,
-            &t,
-            self.wheelhouse_dir().as_deref(),
-        )?;
+        let registry: Vec<&Package> = wanted
+            .iter()
+            .copied()
+            .filter(|p| p.source_kind == "registry")
+            .collect();
+        let (installed, _) =
+            self.with_source(|source| apply(project.venv_root(), &registry, &layout, &t, source))?;
         println!("native layout: {installed} package(s) for {triple}");
         Ok(())
     }

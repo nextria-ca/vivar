@@ -43,6 +43,8 @@ pub struct Resolver<'a> {
     index: &'a Index,
     /// Environments a marker may hold on; entry 0 is this machine.
     envs: Vec<(MarkerEnv, Target)>,
+    /// The Python of each environment, for `requires-python` checks.
+    pythons: Vec<Version>,
     wheels_only: bool,
     /// Versions to keep when still acceptable (the current lock).
     prefer: BTreeMap<String, Version>,
@@ -92,6 +94,7 @@ impl<'a> Resolver<'a> {
         let mut r = Resolver {
             index,
             envs: Vec::new(),
+            pythons: Vec::new(),
             wheels_only,
             prefer: BTreeMap::new(),
             upgrade: BTreeSet::new(),
@@ -123,7 +126,24 @@ impl<'a> Resolver<'a> {
                 }
             }
         }
+        self.pythons = envs
+            .iter()
+            .map(|(e, _)| Version::parse(&e.python_full_version).expect("numeric version"))
+            .collect();
         self.envs = envs;
+    }
+
+    /// Whether a `requires-python` holds on every environment in `envs`: one
+    /// version per package means it has to serve all of them.
+    fn python_ok(&self, requires_python: Option<&str>, envs: &BTreeSet<usize>) -> bool {
+        let Some(rp) = requires_python else {
+            return true;
+        };
+        let Ok(spec) = Specifier::parse(rp) else {
+            return true;
+        };
+        envs.iter()
+            .all(|&i| spec.matches_allowing_pre(&self.pythons[i]))
     }
 
     /// The Python this machine installs with, when it differs from the floor.
@@ -200,15 +220,7 @@ impl<'a> Resolver<'a> {
                 constraints.iter().all(|c| {
                     c.specifier.matches(v) || (exact_pin && c.specifier.matches_allowing_pre(v))
                 }) && fs.iter().any(|f| {
-                    (!f.yanked || exact_pin)
-                        && f.requires_python
-                            .as_deref()
-                            .map(|rp| {
-                                Specifier::parse(rp)
-                                    .map(|s| s.matches_allowing_pre(&self.python_floor))
-                                    .unwrap_or(true)
-                            })
-                            .unwrap_or(true)
+                    (!f.yanked || exact_pin) && self.python_ok(f.requires_python.as_deref(), &envs)
                 })
             })
             .filter(|(_, fs)| self.installable(fs, &envs, exact_pin))
@@ -309,7 +321,15 @@ impl<'a> Resolver<'a> {
                     req.name
                 );
             }
-            // Record the constraint and extras.
+            // Record the constraint and extras. A package already assigned is
+            // expanded again when it now applies in more environments (or with
+            // more extras), so its conditional dependencies there are not lost.
+            let known: BTreeSet<usize> = state
+                .constraints
+                .get(&req.name)
+                .map(|cs| cs.iter().flat_map(|c| c.envs.iter().copied()).collect())
+                .unwrap_or_default();
+            let grew = !envs.is_subset(&known);
             state
                 .constraints
                 .entry(req.name.clone())
@@ -336,7 +356,9 @@ impl<'a> Resolver<'a> {
                 if req.specifier.matches(&v)
                     || req.specifier.matches_allowing_pre(&v) && v.is_prerelease()
                 {
-                    if !new_extras.is_empty() && !self.enqueue_deps(&mut state, &req.name, &v)? {
+                    if (!new_extras.is_empty() || grew)
+                        && !self.enqueue_deps(&mut state, &req.name, &v)?
+                    {
                         state = self.backtrack(&mut frames, &req.name)?;
                     }
                     continue;
@@ -445,22 +467,19 @@ impl<'a> Resolver<'a> {
     }
 
     /// Queues the dependencies of `name == version`. `false` when the release
-    /// cannot be used after all (its metadata requires a newer Python).
+    /// cannot be used after all (its metadata requires another Python than
+    /// some environment it applies in has).
     fn enqueue_deps(&mut self, state: &mut State, name: &str, version: &Version) -> Result<bool> {
         let meta = self.metadata(name, version)?;
-        if let Some(rp) = &meta.requires_python {
-            if let Ok(s) = Specifier::parse(rp) {
-                if !s.matches_allowing_pre(&self.python_floor) {
-                    return Ok(false);
-                }
-            }
-        }
         let extras = state.extras.get(name).cloned().unwrap_or_default();
         let within: BTreeSet<usize> = state
             .constraints
             .get(name)
             .map(|cs| cs.iter().flat_map(|c| c.envs.iter().copied()).collect())
             .unwrap_or_else(|| self.all_envs());
+        if !self.python_ok(meta.requires_python.as_deref(), &within) {
+            return Ok(false);
+        }
         for dep in &meta.requires_dist {
             let envs = self.where_holds(dep.marker.as_deref(), &extras, &within);
             if envs.is_empty() {
@@ -499,10 +518,12 @@ impl<'a> Resolver<'a> {
     }
 }
 
+/// An actual pin to one release (`==1.2.3`, `===x`), not `==1.*` or a range.
 fn exact_pin(constraints: &[Constraint]) -> bool {
-    constraints
-        .iter()
-        .any(|c| c.specifier.to_string().starts_with("=="))
+    constraints.iter().any(|c| {
+        let s = c.specifier.to_string();
+        s.starts_with("==") && !s.contains(',') && !s.ends_with(".*")
+    })
 }
 
 /// Splits `extra == 'x'` out of a marker that is a top-level conjunction:

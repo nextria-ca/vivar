@@ -2461,8 +2461,14 @@ fn native_backend_syncs_from_the_lock_without_uv() {
     // Extras follow through the lock: `requests[socks]` brings PySocks in.
     okn(dir, &["add", "requests[socks]"]);
     let lock = read(&dir.join("uv.lock"));
-    assert!(lock.contains("[package.optional-dependencies]\nsocks = ["), "{lock}");
-    assert!(lock.contains("{ name = \"requests\", extra = [\"socks\"] }"), "{lock}");
+    assert!(
+        lock.contains("[package.optional-dependencies]\nsocks = ["),
+        "{lock}"
+    );
+    assert!(
+        lock.contains("{ name = \"requests\", extra = [\"socks\"] }"),
+        "{lock}"
+    );
     okn(dir, &["run", "python", "-c", "import requests, socks"]);
     if let Ok(out) = Command::new("uv")
         .current_dir(dir)
@@ -2476,7 +2482,9 @@ fn native_backend_syncs_from_the_lock_without_uv() {
         );
     }
     okn(dir, &["remove", "requests"]);
-    assert!(!native(dir, &["run", "python", "-c", "import socks"]).status.success());
+    assert!(!native(dir, &["run", "python", "-c", "import socks"])
+        .status
+        .success());
     // Building is native too: hatchling comes from the index into a throwaway env.
     let path = dir.join("pyproject.toml");
     let text = read(&path)

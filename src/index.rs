@@ -187,18 +187,46 @@ pub fn same_origin(a: &str, b: &str) -> bool {
     matches!((origin(a), origin(b)), (Some(x), Some(y)) if x == y)
 }
 
-/// A `file://` URL for a wheelhouse member, and back.
+/// A `file://` URL for a wheelhouse member: absolute, percent-encoded, and
+/// decoded back by `local_path`.
 fn file_url(path: &std::path::Path) -> String {
-    let p = path.display().to_string().replace('\\', "/");
-    format!("file:///{}", p.trim_start_matches('/'))
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let p = abs.display().to_string().replace('\\', "/");
+    let mut out = String::from("file:///");
+    for b in p.trim_start_matches('/').bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~/:".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 pub fn local_path(url: &str) -> Option<std::path::PathBuf> {
     let rest = url.strip_prefix("file:///")?;
+    let mut bytes = Vec::with_capacity(rest.len());
+    let raw = rest.as_bytes();
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'%' && i + 2 < raw.len() {
+            if let Some(v) = std::str::from_utf8(&raw[i + 1..i + 3])
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
+                bytes.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        bytes.push(raw[i]);
+        i += 1;
+    }
+    let decoded = String::from_utf8(bytes).ok()?;
     if cfg!(windows) {
-        Some(std::path::PathBuf::from(rest.replace('/', "\\")))
+        Some(std::path::PathBuf::from(decoded.replace('/', "\\")))
     } else {
-        Some(std::path::PathBuf::from(format!("/{rest}")))
+        Some(std::path::PathBuf::from(format!("/{decoded}")))
     }
 }
 
@@ -445,7 +473,7 @@ mod tests {
 
     #[test]
     fn a_wheelhouse_directory_is_the_whole_index() {
-        let dir = std::env::temp_dir().join(format!("vivar-wh-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vivar wh#{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("six-1.17.0-py2.py3-none-any.whl"), b"not really").unwrap();
@@ -458,9 +486,22 @@ mod tests {
         assert!(files
             .iter()
             .all(|f| f.sha256.is_some() && f.url.starts_with("file:///")));
+        assert!(
+            files[0].url.contains("%23") && !files[0].url.contains(' '),
+            "{}",
+            files[0].url
+        );
         assert_eq!(
             local_path(&files[0].url).unwrap(),
             dir.join(&files[0].filename)
+        );
+        assert_eq!(
+            crate::lock::Artifact {
+                url: files[0].url.clone(),
+                hash: None
+            }
+            .filename(),
+            files[0].filename
         );
         assert!(index.files("missing").unwrap().is_empty());
         let _ = fs::remove_dir_all(&dir);

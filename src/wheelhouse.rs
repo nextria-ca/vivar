@@ -66,6 +66,11 @@ impl Target {
     }
 
     /// Whether a wheel (by file name) runs on this target. Higher is a better fit.
+    /// `linux-x86_64-cp312`: what a built wheel is good for.
+    pub fn label(&self) -> String {
+        format!("{}-{}-{}", self.os, self.arch, self.py)
+    }
+
     pub fn score(&self, filename: &str) -> Option<u32> {
         let stem = filename.strip_suffix(".whl")?;
         let mut parts = stem.rsplitn(3, '-');

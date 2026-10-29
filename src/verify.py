@@ -107,7 +107,7 @@ def native_libs():
 
 LOADER_PROBE = '''
 import ctypes, importlib, json, sys
-mods, paths = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+mods, paths = json.load(sys.stdin)
 for m in mods:
     try:
         importlib.import_module(m)
@@ -143,7 +143,7 @@ def unloadable_extensions(dist, mods):
         return []
     import json
     try:
-        r = subprocess.run([sys.executable, "-I", "-c", LOADER_PROBE, json.dumps(mods), json.dumps(paths)],
+        r = subprocess.run([sys.executable, "-I", "-c", LOADER_PROBE], input=json.dumps([mods, paths]),
                            capture_output=True, text=True, timeout=IMPORT_TIMEOUT)
     except subprocess.TimeoutExpired:
         return [(paths[0], f"loader probe timed out after {IMPORT_TIMEOUT}s")]

@@ -2575,6 +2575,45 @@ fn native_backend_syncs_from_the_lock_without_uv() {
         )
     };
     let whl = make_wheel(dir, &tmp.0.join("direct"));
+    // A `#sha256=` fragment is enforced: the wrong hash is refused, the right
+    // one accepted and recorded.
+    let digest = stdout_of(&ok(
+        dir,
+        &[
+            "run",
+            "python",
+            "-c",
+            &format!(
+                "import hashlib; print(hashlib.sha256(open({:?}, 'rb').read()).hexdigest())",
+                whl.to_str().unwrap()
+            ),
+        ],
+    ))
+    .trim()
+    .to_owned();
+    let out = native(
+        dir,
+        &[
+            "add",
+            &format!("minipkg @ {}#sha256={}", file_url(&whl), "0".repeat(64)),
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("does not match"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!read(&dir.join("pyproject.toml")).contains("minipkg"));
+    okn(
+        dir,
+        &[
+            "add",
+            &format!("minipkg @ {}#sha256={digest}", file_url(&whl)),
+        ],
+    );
+    assert!(read(&dir.join("uv.lock")).contains(&format!("sha256:{digest}")));
+    okn(dir, &["remove", "minipkg"]);
     okn(dir, &["add", &format!("minipkg @ {}", file_url(&whl))]);
     okn(
         dir,

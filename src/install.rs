@@ -55,6 +55,8 @@ pub struct Installed {
     pub name: String,
     pub version: String,
     pub dist_info: PathBuf,
+    /// PEP 610 `direct_url.json`, for packages installed from a URL or git.
+    pub direct_url: Option<String>,
 }
 
 /// Every `*.dist-info` in `site`.
@@ -80,20 +82,31 @@ pub fn installed(site: &Path) -> Result<Vec<Installed>> {
                 .map(|v| v.trim().to_owned())
         };
         let (fallback_name, fallback_version) = stem.rsplit_once('-').unwrap_or((stem, ""));
+        let direct_url = fs::read_to_string(path.join("direct_url.json"))
+            .ok()
+            .map(|t| t.trim().to_owned());
         out.push(Installed {
             name: crate::project::normalize(
                 &header("Name").unwrap_or_else(|| fallback_name.to_owned()),
             ),
             version: header("Version").unwrap_or_else(|| fallback_version.to_owned()),
             dist_info: path,
+            direct_url,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
 }
 
-/// Unpacks `wheel` into `layout`. Returns the installed distribution.
-pub fn install_wheel(wheel: &Path, layout: &Layout) -> Result<Installed> {
+/// Unpacks `wheel` into `layout`. Returns the installed distribution. For a
+/// package that came from a URL or git, `direct_url` is the PEP 610 record
+/// to write beside METADATA, so a later sync can tell this install from the
+/// same version out of an index or another commit.
+pub fn install_wheel_from(
+    wheel: &Path,
+    layout: &Layout,
+    direct_url: Option<&str>,
+) -> Result<Installed> {
     let data = fs::read(wheel).with_context(|| format!("reading {}", wheel.display()))?;
     let entries =
         zip::entries(&data).with_context(|| format!("{} is not a wheel", wheel.display()))?;
@@ -205,6 +218,15 @@ pub fn install_wheel(wheel: &Path, layout: &Layout) -> Result<Installed> {
         record_hash(b"vivar\n"),
         6,
     ));
+    if let Some(d) = direct_url {
+        let text = format!("{}\n", d.trim());
+        fs::write(info.join("direct_url.json"), &text)?;
+        record.push((
+            rel_to_site(&info.join("direct_url.json")),
+            record_hash(text.as_bytes()),
+            text.len() as u64,
+        ));
+    }
     record.push((rel_to_site(&info.join("RECORD")), String::new(), 0));
     let mut text = String::new();
     for (path, hash, size) in &record {
@@ -221,6 +243,7 @@ pub fn install_wheel(wheel: &Path, layout: &Layout) -> Result<Installed> {
         name: crate::project::normalize(name),
         version: version.to_owned(),
         dist_info: info,
+        direct_url: direct_url.map(|d| d.trim().to_owned()),
     })
 }
 

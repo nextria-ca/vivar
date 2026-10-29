@@ -165,8 +165,8 @@ pub struct Resolver<'a> {
     python_floor: Version,
     cache: BTreeMap<(String, String), Metadata>,
     fetch: Option<&'a dyn Fetch>,
-    /// Direct references seen so far, by name: one URL per package.
-    directs: BTreeMap<String, Direct>,
+    /// Direct references already fetched or built, by URL.
+    direct_cache: BTreeMap<String, Direct>,
 }
 
 /// A requirement on a package together with the environments it applies to.
@@ -191,6 +191,9 @@ struct State {
     assigned: Vec<(String, Version)>,
     constraints: BTreeMap<String, Vec<Constraint>>,
     extras: BTreeMap<String, Extras>,
+    /// Direct references in force, by name: part of the state so backtracking
+    /// past the requirement that introduced one drops it too.
+    directs: BTreeMap<String, Direct>,
     pending: VecDeque<Pending>,
     /// Edges (from, requirement) recorded for the lock.
     edges: Vec<(String, Requirement)>,
@@ -227,7 +230,7 @@ impl<'a> Resolver<'a> {
             .expect("numeric version"),
             cache: BTreeMap::new(),
             fetch: None,
-            directs: BTreeMap::new(),
+            direct_cache: BTreeMap::new(),
         };
         r.set_envs(python_floor, python_floor);
         r
@@ -486,8 +489,13 @@ impl<'a> Resolver<'a> {
 
     /// Candidate versions of `name`, newest first, acceptable under `constraints`
     /// and installable wherever they apply.
-    fn candidates(&self, name: &str, constraints: &[Constraint]) -> Result<Vec<Version>> {
-        if let Some(d) = self.directs.get(name) {
+    fn candidates(
+        &self,
+        name: &str,
+        constraints: &[Constraint],
+        directs: &BTreeMap<String, Direct>,
+    ) -> Result<Vec<Version>> {
+        if let Some(d) = directs.get(name) {
             let ok = constraints
                 .iter()
                 .all(|c| c.specifier.matches_allowing_pre(&d.version));
@@ -559,13 +567,18 @@ impl<'a> Resolver<'a> {
 
     /// The wheel whose metadata describes `version` (one for this machine if
     /// possible; metadata rarely differs between wheels of one release).
-    fn metadata(&mut self, name: &str, version: &Version) -> Result<Metadata> {
+    fn metadata(
+        &mut self,
+        name: &str,
+        version: &Version,
+        directs: &BTreeMap<String, Direct>,
+    ) -> Result<Metadata> {
+        if let Some(d) = directs.get(name) {
+            return Ok(d.metadata.clone());
+        }
         let key = (name.to_owned(), version.to_string());
         if let Some(m) = self.cache.get(&key) {
             return Ok(m.clone());
-        }
-        if let Some(d) = self.directs.get(name) {
-            return Ok(d.metadata.clone());
         }
         let files = self.index_of(name).files(name)?;
         let wheels: Vec<&File> = files
@@ -662,8 +675,10 @@ impl<'a> Resolver<'a> {
                 break; // everything satisfied
             };
             // A direct reference is its own single candidate: fetched once,
-            // then treated as an exact pin for every other requirement.
+            // then treated as an exact pin for every other requirement. The
+            // selection lives in the state, the fetched artifact in a cache.
             let mut req = req;
+            let mut reexpand_direct = false;
             if let Some(url) = req.url.clone() {
                 let fetch = self.fetch.ok_or_else(|| {
                     anyhow!(
@@ -671,30 +686,37 @@ impl<'a> Resolver<'a> {
                         req.name
                     )
                 })?;
-                if !self.directs.contains_key(&req.name) {
-                    let d = fetch.direct(&req)?;
-                    self.directs.insert(req.name.clone(), d);
-                }
-                let d = &self.directs[&req.name];
-                if d.source != Source::Url(url.clone())
-                    && !matches!((&d.source, url.strip_prefix("git+")), (Source::Git { url: u, .. }, Some(g)) if g.starts_with(u.as_str()))
-                {
-                    bail!(
-                        "{} is required from two different places: {url} and {:?}",
-                        req.name,
-                        d.source
-                    );
-                }
-                if let Some((_, v)) = state.assigned.iter().find(|(n, _)| *n == req.name) {
-                    if *v != d.version {
+                let d = match self.direct_cache.get(&url) {
+                    Some(d) => d.clone(),
+                    None => {
+                        let d = fetch.direct(&req)?;
+                        self.direct_cache.insert(url.clone(), d.clone());
+                        d
+                    }
+                };
+                if let Some(active) = state.directs.get(&req.name) {
+                    if active.source != d.source {
                         bail!(
-                            "{} is pinned to {} by {url} but version {v} was already chosen for it; direct references must come before index versions",
+                            "{} is required from two different places: {:?} and {:?}",
                             req.name,
-                            d.version
+                            active.source,
+                            d.source
                         );
                     }
                 }
+                match state.assigned.iter().find(|(n, _)| *n == req.name) {
+                    // Chosen from the index before the URL arrived: the same
+                    // version keeps the assignment but takes the direct
+                    // source's metadata; another version is a conflict.
+                    Some((_, v)) if *v == d.version => reexpand_direct = true,
+                    Some(_) => {
+                        state = self.backtrack(&mut frames, &req.name)?;
+                        continue;
+                    }
+                    None => {}
+                }
                 req.specifier = Specifier::parse(&format!("=={}", d.version))?;
+                state.directs.insert(req.name.clone(), d);
             }
             // Record the constraint and extras. A package already assigned is
             // expanded again when it now applies in more environments (or with
@@ -728,7 +750,7 @@ impl<'a> Resolver<'a> {
                 if req.specifier.matches(&v)
                     || req.specifier.matches_allowing_pre(&v) && v.is_prerelease()
                 {
-                    if grew && !self.enqueue_deps(&mut state, &req.name, &v)? {
+                    if (grew || reexpand_direct) && !self.enqueue_deps(&mut state, &req.name, &v)? {
                         state = self.backtrack(&mut frames, &req.name)?;
                     }
                     continue;
@@ -742,7 +764,7 @@ impl<'a> Resolver<'a> {
                 .get(&req.name)
                 .cloned()
                 .unwrap_or_default();
-            let candidates = self.candidates(&req.name, &constraints)?;
+            let candidates = self.candidates(&req.name, &constraints, &state.directs)?;
             if candidates.is_empty() {
                 if let Some(fork) = self.fork(&constraints) {
                     bail!(
@@ -784,7 +806,7 @@ impl<'a> Resolver<'a> {
         for (name, version) in &state.assigned {
             let allow_yanked = state.constraints.get(name).is_some_and(|c| exact_pin(c));
             // A direct reference brings its own files; the index knows nothing of it.
-            let files: Vec<File> = if self.directs.contains_key(name) {
+            let files: Vec<File> = if state.directs.contains_key(name) {
                 Vec::new()
             } else {
                 self.index_of(name)
@@ -804,7 +826,7 @@ impl<'a> Resolver<'a> {
                     dependencies.push(r.clone());
                 }
             }
-            let (files, source) = match self.directs.get(name) {
+            let (files, source) = match state.directs.get(name) {
                 Some(d) => (d.files.clone(), d.source.clone()),
                 None => (
                     files,
@@ -864,7 +886,7 @@ impl<'a> Resolver<'a> {
     /// cannot be used after all (its metadata requires another Python than
     /// some environment it applies in has).
     fn enqueue_deps(&mut self, state: &mut State, name: &str, version: &Version) -> Result<bool> {
-        let meta = self.metadata(name, version)?;
+        let meta = self.metadata(name, version, &state.directs)?;
         let extras = state.extras.get(name).cloned().unwrap_or_default();
         let within: BTreeSet<usize> = state
             .constraints
@@ -930,13 +952,19 @@ impl<'a> Resolver<'a> {
 pub fn git_parts(url: &str) -> (String, Option<String>) {
     let u = url.strip_prefix("git+").unwrap_or(url);
     let u = u.split('#').next().unwrap_or(u);
-    // The `@` that separates the rev comes after the last `/`; one before it
-    // is userinfo (`git@github.com:`-style URLs are not accepted anyway).
-    match u.rfind('@') {
-        Some(i) if i > u.rfind('/').unwrap_or(0) => {
-            (u[..i].to_owned(), Some(u[i + 1..].to_owned()))
+    // The rev's `@` sits in the path, after the authority; an `@` inside the
+    // authority is userinfo. Revs may contain slashes (`feature/x`).
+    let path_start = u
+        .find("://")
+        .map(|i| i + 3)
+        .and_then(|a| u[a..].find('/').map(|p| a + p))
+        .unwrap_or(0);
+    match u[path_start..].find('@') {
+        Some(i) => {
+            let at = path_start + i;
+            (u[..at].to_owned(), Some(u[at + 1..].to_owned()))
         }
-        _ => (u.to_owned(), None),
+        None => (u.to_owned(), None),
     }
 }
 
@@ -1525,6 +1553,13 @@ mod tests {
         assert_eq!(
             git_parts("git+ssh://git@example.com/r.git"),
             ("ssh://git@example.com/r.git".into(), None)
+        );
+        assert_eq!(
+            git_parts("git+https://user@example.com/r.git@feature/test"),
+            (
+                "https://user@example.com/r.git".into(),
+                Some("feature/test".into())
+            )
         );
         let text = write_lock(
             &roots,

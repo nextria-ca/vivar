@@ -343,6 +343,23 @@ fn cache_dir() -> Result<PathBuf> {
     Ok(dirs::cache()?.join("wheels"))
 }
 
+/// A bare file name from a URL or archive listing, fit to join onto a cache
+/// directory: nothing empty, no `.`/`..`, no separators.
+fn safe_file_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\'])
+}
+
+/// `https://host/x.whl#sha256=abc` → (`https://host/x.whl`, `Some("abc")`).
+fn split_hash_fragment(url: &str) -> (String, Option<String>) {
+    match url.split_once('#') {
+        Some((bare, frag)) => (
+            bare.to_owned(),
+            frag.strip_prefix("sha256=").map(|h| h.to_lowercase()),
+        ),
+        None => (url.to_owned(), None),
+    }
+}
+
 /// Where wheels come from: the configured index (credentials go to its host
 /// only, never to whatever a lock names) and an optional wheelhouse
 /// directory that is tried first.
@@ -408,7 +425,7 @@ fn fetch_wheel(pkg: &Package, target: &wheelhouse::Target, source: &Source) -> R
         return builder.wheel_from_sdist(&pkg.name, &sdist);
     }
     let name = artifact.filename();
-    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+    if !safe_file_name(&name) {
         bail!("refusing artifact with unsafe file name {name:?}");
     }
     let expected = artifact.sha256().ok_or_else(|| {
@@ -463,9 +480,7 @@ fn apply(
     let want_names: BTreeSet<&str> = wanted.iter().map(|p| p.name.as_str()).collect();
     let mut removed = 0;
     for dist in &present {
-        let keep = wanted
-            .iter()
-            .any(|p| p.name == dist.name && p.version == dist.version);
+        let keep = wanted.iter().any(|p| same_install(p, dist));
         if !keep && (want_names.contains(dist.name.as_str()) || !dist.name.is_empty()) {
             install::uninstall(dist)?;
             removed += 1;
@@ -474,16 +489,13 @@ fn apply(
     let present = install::installed(&layout.site)?;
     let mut installed = 0;
     for pkg in wanted {
-        if present
-            .iter()
-            .any(|d| d.name == pkg.name && d.version == pkg.version)
-        {
+        if present.iter().any(|d| same_install(pkg, d)) {
             continue;
         }
         match pkg.source_kind.as_str() {
             "registry" | "url" | "git" => {
                 let wheel = fetch_wheel(pkg, target, source)?;
-                install::install_wheel(&wheel, layout)?;
+                install::install_wheel_from(&wheel, layout, direct_url_of(pkg).as_deref())?;
                 installed += 1;
             }
             "virtual" => {}
@@ -495,6 +507,50 @@ fn apply(
         }
     }
     Ok((installed, removed))
+}
+
+/// The PEP 610 record a lock package installs with: none for a registry
+/// package, the URL and hash for a direct one, the repository and commit for
+/// git. Same name and version from another source is a different install.
+fn direct_url_of(pkg: &Package) -> Option<String> {
+    match pkg.source_kind.as_str() {
+        "url" => {
+            let hash = pkg
+                .wheels
+                .first()
+                .or(pkg.sdist.as_ref())
+                .and_then(|a| a.sha256())
+                .map(|h| format!(",\"archive_info\":{{\"hash\":\"sha256={h}\"}}"))
+                .unwrap_or_default();
+            Some(format!(
+                "{{\"url\":{}{hash}}}",
+                crate::json::quote(&pkg.source)
+            ))
+        }
+        "git" => {
+            let (repo_with_rev, commit) = pkg.source.split_once('#')?;
+            let (repo, query) = repo_with_rev
+                .split_once('?')
+                .map(|(r, q)| (r, Some(q)))
+                .unwrap_or((repo_with_rev, None));
+            let rev = query
+                .and_then(|q| q.strip_prefix("rev="))
+                .map(|r| format!(",\"requested_revision\":{}", crate::json::quote(r)))
+                .unwrap_or_default();
+            Some(format!(
+                "{{\"url\":{},\"vcs_info\":{{\"vcs\":\"git\",\"commit_id\":{}{rev}}}}}",
+                crate::json::quote(repo),
+                crate::json::quote(commit)
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Whether what is installed is exactly this lock package: name, version and
+/// (for direct sources) the same URL, hash or commit.
+fn same_install(pkg: &Package, dist: &install::Installed) -> bool {
+    pkg.name == dist.name && pkg.version == dist.version && direct_url_of(pkg) == dist.direct_url
 }
 
 /// An editable install: a `.pth` pointing at the package's source directory
@@ -751,8 +807,15 @@ impl Builder<'_> {
     }
 
     /// Downloads a source distribution (hash-checked when a hash is known,
-    /// computed otherwise) and returns its path and hash.
+    /// computed otherwise) and returns its path and hash. The file is written
+    /// whole, then renamed: a failed download leaves nothing to be reused.
     fn fetch_sdist(&self, file: &File) -> Result<(PathBuf, String)> {
+        if !safe_file_name(&file.filename) {
+            bail!(
+                "refusing artifact with unsafe file name {:?}",
+                file.filename
+            );
+        }
         let key = file.sha256.clone().unwrap_or_else(|| {
             let mut h = sha256::Sha256::new();
             h.update(file.url.as_bytes());
@@ -768,7 +831,13 @@ impl Builder<'_> {
             } else {
                 file.url.clone()
             };
-            upgrade::fetch_to(&url, &dest)?;
+            let part = dir.join(format!("{}.part-{}", file.filename, std::process::id()));
+            let fetched = upgrade::fetch_to(&url, &part);
+            if let Err(e) = fetched {
+                let _ = fs::remove_file(&part);
+                return Err(e);
+            }
+            fs::rename(&part, &dest)?;
         }
         let actual = sha256::file(&dest)?;
         if let Some(expected) = &file.sha256 {
@@ -781,6 +850,30 @@ impl Builder<'_> {
             }
         }
         Ok((dest, actual))
+    }
+
+    /// Cache key for a build: the source's identity plus what it was built
+    /// for, since a compiled wheel is good for one Python and platform.
+    fn build_key(&self, identity: &str) -> Result<String> {
+        let target = wheelhouse::Target::new(None, &self.series)?;
+        let mut h = sha256::Sha256::new();
+        h.update(identity.as_bytes());
+        Ok(format!(
+            "{}-{}",
+            &sha256::hex(&h.finish())[..16],
+            target.label()
+        ))
+    }
+
+    /// A cached wheel is reused only when it fits this target.
+    fn fitting_cached_wheel(&self, dir: &Path) -> Option<PathBuf> {
+        let target = wheelhouse::Target::new(None, &self.series).ok()?;
+        Self::cached_wheel(dir).filter(|w| {
+            w.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| target.score(n))
+                .is_some()
+        })
     }
 
     /// Unpacks a `.tar.gz`/`.zip` source distribution into `into` and returns
@@ -833,8 +926,11 @@ impl Builder<'_> {
 
     /// Builds (or finds the cached) wheel for a source tree.
     fn wheel_from_tree(&self, name: &str, src: &Path, key: &str) -> Result<PathBuf> {
+        if self.backend.no_build {
+            bail!("{name} would have to be built from source and policy requires wheels");
+        }
         let out = Self::built_dir(key)?;
-        if let Some(w) = Self::cached_wheel(&out) {
+        if let Some(w) = self.fitting_cached_wheel(&out) {
             return Ok(w);
         }
         fs::create_dir_all(&out)?;
@@ -857,16 +953,17 @@ impl Builder<'_> {
             .split_once('#')
             .ok_or_else(|| anyhow!("{name}: git source {source:?} has no commit"))?;
         let repo = repo_with_rev.split('?').next().unwrap_or(repo_with_rev);
-        let key = {
-            let mut h = sha256::Sha256::new();
-            h.update(format!("{repo}#{commit}").as_bytes());
-            sha256::hex(&h.finish())[..16].to_owned()
-        };
-        if let Some(w) = Self::cached_wheel(&Self::built_dir(&key)?) {
+        if self.backend.no_build {
+            bail!("{name} comes from git and would have to be built; policy requires wheels");
+        }
+        let key = self.build_key(&format!("{repo}#{commit}"))?;
+        if let Some(w) = self.fitting_cached_wheel(&Self::built_dir(&key)?) {
             return Ok(w);
         }
         let src = Self::clone(repo, Some(commit))?.0;
-        self.wheel_from_tree(name, &src, &key)
+        let wheel = self.wheel_from_tree(name, &src, &key);
+        let _ = fs::remove_dir_all(&src);
+        wheel
     }
 
     /// Clones `repo` at `rev` (a branch, tag or commit; HEAD when none) into a
@@ -917,8 +1014,8 @@ impl Fetch for Builder<'_> {
             bail!("{name} ships only a source distribution and policy requires wheels");
         }
         let (archive, hash) = self.fetch_sdist(sdist)?;
-        let key = hash[..16].to_owned();
-        if let Some(w) = Self::cached_wheel(&Self::built_dir(&key)?) {
+        let key = self.build_key(&hash)?;
+        if let Some(w) = self.fitting_cached_wheel(&Self::built_dir(&key)?) {
             return Ok(w);
         }
         let scratch =
@@ -960,13 +1057,12 @@ impl Fetch for Builder<'_> {
             if spec.contains("#subdirectory=") {
                 bail!("{name}: git references with a subdirectory are not supported yet");
             }
+            if self.backend.no_build {
+                bail!("{name} comes from git and would have to be built; policy requires wheels");
+            }
             let (repo, rev) = crate::resolve::git_parts(&url);
             let (src, commit) = Self::clone(&repo, rev.as_deref())?;
-            let key = {
-                let mut h = sha256::Sha256::new();
-                h.update(format!("{repo}#{commit}").as_bytes());
-                sha256::hex(&h.finish())[..16].to_owned()
-            };
+            let key = self.build_key(&format!("{repo}#{commit}"))?;
             let wheel = self.wheel_from_tree(&name, &src, &key);
             let _ = fs::remove_dir_all(&src);
             let (version, metadata) = metadata_of(&wheel?)?;
@@ -981,18 +1077,20 @@ impl Fetch for Builder<'_> {
                 },
             });
         }
+        // `#sha256=…` on the URL is a promise to hold the download to.
+        let (url, expected) = split_hash_fragment(&url);
         let filename = crate::lock::Artifact {
             url: url.clone(),
             hash: None,
         }
         .filename();
-        if filename.is_empty() || filename.contains(['/', '\\']) {
+        if !safe_file_name(&filename) {
             bail!("{name}: {url} does not name a file");
         }
         let file = File {
             filename: filename.clone(),
             url: url.clone(),
-            sha256: None,
+            sha256: expected,
             requires_python: None,
             yanked: false,
             has_metadata: false,
@@ -1159,11 +1257,11 @@ impl Backend for NativeBackend {
         // Additive: a tool env only ever gains what it asked for.
         let present = install::installed(&layout.site)?;
         let mut installed = 0;
-        for pkg in wanted.iter().filter(|p| p.source_kind == "registry") {
-            if present
-                .iter()
-                .any(|d| d.name == pkg.name && d.version == pkg.version)
-            {
+        for pkg in wanted
+            .iter()
+            .filter(|p| matches!(p.source_kind.as_str(), "registry" | "url" | "git"))
+        {
+            if present.iter().any(|d| same_install(pkg, d)) {
                 continue;
             }
             if let Some(old) = present.iter().find(|d| d.name == pkg.name) {
@@ -1171,7 +1269,7 @@ impl Backend for NativeBackend {
             }
             let wheel =
                 self.with_source(Some(&series), |source| fetch_wheel(pkg, &target, source))?;
-            install::install_wheel(&wheel, &layout)?;
+            install::install_wheel_from(&wheel, &layout, direct_url_of(pkg).as_deref())?;
             installed += 1;
         }
         println!("native install: {installed} package(s)");

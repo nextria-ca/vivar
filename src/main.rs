@@ -401,11 +401,17 @@ fn main() -> Result<()> {
                 venv::ensure(project.venv_root(), &project.name())?;
                 transact(&project, &backend, &cwd, Some(&name), || {
                     project::declare_profile(&project.root, &name, &packages)?;
+                    // uv adds to the group without installing it; a new profile is
+                    // installed and made the active one, so policy sees the packages.
                     backend.add(&cwd, &packages, Some(&name))?;
+                    backend.sync_group(&cwd, Some(&name))?;
+                    venv::mark_profile(project.venv_root(), Some(&name));
                     venv::mark_synced(project.venv_root());
                     after_install(&project, &policy)
                 })?;
-                println!("profile `{name}` ready; `vivar sync --profile {name}` (or `--profile auto`) installs it");
+                println!(
+                    "profile `{name}` installed and active; `vivar sync --profile <name>` or `--profile auto` switches"
+                );
             }
             ProfileCommand::List => {
                 let project = require(project, &cwd)?;
@@ -911,22 +917,30 @@ fn transact(
         }
     }
     if lock_changed || venv::fingerprint(&venv_dir) != env_before {
-        // Back to what was installed before: the active profile plus the group
-        // being added to, if they still exist (a group the operation created doesn't).
-        let restored = Project::load(&project.root).ok();
-        let exists = |g: &str| restored.as_ref().is_some_and(|p| p.has_group(g));
-        let mut groups: Vec<&str> = Vec::new();
-        if let Some(p) = profile_before.as_deref().filter(|p| exists(p)) {
-            groups.push(p);
-        }
-        if let Some(g) = group.filter(|g| exists(g) && !groups.contains(g)) {
+        // Back to what was installed before: the previously active profile (it
+        // belongs to the project that owns the env, the workspace root for a
+        // member) plus the plain group being added to. Never a second profile:
+        // profiles exclude each other and the sync would be refused.
+        let member = Project::load(&project.root).ok();
+        let owner = Project::load(project.venv_root()).ok();
+        let profiles: Vec<String> = owner
+            .iter()
+            .chain(member.iter())
+            .flat_map(|p| p.profiles())
+            .collect();
+        let exists = |g: &str| {
+            owner.as_ref().is_some_and(|p| p.has_group(g))
+                || member.as_ref().is_some_and(|p| p.has_group(g))
+        };
+        let profile = profile_before.as_deref().filter(|p| exists(p));
+        let mut groups: Vec<&str> = profile.into_iter().collect();
+        if let Some(g) =
+            group.filter(|g| exists(g) && !groups.contains(g) && !profiles.iter().any(|p| p == g))
+        {
             groups.push(g);
         }
         let _ = backend.sync_groups(cwd, &groups);
-        venv::mark_profile(
-            project.venv_root(),
-            profile_before.as_deref().filter(|p| exists(p)),
-        );
+        venv::mark_profile(project.venv_root(), profile);
         venv::mark_synced(project.venv_root());
     }
     Err(e)

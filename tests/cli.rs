@@ -1552,6 +1552,20 @@ fn profiles_env_files_and_policy_env() {
     let text = read(&dir.join("pyproject.toml"));
     assert!(!text.contains("cu999"), "{text}");
     ok(dir, &["run", "python", "-c", "import mpmath"]);
+    // A second profile rejected by policy after install is rolled back the same way:
+    // the active profile stays installed and the project keeps only it.
+    append_policy(dir, "allow-licenses = [\"MIT\", \"BSD-3-Clause\"]");
+    let out = vivar(dir, &["profile", "add", "cu124", "typing-extensions"]); // PSF-2.0
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("licenses outside"));
+    let text = read(&dir.join("pyproject.toml"));
+    assert!(
+        !text.contains("cu124") && text.contains("profiles = [\"cpu\"]"),
+        "{text}"
+    );
+    ok(dir, &["run", "python", "-c", "import mpmath"]);
+    let out = vivar(dir, &["run", "python", "-c", "import typing_extensions"]);
+    assert!(!out.status.success(), "rejected package is still installed");
     if cfg!(unix) {
         let here = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
         let xarchive = tmp.0.join("xprof.tar.gz");

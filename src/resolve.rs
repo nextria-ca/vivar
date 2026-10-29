@@ -293,14 +293,27 @@ impl<'a> Resolver<'a> {
         let mut out = BTreeSet::new();
         for &i in within {
             let mut e = self.envs[i].0.clone();
-            // Only the extras requested in this very environment count.
-            e.extra = extras
+            // Only the extras requested in this very environment count, and
+            // the package is also installed bare (a plain `a` next to an
+            // optional `a[fast]`), so a marker that mentions extras is tried
+            // with them and without: `b; extra != 'fast'` stays in.
+            let requested: Vec<String> = extras
                 .iter()
                 .filter(|(_, envs)| envs.contains(&i))
                 .map(|(k, _)| k.clone())
                 .collect();
+            let mut extra_sets = vec![requested];
+            if m.contains("extra") && !extra_sets[0].is_empty() {
+                extra_sets.push(Vec::new());
+            }
+            let holds = |e: &mut MarkerEnv| {
+                extra_sets.iter().any(|set| {
+                    e.extra = set.clone();
+                    eval_marker(m, e).unwrap_or(false)
+                })
+            };
             if !m.contains("python_full_version") {
-                if eval_marker(m, &e).unwrap_or(false) {
+                if holds(&mut e) {
                     out.insert(i);
                 }
                 continue;
@@ -310,7 +323,7 @@ impl<'a> Resolver<'a> {
                 .iter()
                 .map(|p| {
                     e.python_full_version = p.to_string();
-                    eval_marker(m, &e).unwrap_or(false)
+                    holds(&mut e)
                 })
                 .collect();
             if verdicts.iter().all(|v| *v) {
@@ -1047,6 +1060,20 @@ mod tests {
                 &none,
                 &bounded.all_envs()
             )
+            .unwrap()
+            .is_empty());
+        // A requested extra never hides what the bare package needs.
+        let fast = Extras::from([("fast".to_owned(), all.clone())]);
+        assert_eq!(
+            r.where_holds(Some("extra != 'fast'"), &fast, &all).unwrap(),
+            all
+        );
+        assert_eq!(
+            r.where_holds(Some("extra == 'fast'"), &fast, &all).unwrap(),
+            all
+        );
+        assert!(r
+            .where_holds(Some("extra == 'fast'"), &none, &all)
             .unwrap()
             .is_empty());
         // A single interpreter is exactly its patch.

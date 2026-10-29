@@ -138,7 +138,7 @@ impl Target {
     }
 
     /// The best wheel for this target, else the sdist.
-    fn pick<'a>(&self, pkg: &'a Package) -> Option<(&'a Artifact, bool)> {
+    pub fn pick<'a>(&self, pkg: &'a Package) -> Option<(&'a Artifact, bool)> {
         pkg.wheels
             .iter()
             .filter_map(|w| self.score(&w.filename()).map(|s| (s, w)))

@@ -20,6 +20,14 @@ pub struct Package {
     /// Direct dependencies (all extras and groups flattened). Forked lockfiles
     /// pin an edge to a version when several variants of a package exist.
     pub dependencies: Vec<Dep>,
+    /// Only the unconditional dependencies (no extra, no group).
+    pub base_dependencies: Vec<Dep>,
+    /// `[package.optional-dependencies]` by extra name.
+    pub extras: std::collections::BTreeMap<String, Vec<Dep>>,
+    /// `[package.dev-dependencies]` by group name.
+    pub groups: std::collections::BTreeMap<String, Vec<Dep>>,
+    /// Markers under which this variant of the package applies (forks).
+    pub resolution_markers: Vec<String>,
     /// Every artifact has a hash (registry packages always do with uv).
     pub hashed: bool,
     pub wheels: Vec<Artifact>,
@@ -72,6 +80,10 @@ impl Artifact {
 pub struct Dep {
     pub name: String,
     pub version: Option<String>,
+    /// PEP 508 marker gating this edge, when the lock has one.
+    pub marker: Option<String>,
+    /// Extras requested of the dependency.
+    pub extras: Vec<String>,
 }
 
 pub struct Lock {
@@ -107,32 +119,68 @@ impl Lock {
                 .map(|(k, v)| (k.to_owned(), v.as_str().unwrap_or("").to_owned()))
                 .unwrap_or_default();
 
-            let mut dependencies = Vec::new();
-            let mut push_deps = |item: Option<&Item>| {
+            let deps_of = |item: Option<&Item>| -> Vec<Dep> {
+                let mut out = Vec::new();
                 if let Some(arr) = item.and_then(Item::as_array) {
                     for t in arr.iter().filter_map(|v| v.as_inline_table()) {
                         if let Some(name) = t.get("name").and_then(|n| n.as_str()) {
-                            dependencies.push(Dep {
+                            out.push(Dep {
                                 name: name.to_owned(),
                                 version: t
                                     .get("version")
                                     .and_then(|v| v.as_str())
                                     .map(str::to_owned),
+                                marker: t.get("marker").and_then(|v| v.as_str()).map(str::to_owned),
+                                extras: t
+                                    .get("extra")
+                                    .and_then(|v| v.as_array())
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(|e| e.as_str())
+                                            .map(str::to_owned)
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
                             });
                         }
                     }
                 }
+                out
             };
-            push_deps(table.get("dependencies"));
-            for group in ["optional-dependencies", "dev-dependencies"] {
-                if let Some(t) = table.get(group).and_then(Item::as_table_like) {
-                    for (_, item) in t.iter() {
-                        push_deps(Some(item));
-                    }
+            let base_dependencies = deps_of(table.get("dependencies"));
+            let mut extras = std::collections::BTreeMap::new();
+            let mut groups = std::collections::BTreeMap::new();
+            if let Some(t) = table
+                .get("optional-dependencies")
+                .and_then(Item::as_table_like)
+            {
+                for (k, item) in t.iter() {
+                    extras.insert(k.to_owned(), deps_of(Some(item)));
                 }
             }
+            if let Some(t) = table.get("dev-dependencies").and_then(Item::as_table_like) {
+                for (k, item) in t.iter() {
+                    groups.insert(k.to_owned(), deps_of(Some(item)));
+                }
+            }
+            let mut dependencies: Vec<Dep> = base_dependencies
+                .iter()
+                .chain(extras.values().flatten())
+                .chain(groups.values().flatten())
+                .cloned()
+                .collect();
             dependencies.sort();
             dependencies.dedup();
+            let resolution_markers = table
+                .get("resolution-markers")
+                .and_then(Item::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
 
             let artifact = |t: &toml_edit::InlineTable| Artifact {
                 url: t
@@ -163,6 +211,10 @@ impl Lock {
                 source_kind,
                 source,
                 dependencies,
+                base_dependencies,
+                extras,
+                groups,
+                resolution_markers,
                 hashed: !artifacts.is_empty() && artifacts.iter().all(|a| a.hash.is_some()),
                 wheels,
                 sdist,
@@ -355,6 +407,8 @@ wheels = [{ url = "w", hash = "sha256:c" }]
         assert_eq!(lock.packages.len(), 5);
         let app = lock.get("app").unwrap();
         assert_eq!(app.source_kind, "virtual");
+        assert_eq!(app.base_dependencies.len(), 1);
+        assert_eq!(app.groups["dev"][0].name, "six");
         let names: Vec<&str> = app.dependencies.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, vec!["pytest", "six"]);
         assert!(lock.get("pytest").unwrap().hashed);

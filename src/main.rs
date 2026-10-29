@@ -7,10 +7,13 @@ mod envs;
 mod export;
 mod gpu;
 mod import;
+mod install;
 mod json;
 mod kernel;
 mod licenses;
 mod lock;
+mod native;
+mod pep;
 mod project;
 mod python;
 mod sbom;
@@ -21,10 +24,12 @@ mod upgrade;
 mod venv;
 mod verify;
 mod wheelhouse;
+mod zip;
 
 use anyhow::{bail, Result};
 use backend::{Backend, UvBackend};
 use clap::{CommandFactory, Parser, Subcommand};
+use native::NativeBackend;
 use project::Project;
 use std::path::PathBuf;
 
@@ -404,7 +409,7 @@ fn main() -> Result<()> {
         Some(p) => p.policy()?,
         None => project::org_policy()?.map(|(_, p)| p).unwrap_or_default(),
     };
-    let backend = UvBackend::new(&policy);
+    let backend = backend_for(&policy);
 
     match cli.command {
         Command::Init {
@@ -444,7 +449,7 @@ fn main() -> Result<()> {
             let project = require(project, &cwd)?;
             project.check_requirements(&packages)?;
             venv::ensure(project.venv_root(), &project.name())?;
-            transact(&project, &backend, &cwd, group.as_deref(), || {
+            transact(&project, &*backend, &cwd, group.as_deref(), || {
                 route_pytorch(&project, &packages, cuda.as_deref())?;
                 backend.add(&cwd, &packages, group.as_deref())?;
                 venv::mark_synced(project.venv_root());
@@ -480,7 +485,7 @@ fn main() -> Result<()> {
                 }
             };
             let policy = project.policy()?;
-            let backend = UvBackend::new(&policy);
+            let backend = backend_for(&policy);
             let all: Vec<String> = imported
                 .requirements
                 .iter()
@@ -494,7 +499,7 @@ fn main() -> Result<()> {
                 }
             }
             let root = project.root.clone();
-            transact(&project, &backend, &root, None, || {
+            transact(&project, &*backend, &root, None, || {
                 let project = if convert {
                     let name = imported.name.clone().unwrap_or_else(|| project.name());
                     let python = python.clone().or(imported.python.clone());
@@ -566,7 +571,7 @@ fn main() -> Result<()> {
         } => {
             let project = require(project, &cwd)?;
             std::process::exit(run_check(
-                &project, &policy, &backend, no_audit, no_verify, json,
+                &project, &policy, &*backend, no_audit, no_verify, json,
             )?);
         }
         Command::Key { command } => match command {
@@ -597,7 +602,7 @@ fn main() -> Result<()> {
                 let project = require(project, &cwd)?;
                 project.check_requirements(&packages)?;
                 venv::ensure(project.venv_root(), &project.name())?;
-                transact(&project, &backend, &cwd, Some(&name), || {
+                transact(&project, &*backend, &cwd, Some(&name), || {
                     project::declare_profile(&project.root, &name, &packages)?;
                     // uv adds to the group without installing it; a new profile is
                     // installed and made the active one, so policy sees the packages.
@@ -690,7 +695,7 @@ fn main() -> Result<()> {
                 && tool::script_metadata(script)?.is_some()
             {
                 std::process::exit(tool::run_script(
-                    &backend,
+                    &*backend,
                     &policy,
                     script,
                     &args[1..],
@@ -901,7 +906,7 @@ fn main() -> Result<()> {
         Command::Tool { command } => match command {
             ToolCommand::Run { from, python, args } => {
                 let code = tool::run(
-                    &backend,
+                    &*backend,
                     &policy,
                     from.as_deref(),
                     &args[0],
@@ -911,7 +916,7 @@ fn main() -> Result<()> {
                 std::process::exit(code);
             }
             ToolCommand::Install { package, python } => {
-                tool::install(&backend, &policy, &package, python.as_deref())?
+                tool::install(&*backend, &policy, &package, python.as_deref())?
             }
             ToolCommand::Uninstall { package } => tool::uninstall(&package)?,
             ToolCommand::List => tool::list()?,
@@ -960,7 +965,7 @@ fn main() -> Result<()> {
                     let t = wheelhouse::Target::new(Some(&target), &python)?;
                     check_hashes(&project, &policy)?;
                     bundle::pack_for_target(
-                        &backend,
+                        &*backend,
                         &policy,
                         project.venv_root(),
                         &project.name(),
@@ -1140,7 +1145,7 @@ fn main() -> Result<()> {
 fn run_check(
     project: &Project,
     policy: &project::Policy,
-    backend: &UvBackend,
+    backend: &dyn Backend,
     no_audit: bool,
     no_verify: bool,
     json: bool,
@@ -1307,7 +1312,7 @@ fn record(
 
 fn transact(
     project: &Project,
-    backend: &UvBackend,
+    backend: &dyn Backend,
     cwd: &std::path::Path,
     group: Option<&str>,
     op: impl FnOnce() -> Result<()>,
@@ -1628,6 +1633,19 @@ fn split_command(task: &str) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+/// uv when it is on PATH (resolution needs it), vivar's own installer
+/// otherwise; `VIVAR_BACKEND=native` forces the latter.
+fn backend_for(policy: &project::Policy) -> Box<dyn Backend> {
+    let forced = std::env::var("VIVAR_BACKEND")
+        .map(|v| v == "native")
+        .unwrap_or(false);
+    if !forced && backend::uv_available() {
+        Box::new(UvBackend::new(policy))
+    } else {
+        Box::new(NativeBackend::new(policy))
+    }
 }
 
 fn require(project: Option<Project>, cwd: &std::path::Path) -> Result<Project> {

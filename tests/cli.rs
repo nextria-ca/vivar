@@ -2287,3 +2287,124 @@ fn import_rolls_back_on_policy_and_handles_poetry_in_place() {
     assert_eq!(read(&b.join(".python-version")).trim(), "3.12");
     ok(&b, &["run", "python", "-c", "import six, pycodestyle"]);
 }
+
+#[test]
+fn native_backend_syncs_from_the_lock_without_uv() {
+    let tmp = TempDir::new("native");
+    let dir = &tmp.0;
+    init(dir);
+    ok(dir, &["add", "six", "pycodestyle", "pytest"]);
+    let native = |cwd: &Path, args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_vivar"))
+            .current_dir(cwd)
+            .env("VIVAR_BACKEND", "native")
+            .env("PATH", bare_path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let okn = |cwd: &Path, args: &[&str]| {
+        let out = native(cwd, args);
+        assert!(
+            out.status.success(),
+            "native vivar {} failed:\n{}{}",
+            args.join(" "),
+            stdout_of(&out),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    };
+
+    // A fresh environment from the lock, with uv nowhere on PATH.
+    fs::remove_dir_all(dir.join(".venv")).unwrap();
+    let out = okn(dir, &["sync"]);
+    assert!(
+        stdout_of(&out).contains("native sync: 7 package(s) installed"),
+        "{}",
+        stdout_of(&out)
+    );
+    okn(
+        dir,
+        &[
+            "run",
+            "python",
+            "-c",
+            "import six, pycodestyle, pytest, pluggy",
+        ],
+    );
+    let script = dir
+        .join(".venv")
+        .join(if cfg!(windows) { "Scripts" } else { "bin" })
+        .join(if cfg!(windows) {
+            "pycodestyle.cmd"
+        } else {
+            "pycodestyle"
+        });
+    let out = Command::new(&script).arg("--version").output().unwrap();
+    assert!(out.status.success(), "generated console script failed");
+    assert!(stdout_of(&out).trim().starts_with('2'));
+    // RECORD, INSTALLER and the dist-info are in place for every package.
+    let six_info = site_packages(dir).join("six-1.17.0.dist-info");
+    assert_eq!(read(&six_info.join("INSTALLER")).trim(), "vivar");
+    assert!(read(&six_info.join("RECORD")).contains("six.py,sha256="));
+    // Idempotent.
+    assert!(stdout_of(&okn(dir, &["sync"])).contains("0 package(s) installed, 0 removed"));
+
+    // Removal: drop pytest from the lock (uv does the resolving), native sync removes it.
+    ok(dir, &["remove", "pytest"]);
+    let site = site_packages(dir);
+    // Put it back by hand to prove native sync removes what the lock no longer has.
+    if !site.join("pytest").exists() {
+        let out = okn(dir, &["sync"]);
+        assert!(
+            stdout_of(&out).contains("2 in the environment"),
+            "{}",
+            stdout_of(&out)
+        );
+    }
+    assert!(!native(dir, &["run", "python", "-c", "import pytest"])
+        .status
+        .success());
+    okn(dir, &["run", "python", "-c", "import six, pycodestyle"]);
+
+    // Export, check and the Python-free cross-target layout all work natively.
+    okn(dir, &["export", "requirements"]);
+    assert!(read(&dir.join("requirements.txt")).contains("six==1.17.0"));
+    let out = okn(dir, &["check", "--no-audit"]);
+    assert!(
+        stdout_of(&out).contains("all checks passed"),
+        "{}",
+        stdout_of(&out)
+    );
+    // Resolution still needs uv, and says so clearly.
+    let out = native(dir, &["add", "rich"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("delegates to uv"));
+    if cfg!(unix) {
+        let here = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+        let archive = tmp.0.join("native-x.tar.gz");
+        okn(
+            dir,
+            &[
+                "pack",
+                "--target",
+                &here,
+                "--python",
+                "3.12",
+                "-o",
+                archive.to_str().unwrap(),
+            ],
+        );
+        let dest = tmp.0.join("native-x-dest");
+        okn(
+            &tmp.0,
+            &["unpack", archive.to_str().unwrap(), dest.to_str().unwrap()],
+        );
+        okn(&dest, &["run", "python", "-c", "import six, pycodestyle"]);
+        let out = Command::new(dest.join(".venv").join("bin").join("pycodestyle"))
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+}

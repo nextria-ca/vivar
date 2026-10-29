@@ -2118,6 +2118,32 @@ fn import_rolls_back_on_policy_and_handles_poetry_in_place() {
         .status
         .success());
 
+    // A poetry-only project whose import is rejected ends up exactly as it was:
+    // original pyproject, no leftover environment.
+    let c = tmp.0.join("poetry-strict");
+    fs::create_dir_all(&c).unwrap();
+    let original = "[tool.poetry]\nname = \"svc\"\nversion = \"1.0\"\n\n[tool.poetry.dependencies]\npython = \"^3.12\"\ntyping-extensions = \"*\"\n";
+    fs::write(c.join("pyproject.toml"), original).unwrap();
+    let strict = tmp.0.join("strict-org.toml");
+    fs::write(&strict, "[policy]\nallow-licenses = [\"MIT\"]\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
+        .current_dir(&c)
+        .env("VIVAR_POLICY", &strict)
+        .args(["import", "pyproject.toml"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("licenses outside"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(read(&c.join("pyproject.toml")), original);
+    assert!(
+        !c.join(".venv").exists(),
+        "rolled-back import left a .venv behind"
+    );
+
     // A poetry-only pyproject in place gets [project] metadata and its deps.
     let b = tmp.0.join("poetry");
     fs::create_dir_all(&b).unwrap();

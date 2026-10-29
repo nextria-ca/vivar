@@ -1320,6 +1320,7 @@ fn transact(
     ];
     let snapshot: Vec<Option<Vec<u8>>> = files.iter().map(|p| std::fs::read(p).ok()).collect();
     let env_before = venv::fingerprint(&venv_dir);
+    let had_venv = venv_dir.join("pyvenv.cfg").exists();
     let profile_before = venv::current_profile(project.venv_root());
     let Err(e) = op() else {
         return Ok(());
@@ -1333,6 +1334,23 @@ fn transact(
                 let _ = std::fs::remove_file(path);
             }
         }
+    }
+    if !had_venv && venv_dir.exists() {
+        // The operation created the environment (a fresh import, a converted
+        // poetry project): there is nothing to sync back to, so it goes.
+        let _ = std::fs::remove_dir_all(&venv_dir);
+        return Err(e);
+    }
+    let restored_is_project = Project::load(&project.root)
+        .map(|p| p.has_project_table())
+        .unwrap_or(false);
+    if !restored_is_project {
+        // Nothing uv could sync against; say so rather than pretend.
+        println!(
+            "note: {} has no [project] table after the rollback, so .venv was left as it is",
+            project.root.join(project::PYPROJECT).display()
+        );
+        return Err(e);
     }
     if lock_changed || venv::fingerprint(&venv_dir) != env_before {
         // Back to what was installed before: the previously active profile (it

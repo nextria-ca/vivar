@@ -52,10 +52,11 @@ pub fn generate(force: bool) -> Result<PathBuf> {
         bail!("{} already exists; pass --force to replace it (bundles signed with the old key will stop verifying)", path.display());
     }
     fs::create_dir_all(path.parent().context("key path has no parent")?)?;
+    // New bytes first: a failing random source must not cost the existing key.
+    let bytes = random_bytes()?;
     // Replace, never truncate in place: a key file created elsewhere with wide
     // permissions would otherwise keep them.
     let _ = fs::remove_file(&path);
-    let bytes = random_bytes()?;
     // Private from the first byte: created with 0600, never widened.
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);

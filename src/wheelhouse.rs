@@ -77,17 +77,32 @@ impl Target {
         if !py_ok {
             return None;
         }
-        let specific = plat.split('.').any(|p| self.platform_ok(p));
-        let any = plat == "any";
-        if !specific && !any {
+        // The ABI must be ours, stable, or none: no free-threaded (`cp313t`) or
+        // debug builds for a regular interpreter.
+        if !abi
+            .split('.')
+            .any(|a| a == self.py || a == "abi3" || a == "none")
+        {
             return None;
         }
-        // A native wheel for the exact interpreter beats pure-Python beats abi3.
-        let mut score = if specific { 100 } else { 50 };
-        if py.contains(&self.py) {
-            score += 10;
+        let platforms: Vec<&str> = plat.split('.').filter(|p| self.platform_ok(p)).collect();
+        let any = plat == "any";
+        if platforms.is_empty() && !any {
+            return None;
         }
-        Some(score)
+        // A native wheel for the exact interpreter beats pure-Python beats abi3,
+        // and among native wheels the one with the oldest OS/libc floor wins:
+        // it runs on the most machines.
+        let mut score = if any { 500 } else { 1000 };
+        if py.contains(&self.py) {
+            score += 100;
+        }
+        let floor = platforms
+            .iter()
+            .map(|p| platform_floor(p))
+            .min()
+            .unwrap_or(0);
+        Some(score - floor)
     }
 
     fn platform_ok(&self, tag: &str) -> bool {
@@ -116,10 +131,34 @@ impl Target {
     fn pick<'a>(&self, pkg: &'a Package) -> Option<(&'a Artifact, bool)> {
         pkg.wheels
             .iter()
-            .filter_map(|w| self.score(w.filename()).map(|s| (s, w)))
+            .filter_map(|w| self.score(&w.filename()).map(|s| (s, w)))
             .max_by_key(|(s, _)| *s)
             .map(|(_, w)| (w, true))
             .or(pkg.sdist.as_ref().map(|s| (s, false)))
+    }
+}
+
+/// How demanding a platform tag is: the glibc minor for manylinux, the macOS
+/// major for macosx, 0 otherwise. Lower runs on more machines.
+fn platform_floor(tag: &str) -> u32 {
+    let nums: Vec<u32> = tag
+        .split('_')
+        .skip(1)
+        .take(2)
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    if tag.starts_with("manylinux_") {
+        nums.get(1).copied().unwrap_or(0)
+    } else if tag.starts_with("manylinux2014") {
+        17
+    } else if tag.starts_with("manylinux2010") {
+        12
+    } else if tag.starts_with("manylinux1") {
+        5
+    } else if tag.starts_with("macosx_") {
+        nums.first().copied().unwrap_or(0)
+    } else {
+        0
     }
 }
 
@@ -203,6 +242,18 @@ mod tests {
             linux.score("numpy-2.5.4-cp312-cp312-manylinux_2_28_x86_64.whl")
                 > linux.score("six-1.17.0-py3-none-any.whl")
         );
+        // Older floors win ties; free-threaded builds never match a regular interpreter.
+        assert!(
+            linux.score("numpy-2.5.4-cp312-cp312-manylinux_2_17_x86_64.whl")
+                > linux.score("numpy-2.5.4-cp312-cp312-manylinux_2_28_x86_64.whl")
+        );
+        let py313 = Target::new(Some("linux-x86_64"), "3.13").unwrap();
+        assert!(py313
+            .score("numpy-2.5.4-cp313-cp313-manylinux_2_28_x86_64.whl")
+            .is_some());
+        assert!(py313
+            .score("numpy-2.5.4-cp313-cp313t-manylinux_2_28_x86_64.whl")
+            .is_none());
 
         let win = Target::new(Some("windows-amd64"), "3.12").unwrap();
         assert!(win.score("numpy-2.5.4-cp312-cp312-win_amd64.whl").is_some());
@@ -217,6 +268,13 @@ mod tests {
         assert!(mac
             .score("x-1.0-cp313-cp313-macosx_11_0_universal2.whl")
             .is_some());
+        assert!(
+            mac.score("numpy-2.5.4-cp313-cp313-macosx_11_0_arm64.whl")
+                > mac.score("numpy-2.5.4-cp313-cp313-macosx_14_0_arm64.whl")
+        );
+        assert_eq!(platform_floor("manylinux2014_x86_64"), 17);
+        assert_eq!(platform_floor("macosx_14_0_arm64"), 14);
+        assert_eq!(platform_floor("win_amd64"), 0);
         assert!(Target::new(Some("plan9-mips"), "3.12").is_err());
         assert!(Target::new(None, "three").is_err());
     }

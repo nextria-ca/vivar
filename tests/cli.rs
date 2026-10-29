@@ -1349,8 +1349,13 @@ fn shell_slim_pack_init_lib_and_cuda_routing() {
     );
     ok(dir, &["run", "python", "-c", "import mpmath"]);
 
-    // No release exists yet, so --check must fail with a clear message, not a panic.
-    let out = vivar(dir, &["upgrade", "--check"]);
+    // With the API unreachable, --check fails with a clear message, not a panic.
+    let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
+        .current_dir(dir)
+        .env("VIVAR_GITHUB_API", "http://127.0.0.1:9")
+        .args(["upgrade", "--check"])
+        .output()
+        .unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("release"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("failed"));
 }

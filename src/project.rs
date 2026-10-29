@@ -26,11 +26,15 @@ pub fn init_files(root: &Path, name: &str, version: [u32; 3], lib: bool) -> Resu
         build["requires"] = value(requires);
         build["build-backend"] = value("hatchling.build");
         doc["build-system"] = Item::Table(build);
-        let package = root.join("src").join(name.replace('-', "_"));
-        fs::create_dir_all(&package)?;
-        let init = package.join("__init__.py");
-        if !init.exists() {
-            fs::write(init, "")?;
+        // `acme.widgets` → src/acme/widgets/, each level a package.
+        let mut package = root.join("src");
+        for part in name.replace('-', "_").split('.') {
+            package = package.join(part);
+            fs::create_dir_all(&package)?;
+            let init = package.join("__init__.py");
+            if !init.exists() {
+                fs::write(init, "")?;
+            }
         }
     }
     fs::write(root.join(PYPROJECT), doc.to_string())?;
@@ -87,15 +91,27 @@ pub fn route_to_cuda_index(root: &Path, packages: &[String], cuda: &str) -> Resu
     fs::write(&path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
 }
 
-/// Pins the project's Python series in `.python-version` and `requires-python`'s floor.
-pub fn pin_python(root: &Path, version: [u32; 3]) -> Result<()> {
+/// Pins a Python series: `.python-version` in `pin_dir` (the environment's
+/// root) and the `>=` floor of `requires-python` in `pyproject_dir`, leaving
+/// any other clauses (`<3.14`, `!=3.12.1`) in place.
+pub fn pin_python(pin_dir: &Path, pyproject_dir: &Path, version: [u32; 3]) -> Result<()> {
     let [major, minor, _] = version;
-    fs::write(root.join(".python-version"), format!("{major}.{minor}\n"))?;
-    let path = root.join(PYPROJECT);
+    fs::write(
+        pin_dir.join(".python-version"),
+        format!("{major}.{minor}\n"),
+    )?;
+    let path = pyproject_dir.join(PYPROJECT);
     let mut doc: DocumentMut = fs::read_to_string(&path)?.parse()?;
     if let Some(project) = doc.get_mut("project").and_then(Item::as_table_mut) {
-        if project.contains_key("requires-python") {
-            project["requires-python"] = value(format!(">={major}.{minor}"));
+        if let Some(current) = project.get("requires-python").and_then(Item::as_str) {
+            let mut clauses: Vec<String> = current
+                .split(',')
+                .map(str::trim)
+                .filter(|c| !c.is_empty() && !c.starts_with(">="))
+                .map(str::to_owned)
+                .collect();
+            clauses.insert(0, format!(">={major}.{minor}"));
+            project["requires-python"] = value(clauses.join(", "));
         }
     }
     fs::write(&path, doc.to_string())?;
@@ -760,17 +776,17 @@ lint = ["ruff"]
         let tmp = TempDir::new("pin");
         fs::write(
             tmp.0.join(PYPROJECT),
-            "[project]\nname = \"t\"\nrequires-python = \">=3.10\"\n",
+            "[project]\nname = \"t\"\nrequires-python = \">=3.10, <3.14\"\n",
         )
         .unwrap();
-        pin_python(&tmp.0, [3, 13, 2]).unwrap();
+        pin_python(&tmp.0, &tmp.0, [3, 13, 2]).unwrap();
         assert_eq!(
             fs::read_to_string(tmp.0.join(".python-version")).unwrap(),
             "3.13\n"
         );
         assert!(fs::read_to_string(tmp.0.join(PYPROJECT))
             .unwrap()
-            .contains("requires-python = \">=3.13\""));
+            .contains("requires-python = \">=3.13, <3.14\""));
     }
 
     #[test]

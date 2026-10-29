@@ -31,7 +31,7 @@ pub fn target() -> Result<String> {
 
 /// `vivar upgrade --check`: report the latest release without installing it.
 pub fn check() -> Result<()> {
-    let api = format!("https://api.github.com/repos/{REPO}/releases/latest");
+    let api = format!("{}/repos/{REPO}/releases/latest", api_base());
     let release = String::from_utf8_lossy(&fetch(&api, None)?).into_owned();
     let tag = json_str(&release, "tag_name").ok_or_else(|| anyhow!("no release found at {api}"))?;
     if tag.trim_start_matches('v') == VERSION {
@@ -73,8 +73,8 @@ fn upgrade(current: &Path, version: Option<&str>, from: Option<&str>, tmp: &Path
                 if cfg!(windows) { "zip" } else { "tar.gz" }
             );
             let api = match version {
-                Some(tag) => format!("https://api.github.com/repos/{REPO}/releases/tags/{tag}"),
-                None => format!("https://api.github.com/repos/{REPO}/releases/latest"),
+                Some(tag) => format!("{}/repos/{REPO}/releases/tags/{tag}", api_base()),
+                None => format!("{}/repos/{REPO}/releases/latest", api_base()),
             };
             let release = String::from_utf8_lossy(&fetch(&api, None)?).into_owned();
             let tag = json_str(&release, "tag_name")
@@ -146,7 +146,7 @@ fn fetcher(url: &str, accept: Option<&str>, output: Option<&Path>) -> Result<std
         .map(|o| o.status.success())
         .unwrap_or(false);
     let mut cmd;
-    if gh_ok && url.contains("api.github.com/") {
+    if gh_ok && url.starts_with("https://api.github.com/") {
         cmd = Command::new("gh");
         cmd.arg("api");
         if let Some(accept) = accept {
@@ -168,8 +168,11 @@ fn fetcher(url: &str, accept: Option<&str>, output: Option<&Path>) -> Result<std
         if let Some(accept) = accept {
             cmd.args(["-H", &format!("Accept: {accept}")]);
         }
+        // The token is for the private repo only: never send it to package hosts.
         if let Ok(token) = env::var("GITHUB_TOKEN") {
-            cmd.args(["-H", &format!("Authorization: Bearer {token}")]);
+            if is_github(url) {
+                cmd.args(["-H", &format!("Authorization: Bearer {token}")]);
+            }
         }
     }
     let out = cmd
@@ -185,6 +188,25 @@ fn fetcher(url: &str, accept: Option<&str>, output: Option<&Path>) -> Result<std
         bail!("fetching {url} failed: {err}{hint}");
     }
     Ok(out)
+}
+
+/// Whether a URL points at GitHub itself (API, web, release assets).
+fn is_github(url: &str) -> bool {
+    let host = url
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("");
+    host == "api.github.com"
+        || host == "github.com"
+        || host == "objects.githubusercontent.com"
+        || host == "release-assets.githubusercontent.com"
+        || host == "codeload.github.com"
+}
+
+/// GitHub's API base; `VIVAR_GITHUB_API` redirects it (tests, mirrors).
+fn api_base() -> String {
+    env::var("VIVAR_GITHUB_API").unwrap_or_else(|_| "https://api.github.com".to_owned())
 }
 
 /// A private CA bundle for curl: `VIVAR_CA_BUNDLE`, else `SSL_CERT_FILE` (which
@@ -309,6 +331,27 @@ mod tests {
             asset_url(&pretty, "SHA256SUMS").unwrap(),
             "https://api.github.com/repos/o/r/releases/assets/11"
         );
+    }
+
+    #[test]
+    fn credentials_only_go_to_github() {
+        assert!(is_github(
+            "https://api.github.com/repos/x/y/releases/latest"
+        ));
+        assert!(is_github(
+            "https://github.com/x/y/releases/download/v1/a.tar.gz"
+        ));
+        assert!(is_github(
+            "https://objects.githubusercontent.com/github-production-release-asset/1"
+        ));
+        assert!(!is_github(
+            "https://files.pythonhosted.org/packages/a/b/six.whl"
+        ));
+        assert!(!is_github(
+            "https://download.pytorch.org/whl/cu124/torch.whl"
+        ));
+        assert!(!is_github("https://api.github.com.evil.example/x"));
+        assert!(!is_github("https://evil.example/api.github.com/x"));
     }
 
     #[test]

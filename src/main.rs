@@ -321,9 +321,14 @@ fn main() -> Result<()> {
             if let Some(cuda) = &cuda {
                 project::route_to_cuda_index(&project.root, &packages, cuda)?;
             }
-            backend.add(&cwd, &packages, group.as_deref())?;
-            venv::mark_synced(project.venv_root());
-            if let Err(e) = after_install(&project, &policy) {
+            // A failed add (bad index, unresolvable spec) is rolled back like a policy failure.
+            let added = backend
+                .add(&cwd, &packages, group.as_deref())
+                .and_then(|()| {
+                    venv::mark_synced(project.venv_root());
+                    after_install(&project, &policy)
+                });
+            if let Err(e) = added {
                 println!("rolling back the add");
                 for (path, contents) in snapshot {
                     match contents {
@@ -626,14 +631,23 @@ fn main() -> Result<()> {
                     .unwrap_or(cwd),
             };
             let venv = verify::find_venv(&base)?;
-            let mut code = verify::run(&venv, allow_missing_gpu, verbose, json)?;
+            let (mut code, mut report) = verify::run(&venv, allow_missing_gpu, verbose, json)?;
             // An unpacked bundle also carries checksums: report anything changed since packing.
             let bundle_dir = venv.parent().unwrap_or(&venv);
             if bundle_dir.join(bundle::CHECKSUMS).is_file() {
                 let bad = bundle::verify_checksums(bundle_dir)?;
                 if json {
+                    // Fold the integrity result into the report's single JSON object.
                     let items: Vec<String> = bad.iter().map(|b| json::quote(b)).collect();
-                    println!("{{\"integrity\":{{\"changed\":[{}]}}}}", items.join(","));
+                    let body = report
+                        .trim_end()
+                        .strip_suffix('}')
+                        .unwrap_or("{")
+                        .to_owned();
+                    report = format!(
+                        "{body},\n  \"integrity\": {{\"changed\": [{}]}}\n}}\n",
+                        items.join(",")
+                    );
                 } else if bad.is_empty() {
                     println!("integrity: all bundled files match their checksums");
                 } else {
@@ -649,6 +663,7 @@ fn main() -> Result<()> {
                     code = 1;
                 }
             }
+            print!("{report}");
             std::process::exit(code);
         }
         Command::Upgrade {
@@ -669,9 +684,11 @@ fn main() -> Result<()> {
             PythonCommand::Uninstall { version } => python::uninstall(&version)?,
             PythonCommand::Pin { version } => {
                 let project = require(project, &cwd)?;
+                project.check_declared()?;
                 let interpreter = venv::interpreter(Some(&version))?;
+                // The pin lives where the env lives (the workspace root for members).
                 let root = project.venv_root().to_path_buf();
-                project::pin_python(&project.root, interpreter.version)?;
+                project::pin_python(&root, &project.root, interpreter.version)?;
                 println!(
                     "pinned {} to CPython {}",
                     project.name(),
@@ -691,6 +708,7 @@ fn main() -> Result<()> {
                         backend.lock(&cwd)?;
                         backend.sync(&cwd)?;
                         venv::mark_synced(&root);
+                        after_install(&project, &policy)?;
                     }
                 }
             }

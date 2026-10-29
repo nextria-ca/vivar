@@ -105,7 +105,13 @@ if ((Test-Path $bundledPolicy) -or $env:VIVAR_POLICY_URL) {
   $dest = Join-Path $conf "policy.toml"
   if (Test-Path $dest) { Write-Host "keeping existing $dest" }
   elseif (Test-Path $bundledPolicy) { Copy-Item $bundledPolicy $dest; Write-Host "installed org policy to $dest" }
-  else { Invoke-WebRequest $env:VIVAR_POLICY_URL -OutFile $dest; Write-Host "installed org policy to $dest" }
+  else {
+    $tmpPolicy = "$dest.tmp"
+    try { Invoke-WebRequest $env:VIVAR_POLICY_URL -OutFile $tmpPolicy }
+    catch { Remove-Item $tmpPolicy -ErrorAction SilentlyContinue; throw "vivar: could not download the org policy from $env:VIVAR_POLICY_URL" }
+    Move-Item $tmpPolicy $dest -Force
+    Write-Host "installed org policy to $dest"
+  }
 }
 
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")

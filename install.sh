@@ -104,10 +104,17 @@ if [ -f "$HERE/policy.toml" ] || [ -n "${VIVAR_POLICY_URL:-}" ]; then
   mkdir -p "$CONF"
   if [ -f "$CONF/policy.toml" ]; then
     echo "keeping existing $CONF/policy.toml"
-  elif [ -f "$HERE/policy.toml" ]; then
-    cp "$HERE/policy.toml" "$CONF/policy.toml" && echo "installed org policy to $CONF/policy.toml"
   else
-    curl -LsSf "$VIVAR_POLICY_URL" -o "$CONF/policy.toml" && echo "installed org policy to $CONF/policy.toml"
+    # Fetched to a temp file first: a failed or partial download must not become the policy.
+    if [ -f "$HERE/policy.toml" ]; then
+      cp "$HERE/policy.toml" "$CONF/policy.toml.tmp"
+    elif ! curl -LsSf "$VIVAR_POLICY_URL" -o "$CONF/policy.toml.tmp"; then
+      rm -f "$CONF/policy.toml.tmp"
+      echo "vivar: could not download the org policy from $VIVAR_POLICY_URL" >&2
+      exit 1
+    fi
+    mv "$CONF/policy.toml.tmp" "$CONF/policy.toml"
+    echo "installed org policy to $CONF/policy.toml"
   fi
 fi
 

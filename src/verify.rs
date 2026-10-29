@@ -22,8 +22,14 @@ pub fn find_venv(path: &Path) -> Result<PathBuf> {
     )
 }
 
-/// Returns the exit code: 0 when everything works, 1 when something is broken.
-pub fn run(venv: &Path, allow_missing_gpu: bool, verbose: bool, json: bool) -> Result<i32> {
+/// Returns the exit code (0 when everything works) and, in JSON mode, the
+/// report itself so the caller can extend it; text mode streams to stdout.
+pub fn run(
+    venv: &Path,
+    allow_missing_gpu: bool,
+    verbose: bool,
+    json: bool,
+) -> Result<(i32, String)> {
     let python = if cfg!(windows) {
         venv.join("Scripts").join("python.exe")
     } else {
@@ -38,7 +44,7 @@ pub fn run(venv: &Path, allow_missing_gpu: bool, verbose: bool, json: bool) -> R
         cmd.arg("--verbose");
     }
     if json {
-        cmd.arg("--json");
+        cmd.arg("--json").stdout(Stdio::piped());
     }
     let mut child = cmd.spawn().with_context(|| {
         format!(
@@ -51,6 +57,9 @@ pub fn run(venv: &Path, allow_missing_gpu: bool, verbose: bool, json: bool) -> R
         .take()
         .context("no stdin")?
         .write_all(SCRIPT.as_bytes())?;
-    let status = child.wait()?;
-    Ok(status.code().unwrap_or(1))
+    let out = child.wait_with_output()?;
+    Ok((
+        out.status.code().unwrap_or(1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    ))
 }

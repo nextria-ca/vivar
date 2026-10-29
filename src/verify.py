@@ -10,6 +10,7 @@ SITE = sysconfig.get_paths()["purelib"]
 CUDA_LIB = re.compile(r"^lib(cuda|cudart|cublas|cublasLt|cudnn|cufft|curand|cusparse|cusolver|nvrtc|nccl|nvJitLink|nvToolsExt)\b")
 
 errors, warnings, records = [], [], []
+warnings_only = []  # CUDA notes that are never errors
 ok_count = 0
 
 
@@ -119,13 +120,18 @@ def cuda_problem(runtime):
     if n.value == 0:
         return "NVIDIA driver present but no GPU found"
     if runtime:
-        # The driver must support at least the CUDA version the packages were built for.
+        # A driver for an older major version cannot run these packages at all.
+        # Within a major, NVIDIA's minor-version compatibility usually works but
+        # not for every feature, so that is reported separately as a warning.
         v = ctypes.c_int(0)
         if cuda.cuDriverGetVersion(ctypes.byref(v)) == 0 and v.value:
             have = (v.value // 1000, v.value % 1000 // 10)
-            if have < runtime:
+            if have[0] < runtime[0]:
                 return (f"the driver supports CUDA {have[0]}.{have[1]} but the packages need "
                         f"CUDA {runtime[0]}.{runtime[1]} (update the NVIDIA driver)")
+            if have < runtime:
+                warnings_only.append(f"the driver supports CUDA {have[0]}.{have[1]}, the packages were built for "
+                                     f"CUDA {runtime[0]}.{runtime[1]}: relying on minor-version compatibility")
     return None
 
 
@@ -176,6 +182,8 @@ def main():
             report("WARN" if ALLOW_MISSING_GPU else "ERR", "CUDA", f"environment contains CUDA packages ({why}) but {problem}")
         elif VERBOSE:
             say(f"  ok   CUDA driver and GPU present for {', '.join((cuda_dists or cuda_libs)[:5])}")
+        for note in warnings_only:
+            report("WARN", "CUDA", note)
 
     # 4. Scripts point at an interpreter that exists.
     bindir = os.path.join(venv, "Scripts" if os.name == "nt" else "bin")

@@ -34,9 +34,32 @@ pub struct Artifact {
 }
 
 impl Artifact {
-    /// The file name at the end of the URL.
-    pub fn filename(&self) -> &str {
-        self.url.rsplit('/').next().unwrap_or(&self.url)
+    /// The file name at the end of the URL, percent-decoded (`%2B` → `+` in
+    /// local versions such as `torch-2.6.0+cu124`).
+    pub fn filename(&self) -> String {
+        let raw = self
+            .url
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(&self.url)
+            .rsplit('/')
+            .next()
+            .unwrap_or(&self.url);
+        let bytes = raw.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                if let Ok(v) = u8::from_str_radix(&raw[i + 1..i + 3], 16) {
+                    out.push(v);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
     }
 
     /// The hex digest without the `sha256:` prefix.
@@ -339,6 +362,14 @@ wheels = [{ url = "w", hash = "sha256:c" }]
         assert_eq!(pytest.wheels.len(), 1);
         assert_eq!(pytest.sdist.as_ref().unwrap().sha256(), Some("a"));
         assert_eq!(pytest.wheels[0].filename(), "w");
+        let torch = Artifact {
+            url: "https://download.pytorch.org/whl/cu124/torch-2.6.0%2Bcu124-cp312-cp312-linux_x86_64.whl#sha256=abc".into(),
+            hash: None,
+        };
+        assert_eq!(
+            torch.filename(),
+            "torch-2.6.0+cu124-cp312-cp312-linux_x86_64.whl"
+        );
         assert!(!lock.get("pluggy").unwrap().hashed);
         assert!(!lock.get("iniconfig").unwrap().hashed);
         assert_eq!(lock.get("iniconfig").unwrap().source_kind, "git");

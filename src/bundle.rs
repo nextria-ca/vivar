@@ -1375,26 +1375,33 @@ fn patch_launchers(bin: &Path, old_venv: &str, old_home: &str, python_dir: &str)
 /// Returns `false` when the file doesn't contain `old` (not a uv launcher we know).
 fn patch_launcher(exe: &Path, old: &[u8], new: &str) -> Result<bool> {
     let mut data = fs::read(exe)?;
-    let Some(off) = find(&data, old) else {
-        return Ok(false);
-    };
     if new.len() > old.len() {
         bail!(
             "{}: launcher path {new} is longer than the original; unpack into a shorter directory",
             exe.display()
         );
     }
-    let rva = rva_of(&data, off)
-        .ok_or_else(|| anyhow!("{} is not a PE file vivar understands", exe.display()))?;
-    let mut entry_key = rva.to_le_bytes().to_vec();
-    entry_key.extend_from_slice(&(old.len() as u32).to_le_bytes());
-    let entry = find(&data, &entry_key)
-        .ok_or_else(|| anyhow!("{}: launcher resource entry not found", exe.display()))?;
-    data[entry + 4..entry + 8].copy_from_slice(&(new.len() as u32).to_le_bytes());
-    data[off..off + old.len()].fill(0);
-    data[off..off + new.len()].copy_from_slice(new.as_bytes());
-    fs::write(exe, data).with_context(|| format!("rewriting {}", exe.display()))?;
-    Ok(true)
+    // The path can occur more than once (the embedded script's shebang holds a
+    // copy); only the occurrence backed by a resource entry is the launcher's
+    // interpreter path. Skipping the others keeps a second relocation harmless.
+    let mut from = 0;
+    while let Some(rel) = find(&data[from..], old) {
+        let off = from + rel;
+        let Some(rva) = rva_of(&data, off) else {
+            bail!("{} is not a PE file vivar understands", exe.display());
+        };
+        let mut entry_key = rva.to_le_bytes().to_vec();
+        entry_key.extend_from_slice(&(old.len() as u32).to_le_bytes());
+        if let Some(entry) = find(&data, &entry_key) {
+            data[entry + 4..entry + 8].copy_from_slice(&(new.len() as u32).to_le_bytes());
+            data[off..off + old.len()].fill(0);
+            data[off..off + new.len()].copy_from_slice(new.as_bytes());
+            fs::write(exe, data).with_context(|| format!("rewriting {}", exe.display()))?;
+            return Ok(true);
+        }
+        from = off + 1;
+    }
+    Ok(false)
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {

@@ -25,6 +25,17 @@ pub fn create(venv: &Path, python: &Installed, prompt: &str) -> Result<()> {
     if venv.join("pyvenv.cfg").exists() {
         bail!("{} already exists; delete it to recreate", venv.display());
     }
+    // Never mix an environment into a directory holding something else: it
+    // could not be told apart again, and a rollback could not clean it.
+    if fs::read_dir(venv)
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false)
+    {
+        bail!(
+            "{} exists and is not an environment; move it aside first",
+            venv.display()
+        );
+    }
     let venv = crate::bundle::absolute(venv)?;
     let bin = venv.join(BIN);
     fs::create_dir_all(&bin).with_context(|| format!("creating {}", bin.display()))?;
@@ -99,25 +110,6 @@ pub fn write_activate_scripts(
         fs::write(bin.join("deactivate.bat"), DEACTIVATE_BAT)?;
     }
     Ok(())
-}
-
-/// Removes what `create` put into `venv`, leaving any other files there alone
-/// (a rollback for an environment the failed operation created in place).
-pub fn remove_created(venv: &Path) {
-    for name in ["pyvenv.cfg", ".gitignore", SYNCED, PROFILE] {
-        let _ = fs::remove_file(venv.join(name));
-    }
-    for dir in [BIN, "lib", "Lib", "include", "share", "etc"] {
-        let _ = fs::remove_dir_all(venv.join(dir));
-    }
-    let _ = fs::remove_file(venv.join("lib64"));
-    // Empty afterwards: it was ours entirely.
-    if fs::read_dir(venv)
-        .map(|mut d| d.next().is_none())
-        .unwrap_or(false)
-    {
-        let _ = fs::remove_dir(venv);
-    }
 }
 
 /// Makes sure `root/.venv` exists, creating it on the project's pinned Python

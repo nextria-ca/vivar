@@ -1320,9 +1320,15 @@ fn transact(
     ];
     let snapshot: Vec<Option<Vec<u8>>> = files.iter().map(|p| std::fs::read(p).ok()).collect();
     let env_before = venv::fingerprint(&venv_dir);
-    // Only what the operation itself creates may be removed on failure.
-    let had_venv_dir = venv_dir.exists();
+    // Only what the operation itself creates may be removed on failure: a
+    // directory that didn't exist, or an empty one it was allowed to fill
+    // (`venv::create` refuses anything else that isn't already an environment).
     let had_env = venv_dir.join("pyvenv.cfg").exists();
+    let ours_to_remove = !venv_dir.exists()
+        || (!had_env
+            && std::fs::read_dir(&venv_dir)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(false));
     let profile_before = venv::current_profile(project.venv_root());
     let Err(e) = op() else {
         return Ok(());
@@ -1337,15 +1343,11 @@ fn transact(
             }
         }
     }
-    if !had_env && venv_dir.join("pyvenv.cfg").exists() {
+    if ours_to_remove && venv_dir.exists() {
         // The operation created the environment (a fresh import, a converted
-        // poetry project): there is nothing to sync back to, so it goes. A
-        // directory that was already there keeps whatever else it held.
-        if had_venv_dir {
-            venv::remove_created(&venv_dir);
-        } else {
-            let _ = std::fs::remove_dir_all(&venv_dir);
-        }
+        // poetry project), finished or not: there is nothing to sync back to,
+        // so it goes, and a retry starts clean.
+        let _ = std::fs::remove_dir_all(&venv_dir);
         return Err(e);
     }
     // A poetry-only manifest is the one thing uv cannot sync against; a virtual

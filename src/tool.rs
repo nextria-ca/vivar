@@ -228,7 +228,7 @@ fn is_tool_link(link: &Path) -> Result<bool> {
             fs::read(env.join(venv::BIN).join(name))
                 .map(|theirs| theirs == mine)
                 .unwrap_or(false)
-                || native_shim(&env, stem, &file).is_some_and(|text| text.as_bytes() == mine)
+                || (file.ends_with(".cmd") && shim_text(&env, stem).as_bytes() == mine)
         }))
     }
 }
@@ -406,16 +406,20 @@ fn native_shim(env: &Path, name: &str, file: &str) -> Option<String> {
     if !cfg!(windows) || !file.ends_with(".cmd") {
         return None;
     }
+    let body = env.join(venv::BIN).join(format!("{name}-script.py"));
+    body.is_file().then(|| shim_text(env, name))
+}
+
+/// What a shim for `name` in `env` says, whether or not its body exists:
+/// ownership is judged on the text alone, so a shim written for a command
+/// that later lost its body is still vivar's to replace or remove.
+fn shim_text(env: &Path, name: &str) -> String {
     let scripts = env.join(venv::BIN);
-    let body = scripts.join(format!("{name}-script.py"));
-    if !body.is_file() {
-        return None;
-    }
-    Some(format!(
+    format!(
         "@echo off\r\n\"{}\" \"{}\" %*\r\n",
         scripts.join("python.exe").display(),
-        body.display()
-    ))
+        scripts.join(format!("{name}-script.py")).display()
+    )
 }
 
 fn exe(name: &str) -> String {

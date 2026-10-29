@@ -236,14 +236,15 @@ In-house batch (2026-10-29): the `uv`-free path. `zip.rs` (inflate + zip reader)
 installer: RECORD, console scripts, uninstall), `index.rs` (PEP 691/503 listings, PEP 658
 metadata, cached), `resolve.rs` (backtracking resolver, newest-first, prefers the existing
 lock, universal markers, writes `uv.lock` that `uv lock --check` accepts), `native.rs`
-(`NativeBackend`: sync/add/remove/lock/upgrade/install/export/cross-target layout).
+(`NativeBackend`: sync/add/remove/lock/upgrade/install/export/cross-target layout, and
+`build` as a PEP 517 driver in a throwaway environment).
 `backend_for` picks uv when it is on PATH, native otherwise or with `VIVAR_BACKEND=native`.
 Bundle signatures moved from HMAC to Ed25519 (`sha512.rs`, `ed25519.rs`, RFC 8032
 vectors): `key generate` writes `bundle.key` + `bundle.pub`, verifiers trust
 `trusted-keys` in policy, `VIVAR_TRUSTED_KEYS`, or their own keys.
 
-Deferred: native dependencies via conda-forge (phase 2), native `build` (PEP 517 without
-`uv`), Windows launcher stubs for cross-target Windows bundles, man pages.
+Deferred: native dependencies via conda-forge (phase 2), Windows launcher stubs for
+cross-target Windows bundles, man pages.
 
 ## 13. Open questions
 

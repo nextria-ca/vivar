@@ -40,8 +40,8 @@ work itself. Both write the same `uv.lock`. A vivar project is a plain, standard
 Python project: `pyproject.toml` (PEP 621), `.python-version`, a normal `.venv`, and
 `uv.lock`. Anyone without vivar can still use it with `uv` or `pip`.
 
-Not yet: native (conda-forge) dependencies, building packages without `uv`, and
-model-weight management (out of scope by decision).
+Not yet: native (conda-forge) dependencies, and model-weight management (out of scope
+by decision).
 
 ## Install
 

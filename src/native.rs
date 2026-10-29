@@ -15,6 +15,31 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// The PEP 517 driver run inside the build environment: argv is
+/// `<mode> <backend> <dist dir> [backend-path...]`; the last stdout line is
+/// the result (a JSON list for `requires`, else the built file's name).
+const BUILD_HOOK: &str = r#"
+import importlib, json, os, sys
+mode, backend, dist = sys.argv[1:4]
+sys.path[:0] = [os.path.abspath(p) for p in sys.argv[4:]]
+module, _, attr = backend.partition(":")
+obj = importlib.import_module(module)
+for part in filter(None, attr.split(".")):
+    obj = getattr(obj, part)
+if mode == "requires":
+    reqs = []
+    for name in ("get_requires_for_build_sdist", "get_requires_for_build_wheel"):
+        hook = getattr(obj, name, None)
+        if hook is not None:
+            reqs.extend(hook(None))
+    sys.stdout.flush()
+    print(json.dumps(sorted(set(reqs))))
+elif mode == "sdist":
+    print(obj.build_sdist(dist, None))
+else:
+    print(obj.build_wheel(dist, None, None))
+"#;
+
 pub struct NativeBackend {
     index_url: Option<String>,
     no_build: bool,
@@ -93,10 +118,6 @@ impl NativeBackend {
             );
         }
         Ok((old, new))
-    }
-
-    fn needs_uv(what: &str) -> anyhow::Error {
-        anyhow!("`{what}` is not supported by the native backend yet; install uv for it")
     }
 }
 
@@ -469,9 +490,103 @@ impl Backend for NativeBackend {
         Ok(())
     }
 
+    /// PEP 517 by hand: a throwaway environment with `build-system.requires`
+    /// (plus whatever the backend asks for), then `build_sdist` and
+    /// `build_wheel` into `dist/`.
     fn build(&self, dir: &Path) -> Result<()> {
-        let _ = dir;
-        Err(Self::needs_uv("vivar build"))
+        let project = Project::require(dir)?;
+        let root = project.root.clone();
+        let doc: toml_edit::DocumentMut = fs::read_to_string(root.join(project::PYPROJECT))?
+            .parse()
+            .context("parsing pyproject.toml")?;
+        let table = doc.get("build-system").and_then(|i| i.as_table_like());
+        let strings = |key: &str| -> Vec<String> {
+            table
+                .and_then(|t| t.get(key))
+                .and_then(|i| i.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        // No [build-system]: PEP 517's legacy fallback.
+        let (requires, backend) = match table {
+            Some(t) => (
+                strings("requires"),
+                t.get("build-backend")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("setuptools.build_meta:__legacy__")
+                    .to_owned(),
+            ),
+            None => (
+                vec!["setuptools>=40.8.0".to_owned()],
+                "setuptools.build_meta:__legacy__".to_owned(),
+            ),
+        };
+        let backend_path = strings("backend-path");
+        if backend_path
+            .iter()
+            .any(|p| Path::new(p).is_absolute() || p.split(['/', '\\']).any(|c| c == ".."))
+        {
+            bail!("build-system.backend-path must stay inside the project");
+        }
+
+        let version = python_floor(&project)?;
+        let series = format!("{}.{}", version[0], version[1]);
+        let python = venv::interpreter(Some(&series))?;
+        let build_env = std::env::temp_dir().join(format!("vivar-build-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&build_env);
+        venv::create(&build_env, &python, "build")?;
+        let result = (|| -> Result<()> {
+            let py = venv::python(&build_env);
+            if !requires.is_empty() {
+                self.install(&py, &requires)?;
+            }
+            let dist = root.join("dist");
+            fs::create_dir_all(&dist)?;
+            let hook = |mode: &str| -> Result<String> {
+                let mut cmd = std::process::Command::new(&py);
+                cmd.current_dir(&root)
+                    .args(["-c", BUILD_HOOK, mode, &backend])
+                    .arg(&dist)
+                    .args(&backend_path);
+                let out = cmd
+                    .output()
+                    .with_context(|| format!("running {}", py.display()))?;
+                if !out.status.success() {
+                    bail!(
+                        "the build backend `{backend}` failed during {mode}:\n{}",
+                        String::from_utf8_lossy(&out.stderr).trim_end()
+                    );
+                }
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                Ok(stdout.lines().last().unwrap_or_default().trim().to_owned())
+            };
+            // Dynamic requirements (setuptools asks for wheel, for instance).
+            let extra = hook("requires")?;
+            let extra: Vec<String> = extra
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .split(',')
+                .map(|s| s.trim().trim_matches('"').to_owned())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !extra.is_empty() {
+                self.install(&py, &extra)?;
+            }
+            for mode in ["sdist", "wheel"] {
+                let name = hook(mode)?;
+                if name.is_empty() {
+                    bail!("the build backend `{backend}` returned no {mode} name");
+                }
+                println!("built dist/{name}");
+            }
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(&build_env);
+        result
     }
 
     /// Installs `specs` into the environment whose interpreter is `python`:

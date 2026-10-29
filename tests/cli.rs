@@ -2453,6 +2453,26 @@ fn native_backend_syncs_from_the_lock_without_uv() {
     assert!(!native(dir, &["run", "python", "-c", "import pluggy"])
         .status
         .success());
+    // Building is native too: hatchling comes from the index into a throwaway env.
+    let path = dir.join("pyproject.toml");
+    let text = read(&path)
+        + "\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n";
+    fs::write(&path, text).unwrap();
+    fs::create_dir_all(dir.join("src").join("demo")).unwrap();
+    fs::write(dir.join("src").join("demo").join("__init__.py"), "").unwrap();
+    let out = okn(dir, &["build"]);
+    assert!(
+        stdout_of(&out).contains("built dist/"),
+        "{}",
+        stdout_of(&out)
+    );
+    let built: Vec<String> = fs::read_dir(dir.join("dist"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(built.iter().any(|f| f.ends_with(".whl")), "{built:?}");
+    assert!(built.iter().any(|f| f.ends_with(".tar.gz")), "{built:?}");
     // A tool environment resolves and installs natively as well.
     let home = tmp.0.join("home");
     fs::create_dir_all(&home).unwrap();

@@ -106,12 +106,7 @@ impl Index {
                 // Links resolve against the page without credentials: what the
                 // lock records must never carry them.
                 let page = format!("{}/{name}/", self.base);
-                let body = upgrade::fetch(
-                    &self.authed(&page),
-                    Some("application/vnd.pypi.simple.v1+json, text/html;q=0.1"),
-                )
-                .with_context(|| format!("looking up {name} on {}", self.base))?;
-                let text = String::from_utf8_lossy(&body);
+                let text = self.listing_body(&name, &page)?;
                 if text.trim_start().starts_with('{') {
                     parse_json(&text, &page)?
                 } else {
@@ -123,8 +118,65 @@ impl Index {
         Ok(files)
     }
 
+    /// A project's listing: from the on-disk cache while it is fresh
+    /// (`VIVAR_INDEX_TTL` seconds, default 600, 0 to bypass), else fetched
+    /// and cached. A stale copy still serves when the index is unreachable,
+    /// so a resolve on a flaky link does not re-download the world.
+    fn listing_body(&self, name: &str, page: &str) -> Result<String> {
+        let ttl: u64 = std::env::var("VIVAR_INDEX_TTL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600);
+        let cache = dirs::cache()?.join("index").join(
+            &{
+                let mut h = sha256::Sha256::new();
+                h.update(self.base.as_bytes());
+                sha256::hex(&h.finish())
+            }[..16],
+        );
+        let path = cache.join(format!("{name}.listing"));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let cached = fs::read_to_string(&path).ok().and_then(|t| {
+            let (stamp, body) = t.split_once('\n')?;
+            Some((stamp.parse::<u64>().ok()?, body.to_owned()))
+        });
+        if let Some((stamp, body)) = &cached {
+            if ttl > 0 && now.saturating_sub(*stamp) < ttl {
+                return Ok(body.clone());
+            }
+        }
+        match upgrade::fetch(
+            &self.authed(page),
+            Some("application/vnd.pypi.simple.v1+json, text/html;q=0.1"),
+        ) {
+            Ok(body) => {
+                let text = String::from_utf8_lossy(&body).into_owned();
+                if ttl > 0 {
+                    let _ = fs::create_dir_all(&cache);
+                    let _ = fs::write(&path, format!("{now}\n{text}"));
+                }
+                Ok(text)
+            }
+            Err(e) => match cached {
+                Some((stamp, body)) => {
+                    eprintln!(
+                        "note: {} is unreachable ({e:#}); using the listing for {name} cached {}s ago",
+                        self.base,
+                        now.saturating_sub(stamp)
+                    );
+                    Ok(body)
+                }
+                None => Err(e).with_context(|| format!("looking up {name} on {}", self.base)),
+            },
+        }
+    }
+
     /// Core metadata for a wheel: the PEP 658 sidecar when offered, else the
-    /// wheel itself (cached by hash so each is read at most once).
+    /// wheel itself (cached by hash so each is read at most once; a cached
+    /// copy that does not look like metadata is fetched again).
     pub fn metadata(&self, file: &File) -> Result<Metadata> {
         let cache = dirs::cache()?.join("metadata");
         fs::create_dir_all(&cache)?;
@@ -136,7 +188,10 @@ impl Index {
             })
         });
         let cached = cache.join(format!("{key}.metadata"));
-        let text = if let Ok(t) = fs::read_to_string(&cached) {
+        let valid = fs::read_to_string(&cached)
+            .ok()
+            .filter(|t| t.starts_with("Metadata-Version:"));
+        let text = if let Some(t) = valid {
             t
         } else {
             let text = if let Some(path) = local_path(&file.url) {

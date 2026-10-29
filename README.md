@@ -172,9 +172,9 @@ vivar shell                     # an interactive shell with the env activated
 vivar run test                  # a [tool.vivar.scripts] task; extra args are appended
 vivar run tool.py               # a PEP 723 script: its inline deps get a cached env of their own
 vivar tool run ruff check .     # tools in isolated envs (pipx-style); `tool install` links them into ~/.local/bin
-vivar tree                      # dependency tree from the lockfile
-vivar why urllib3               # every chain that pulls a package in
-vivar outdated                  # what a re-resolve would upgrade
+vivar tree                      # dependency tree from the lockfile (--json for tools)
+vivar why urllib3               # every chain that pulls a package in (--json)
+vivar outdated                  # what a re-resolve would upgrade (--json)
 vivar upgrade-deps [pkg…]       # upgrade within the declared constraints, then sync
 vivar licenses                  # every installed package with its license
 vivar audit                     # known vulnerabilities (OSV) for the locked packages
@@ -234,9 +234,13 @@ environments several times faster (the unpacking machine needs zstd too);
 `--use-host-cuda` leaves out the NVIDIA libraries from `nvidia-*` wheels when the
 target provides CUDA itself.
 
-Policy for ML boxes: `telemetry = "off"` makes `run` and `shell` set the variables that
-silence Hugging Face, Gradio, Weights & Biases and friends; `network = "offline"` puts
-them in offline mode; `require-wheels = true` refuses source distributions. Private
+Policy for ML boxes is cooperative, not a sandbox: `telemetry = "off"` and
+`network = "offline"` set the environment variables that well-behaved libraries honour
+(Hugging Face, uv, pip, and friends); a process that ignores them can still reach the
+network. For a hard guarantee, run the environment on a host that has none.
+`telemetry = "off"` silences Hugging Face, Gradio, Weights & Biases and friends;
+`network = "offline"` puts them in offline mode; `require-wheels = true` refuses
+source distributions. Private
 registries take `VIVAR_INDEX_TOKEN` or `VIVAR_INDEX_USERNAME`/`VIVAR_INDEX_PASSWORD`
 (or a `~/.netrc` entry). `export docker` uses an `nvidia/cuda` base image when the
 lock contains CUDA packages.

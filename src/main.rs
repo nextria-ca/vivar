@@ -60,9 +60,12 @@ enum Command {
         /// Only write project files; don't create .venv or the lockfile yet
         #[arg(long)]
         no_sync: bool,
-        /// A library: adds a build backend and a src/<package>/ layout
+        /// A library: adds a build backend and a src/<package>/ layout (same as --template library)
         #[arg(long)]
         lib: bool,
+        /// Project shape: app (default), library, service (library + `vivar run serve`), notebook (ipykernel + jupyterlab, notebooks/)
+        #[arg(long, value_parser = ["app", "library", "service", "notebook"])]
+        template: Option<String>,
     },
     /// Add dependencies to the project (checked against policy first)
     Add {
@@ -145,7 +148,10 @@ enum Command {
         args: Vec<String>,
     },
     /// Show which locked packages have newer versions available
-    Outdated,
+    Outdated {
+        #[arg(long)]
+        json: bool,
+    },
     /// Upgrade locked packages (all, or the ones given) within the declared constraints
     UpgradeDeps { packages: Vec<String> },
     /// Show the dependency tree from the lockfile
@@ -153,9 +159,15 @@ enum Command {
         /// Maximum depth to show
         #[arg(long, default_value = "10")]
         depth: usize,
+        #[arg(long)]
+        json: bool,
     },
     /// Explain which dependencies pull a package in
-    Why { package: String },
+    Why {
+        package: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// List every installed package with its license
     Licenses {
         #[arg(long)]
@@ -421,7 +433,15 @@ fn main() -> Result<()> {
             python,
             no_sync,
             lib,
+            template,
         } => {
+            let template = match template.as_deref() {
+                Some("library") => project::Template::Library,
+                Some("service") => project::Template::Service,
+                Some("notebook") => project::Template::Notebook,
+                _ if lib => project::Template::Library,
+                _ => project::Template::App,
+            };
             if cwd.join(project::PYPROJECT).exists() {
                 bail!(
                     "{} already exists; this is already a project",
@@ -430,7 +450,7 @@ fn main() -> Result<()> {
             }
             let interpreter = venv::interpreter(python.as_deref())?;
             let name = name.unwrap_or_else(|| project::default_name(&cwd));
-            project::init_files(&cwd, &name, interpreter.version, lib)?;
+            project::init_files(&cwd, &name, interpreter.version, template)?;
             println!(
                 "Initialized project `{name}` on CPython {}",
                 interpreter.version_string()
@@ -482,7 +502,7 @@ fn main() -> Result<()> {
                         .name
                         .clone()
                         .unwrap_or_else(|| project::default_name(&cwd));
-                    project::init_files(&cwd, &name, interpreter.version, false)?;
+                    project::init_files(&cwd, &name, interpreter.version, project::Template::App)?;
                     println!(
                         "Initialized project `{name}` on CPython {}",
                         interpreter.version_string()
@@ -729,9 +749,19 @@ fn main() -> Result<()> {
             };
             std::process::exit(venv::run(project.venv_root(), &args, &extra)?);
         }
-        Command::Outdated => {
+        Command::Outdated { json } => {
             require(project, &cwd)?;
-            backend.upgrade(&cwd, &[], true)?;
+            let changes = backend.outdated(&cwd)?;
+            if json {
+                let items: Vec<String> = changes.iter().map(backend::Change::json).collect();
+                println!("[{}]", items.join(","));
+            } else if changes.is_empty() {
+                println!("No lockfile changes detected");
+            } else {
+                for c in &changes {
+                    println!("{}", c.describe(false));
+                }
+            }
         }
         Command::UpgradeDeps { packages } => {
             let project = require(project, &cwd)?;
@@ -742,17 +772,45 @@ fn main() -> Result<()> {
             venv::mark_synced(project.venv_root());
             after_install(&project, &policy)?;
         }
-        Command::Tree { depth } => {
+        Command::Tree { depth, json } => {
             let project = require(project, &cwd)?;
-            print!("{}", lock::Lock::read(project.venv_root())?.tree(depth));
+            let lock = lock::Lock::read(project.venv_root())?;
+            print!(
+                "{}",
+                if json {
+                    lock.tree_json(depth)
+                } else {
+                    lock.tree(depth)
+                }
+            );
         }
-        Command::Why { package } => {
+        Command::Why { package, json } => {
             let project = require(project, &cwd)?;
             let name = project::normalize(&package);
             let lock = lock::Lock::read(project.venv_root())?;
             let paths = lock.why(&name);
             if paths.is_empty() {
                 bail!("{name} is not in the lockfile");
+            }
+            if json {
+                let chains: Vec<String> = paths
+                    .iter()
+                    .map(|path| {
+                        let hops: Vec<String> = path
+                            .iter()
+                            .map(|p| {
+                                format!(
+                                    "{{\"name\":{},\"version\":{}}}",
+                                    json::quote(&p.name),
+                                    json::quote(&p.version)
+                                )
+                            })
+                            .collect();
+                        format!("[{}]", hops.join(","))
+                    })
+                    .collect();
+                println!("[{}]", chains.join(","));
+                return Ok(());
             }
             for path in paths {
                 let chain: Vec<String> = path

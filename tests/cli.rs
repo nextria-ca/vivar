@@ -161,6 +161,48 @@ fn init_no_sync_skips_environment() {
     assert!(dir.join("pyproject.toml").is_file());
     assert!(!dir.join(".venv").exists());
     assert!(!dir.join("uv.lock").exists());
+
+    // Templates lay out the shapes teams start from.
+    let svc = tmp.0.join("svc");
+    fs::create_dir_all(&svc).unwrap();
+    ok(
+        &svc,
+        &[
+            "init",
+            "my-svc",
+            "--python",
+            "3.12",
+            "--no-sync",
+            "--template",
+            "service",
+        ],
+    );
+    let text = read(&svc.join("pyproject.toml"));
+    assert!(
+        text.contains("build-backend") && text.contains("serve = \"python -m my_svc\""),
+        "{text}"
+    );
+    assert!(svc.join("src").join("my_svc").join("__main__.py").is_file());
+    let nb = tmp.0.join("nb");
+    fs::create_dir_all(&nb).unwrap();
+    ok(
+        &nb,
+        &[
+            "init",
+            "lab",
+            "--python",
+            "3.12",
+            "--no-sync",
+            "--template",
+            "notebook",
+        ],
+    );
+    let text = read(&nb.join("pyproject.toml"));
+    assert!(
+        text.contains("ipykernel") && text.contains("lab = \"jupyter lab notebooks\""),
+        "{text}"
+    );
+    assert!(nb.join("notebooks").is_dir());
 }
 
 #[test]
@@ -339,6 +381,7 @@ fn index_url_is_passed_to_uv() {
 }
 
 #[test]
+#[ignore = "slow: builds bundles or resolves natively; run with --include-ignored (CI does)"]
 fn pack_and_unpack_produce_a_self_contained_env() {
     let tmp = TempDir::new("bundle");
     let src = tmp.0.join("src-machine");
@@ -882,6 +925,16 @@ fn tree_why_outdated_upgrade_and_build() {
         "{tree}"
     );
     assert!(tree.starts_with("demo v0.1.0"), "{tree}");
+    let tree_json = stdout_of(&ok(dir, &["tree", "--json"]));
+    assert!(
+        tree_json.starts_with("[{\"name\":\"demo\"") && tree_json.contains("\"dependencies\":["),
+        "{tree_json}"
+    );
+    let why_json = stdout_of(&ok(dir, &["why", "pluggy", "--json"]));
+    assert!(
+        why_json.starts_with("[[{\"name\":\"demo\"") && why_json.contains("{\"name\":\"pluggy\""),
+        "{why_json}"
+    );
     let why = stdout_of(&ok(dir, &["why", "pluggy"]));
     assert!(
         why.contains("demo v0.1.0 -> pytest v") && why.ends_with("pluggy v1.6.0\n")
@@ -890,6 +943,11 @@ fn tree_why_outdated_upgrade_and_build() {
     );
     fails_with(dir, &["why", "nope"], "not in the lockfile");
 
+    let outdated_json = stdout_of(&ok(dir, &["outdated", "--json"]));
+    assert!(
+        outdated_json.trim_end().starts_with('[') && outdated_json.trim_end().ends_with(']'),
+        "{outdated_json}"
+    );
     let out = ok(dir, &["outdated"]);
     let text = format!(
         "{}{}",
@@ -981,6 +1039,7 @@ fn org_policy_and_require_hashes() {
 }
 
 #[test]
+#[ignore = "slow: builds bundles or resolves natively; run with --include-ignored (CI does)"]
 fn bundle_integrity_and_diff() {
     let tmp = TempDir::new("integrity");
     let dir = &tmp.0;
@@ -1159,6 +1218,7 @@ fn workspace_members_share_the_root_env() {
 }
 
 #[test]
+#[ignore = "slow: builds bundles or resolves natively; run with --include-ignored (CI does)"]
 fn wheelhouse_export_feeds_an_offline_project() {
     let tmp = TempDir::new("wheelhouse-export");
     let src = tmp.0.join("src");
@@ -1408,6 +1468,7 @@ fn shell_slim_pack_init_lib_and_cuda_routing() {
 }
 
 #[test]
+#[ignore = "slow: builds bundles or resolves natively; run with --include-ignored (CI does)"]
 fn cross_target_pack_builds_a_runnable_bundle() {
     let tmp = TempDir::new("xpack");
     let dir = &tmp.0;
@@ -1807,6 +1868,7 @@ fn check_and_sbom() {
 }
 
 #[test]
+#[ignore = "slow: builds bundles or resolves natively; run with --include-ignored (CI does)"]
 fn delta_bundles_dedupe_and_signing() {
     let tmp = TempDir::new("delta");
     let dir = &tmp.0;
@@ -2018,6 +2080,7 @@ fn delta_bundles_dedupe_and_signing() {
 }
 
 #[test]
+#[ignore = "slow: builds bundles or resolves natively; run with --include-ignored (CI does)"]
 fn signatures_cover_launchers_and_deltas_cannot_escape() {
     let tmp = TempDir::new("sigcover");
     let dir = &tmp.0;
@@ -2194,6 +2257,7 @@ fn signatures_cover_launchers_and_deltas_cannot_escape() {
 }
 
 #[test]
+#[ignore = "slow: builds bundles or resolves natively; run with --include-ignored (CI does)"]
 fn import_rolls_back_on_policy_and_handles_poetry_in_place() {
     let tmp = TempDir::new("import2");
     // A license policy rejects one imported package: nothing of the import stays.
@@ -2335,6 +2399,7 @@ fn import_rolls_back_on_policy_and_handles_poetry_in_place() {
 }
 
 #[test]
+#[ignore = "slow: builds bundles or resolves natively; run with --include-ignored (CI does)"]
 fn native_backend_syncs_from_the_lock_without_uv() {
     let tmp = TempDir::new("native");
     let dir = &tmp.0;

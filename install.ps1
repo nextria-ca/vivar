@@ -16,6 +16,7 @@
 #   GITHUB_TOKEN       used for private-repo downloads when gh isn't logged in
 #   VIVAR_SKIP_UV=1    don't install uv
 #   VIVAR_SKIP_PATH=1  don't add the install dir to the user PATH
+#   VIVAR_SKIP_COMPLETIONS=1  don't add completions to the PowerShell profile
 #   VIVAR_POLICY_URL   org policy file to install as %APPDATA%\vivar\policy.toml
 #                      (an offline bundle may carry one as policy.toml next to this script)
 $ErrorActionPreference = "Stop"
@@ -111,6 +112,16 @@ if ((Test-Path $bundledPolicy) -or $env:VIVAR_POLICY_URL) {
     catch { Remove-Item $tmpPolicy -ErrorAction SilentlyContinue; throw "vivar: could not download the org policy from $env:VIVAR_POLICY_URL" }
     Move-Item $tmpPolicy $dest -Force
     Write-Host "installed org policy to $dest"
+  }
+}
+
+# Completions: one guarded line in the user's PowerShell profile.
+if (-not $env:VIVAR_SKIP_COMPLETIONS) {
+  $prof = $PROFILE.CurrentUserAllHosts
+  if (-not (Test-Path $prof)) { New-Item -ItemType File -Path $prof -Force | Out-Null }
+  if (-not (Select-String -Path $prof -SimpleMatch 'vivar completions powershell' -Quiet)) {
+    Add-Content $prof "`n# vivar shell completions`nif (Get-Command vivar -ErrorAction SilentlyContinue) { vivar completions powershell | Out-String | Invoke-Expression }"
+    Write-Host "added vivar completions to $prof"
   }
 }
 

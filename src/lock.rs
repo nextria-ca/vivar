@@ -265,6 +265,58 @@ impl Lock {
         roots
     }
 
+    /// The dependency tree as JSON: nested `{name, version, dependencies}`;
+    /// a package already expanded elsewhere appears with `"repeat": true` and
+    /// no children, as the text tree marks it with `(*)`.
+    pub fn tree_json(&self, depth: usize) -> String {
+        let mut out = String::from("[");
+        let mut seen = BTreeSet::new();
+        for (i, root) in self.roots().into_iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            self.render_json(root, depth, &mut seen, &mut out);
+        }
+        out.push_str("]\n");
+        out
+    }
+
+    fn render_json(
+        &self,
+        pkg: &Package,
+        depth: usize,
+        seen: &mut BTreeSet<String>,
+        out: &mut String,
+    ) {
+        let repeat =
+            !seen.insert(format!("{}@{}", pkg.name, pkg.version)) && !pkg.dependencies.is_empty();
+        out.push_str(&format!(
+            "{{\"name\":{},\"version\":{}",
+            crate::json::quote(&pkg.name),
+            crate::json::quote(&pkg.version)
+        ));
+        if repeat {
+            out.push_str(",\"repeat\":true}");
+            return;
+        }
+        if depth > 0 {
+            out.push_str(",\"dependencies\":[");
+            let mut first = true;
+            for dep in &pkg.dependencies {
+                let Some(child) = self.resolve(dep) else {
+                    continue;
+                };
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                self.render_json(child, depth - 1, seen, out);
+            }
+            out.push(']');
+        }
+        out.push('}');
+    }
+
     /// Renders the dependency tree as text, one line per edge.
     pub fn tree(&self, depth: usize) -> String {
         let mut out = String::new();

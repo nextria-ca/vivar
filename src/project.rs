@@ -10,14 +10,33 @@ pub const PYPROJECT: &str = "pyproject.toml";
 /// Writes `pyproject.toml`, `.python-version` and the vivar defaults for a new
 /// project. A library also gets a build backend and a `src/<package>/` layout,
 /// which is what `vivar build` needs.
-pub fn init_files(root: &Path, name: &str, version: [u32; 3], lib: bool) -> Result<()> {
+/// The shapes `vivar init` knows how to lay out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Template {
+    /// A plain application: pyproject, pin, env.
+    App,
+    /// A package: build backend and a src/<package>/ layout.
+    Library,
+    /// A package with an entry point and a `serve` task.
+    Service,
+    /// Notebooks: ipykernel and jupyterlab, a notebooks/ directory, a `lab` task.
+    Notebook,
+}
+
+pub fn init_files(root: &Path, name: &str, version: [u32; 3], template: Template) -> Result<()> {
     let [major, minor, _] = version;
+    let lib = matches!(template, Template::Library | Template::Service);
     let mut doc = DocumentMut::new();
     let mut project = Table::new();
     project["name"] = value(name);
     project["version"] = value("0.1.0");
     project["requires-python"] = value(format!(">={major}.{minor}"));
-    project["dependencies"] = value(Array::new());
+    let mut deps = Array::new();
+    if template == Template::Notebook {
+        deps.push("ipykernel");
+        deps.push("jupyterlab");
+    }
+    project["dependencies"] = value(deps);
     doc["project"] = Item::Table(project);
     if lib {
         let mut build = Table::new();
@@ -55,6 +74,40 @@ pub fn init_files(root: &Path, name: &str, version: [u32; 3], lib: bool) -> Resu
         let mut tool = Table::new();
         tool.set_implicit(true);
         tool["hatch"] = Item::Table(hatch);
+        doc["tool"] = Item::Table(tool);
+        if template == Template::Service {
+            // `python -m <package>` runs it; `vivar run serve` is the task.
+            let main = root.join("src").join(top).join("__main__.py");
+            if !main.exists() {
+                fs::write(
+                    &main,
+                    format!(
+                        "\"\"\"Entry point: `vivar run serve` or `python -m {top}`.\"\"\"\n\n\ndef main() -> None:\n    print(\"{name} is running\")\n\n\nif __name__ == \"__main__\":\n    main()\n"
+                    ),
+                )?;
+            }
+            let mut scripts = Table::new();
+            scripts["serve"] = value(format!("python -m {top}"));
+            let mut vivar = Table::new();
+            vivar.set_implicit(true);
+            vivar["scripts"] = Item::Table(scripts);
+            doc["tool"]["vivar"] = Item::Table(vivar);
+        }
+    }
+    if template == Template::Notebook {
+        fs::create_dir_all(root.join("notebooks"))?;
+        let keep = root.join("notebooks").join(".gitkeep");
+        if !keep.exists() {
+            fs::write(keep, "")?;
+        }
+        let mut scripts = Table::new();
+        scripts["lab"] = value("jupyter lab notebooks");
+        let mut vivar = Table::new();
+        vivar.set_implicit(true);
+        vivar["scripts"] = Item::Table(scripts);
+        let mut tool = Table::new();
+        tool.set_implicit(true);
+        tool["vivar"] = Item::Table(vivar);
         doc["tool"] = Item::Table(tool);
     }
     fs::write(root.join(PYPROJECT), doc.to_string())?;
@@ -1313,7 +1366,7 @@ lint = ["ruff"]
     #[test]
     fn lib_layout_nests_dotted_names() {
         let tmp = TempDir::new("lib");
-        init_files(&tmp.0, "acme.widgets", [3, 12, 0], true).unwrap();
+        init_files(&tmp.0, "acme.widgets", [3, 12, 0], Template::Library).unwrap();
         assert!(tmp.0.join("src/acme/__init__.py").is_file());
         assert!(tmp.0.join("src/acme/widgets/__init__.py").is_file());
         let text = fs::read_to_string(tmp.0.join(PYPROJECT)).unwrap();

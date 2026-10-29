@@ -13,6 +13,7 @@
 # Environment:
 #   VIVAR_VERSION      release tag to install (default: latest)
 #   VIVAR_INSTALL_DIR  where to put the binaries (default: ~/.local/bin)
+#   VIVAR_SKIP_COMPLETIONS=1  don't install shell completions for $SHELL
 #   VIVAR_ARCHIVE      local file or URL of a release archive to install instead
 #   GITHUB_TOKEN       used for private-repo downloads when gh isn't logged in
 #   VIVAR_SKIP_UV=1    don't install uv
@@ -116,6 +117,25 @@ if [ -f "$HERE/policy.toml" ] || [ -n "${VIVAR_POLICY_URL:-}" ]; then
     mv "$CONF/policy.toml.tmp" "$CONF/policy.toml"
     echo "installed org policy to $CONF/policy.toml"
   fi
+fi
+
+# Shell completions for the shell that runs this, into the directory that
+# shell loads on its own (zsh needs the fpath line once).
+if [ -z "${VIVAR_SKIP_COMPLETIONS:-}" ]; then
+  case "$(basename "${SHELL:-sh}")" in
+    bash)
+      CDIR=${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions
+      mkdir -p "$CDIR" && "$DIR/vivar" completions bash > "$CDIR/vivar" \
+        && echo "installed bash completions to $CDIR/vivar" ;;
+    zsh)
+      CDIR=${ZDOTDIR:-$HOME}/.zfunc
+      mkdir -p "$CDIR" && "$DIR/vivar" completions zsh > "$CDIR/_vivar" \
+        && echo "installed zsh completions to $CDIR/_vivar (needs 'fpath+=$CDIR' before compinit in .zshrc)" ;;
+    fish)
+      CDIR=${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions
+      mkdir -p "$CDIR" && "$DIR/vivar" completions fish > "$CDIR/vivar.fish" \
+        && echo "installed fish completions to $CDIR/vivar.fish" ;;
+  esac
 fi
 
 case ":$PATH:" in

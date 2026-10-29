@@ -11,6 +11,50 @@ use std::process::Command;
 
 /// Dependency resolution and installation. Everything else (projects, venvs,
 /// Python builds, running, bundles) is vivar's own.
+/// One difference a re-resolve would make to the lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change {
+    pub name: String,
+    /// The locked version, or none when the package would be added.
+    pub from: Option<String>,
+    /// The new version, or none when the package would be removed.
+    pub to: Option<String>,
+}
+
+impl Change {
+    /// `Would update six v1.16.0 -> v1.17.0` (or `Updated`, when done).
+    pub fn describe(&self, done: bool) -> String {
+        match (&self.from, &self.to) {
+            (Some(f), Some(t)) => format!(
+                "{} {} v{f} -> v{t}",
+                if done { "Updated" } else { "Would update" },
+                self.name
+            ),
+            (None, Some(t)) => format!(
+                "{} {} v{t}",
+                if done { "Added" } else { "Would add" },
+                self.name
+            ),
+            (Some(f), None) => format!(
+                "{} {} v{f}",
+                if done { "Removed" } else { "Would remove" },
+                self.name
+            ),
+            (None, None) => self.name.clone(),
+        }
+    }
+
+    pub fn json(&self) -> String {
+        let opt = |v: &Option<String>| v.as_deref().map_or("null".to_owned(), crate::json::quote);
+        format!(
+            "{{\"name\":{},\"from\":{},\"to\":{}}}",
+            crate::json::quote(&self.name),
+            opt(&self.from),
+            opt(&self.to)
+        )
+    }
+}
+
 pub trait Backend {
     fn add(&self, dir: &Path, packages: &[String], group: Option<&str>) -> Result<()>;
     fn remove(&self, dir: &Path, packages: &[String]) -> Result<()>;
@@ -25,6 +69,8 @@ pub trait Backend {
     /// Re-resolves `packages` (all when empty) to their newest allowed versions;
     /// `dry_run` only reports what would change.
     fn upgrade(&self, dir: &Path, packages: &[String], dry_run: bool) -> Result<()>;
+    /// What a full re-resolve would change, without touching the lock.
+    fn outdated(&self, dir: &Path) -> Result<Vec<Change>>;
     /// Builds the project's sdist and wheel into `dist/`.
     fn build(&self, dir: &Path) -> Result<()>;
     /// Installs requirement specs into the environment whose interpreter is `python`.
@@ -134,6 +180,31 @@ impl UvBackend {
         cmd
     }
 
+    /// Runs uv and returns everything it printed (both streams), failing on a
+    /// non-zero exit with that output as the message.
+    fn capture(mut cmd: Command) -> Result<String> {
+        let out = cmd.output().map_err(|e| {
+            if e.kind() == ErrorKind::NotFound {
+                anyhow!("`uv` was not found on PATH; vivar currently delegates dependency resolution to it. {UV_INSTALL_HINT}")
+            } else {
+                anyhow!(e).context("failed to run `uv`")
+            }
+        })?;
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if !out.status.success() {
+            bail!(
+                "uv exited with status {}:\n{}",
+                out.status.code().unwrap_or(1),
+                text.trim_end()
+            );
+        }
+        Ok(text)
+    }
+
     fn check(mut cmd: Command) -> Result<()> {
         let status = cmd.status().map_err(|e| {
             if e.kind() == ErrorKind::NotFound {
@@ -198,6 +269,37 @@ impl Backend for UvBackend {
             cmd.arg("--dry-run");
         }
         Self::check(cmd)
+    }
+
+    fn outdated(&self, dir: &Path) -> Result<Vec<Change>> {
+        let mut cmd = self.uv(dir);
+        cmd.args(["lock", "--upgrade", "--dry-run"]);
+        // uv prints one line per change: `Update six v1.16.0 -> v1.17.0`,
+        // `Add x v1.0`, `Remove y v2.0`.
+        let mut changes = Vec::new();
+        for line in Self::capture(cmd)?.lines() {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let strip = |v: &str| v.trim_start_matches('v').to_owned();
+            match words.as_slice() {
+                ["Update" | "Updated", name, from, "->", to] => changes.push(Change {
+                    name: crate::project::normalize(name),
+                    from: Some(strip(from)),
+                    to: Some(strip(to)),
+                }),
+                ["Add" | "Added", name, to] => changes.push(Change {
+                    name: crate::project::normalize(name),
+                    from: None,
+                    to: Some(strip(to)),
+                }),
+                ["Remove" | "Removed", name, from] => changes.push(Change {
+                    name: crate::project::normalize(name),
+                    from: Some(strip(from)),
+                    to: None,
+                }),
+                _ => {}
+            }
+        }
+        Ok(changes)
     }
 
     fn build(&self, dir: &Path) -> Result<()> {

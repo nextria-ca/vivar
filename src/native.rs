@@ -4,7 +4,7 @@
 //! features (workspaces, per-package sources, profiles) are refused rather
 //! than resolved differently.
 
-use crate::backend::Backend;
+use crate::backend::{Backend, Change};
 use crate::index::Index;
 use crate::lock::{Lock, Package};
 use crate::pep::{eval_marker, MarkerEnv, Requirement, Version};
@@ -175,6 +175,29 @@ fn python_floor(project: &Project) -> Result<[u32; 3]> {
         Some(v) => Ok(v),
         None => Ok(venv::interpreter(None)?.version),
     }
+}
+
+/// The differences between two name → version maps, as the lock would change.
+fn changes_between(old: &BTreeMap<String, String>, new: &BTreeMap<String, String>) -> Vec<Change> {
+    let mut changes = Vec::new();
+    for (name, version) in new {
+        match old.get(name) {
+            Some(o) if o == version => {}
+            other => changes.push(Change {
+                name: name.clone(),
+                from: other.cloned(),
+                to: Some(version.clone()),
+            }),
+        }
+    }
+    for (name, version) in old.iter().filter(|(n, _)| !new.contains_key(*n)) {
+        changes.push(Change {
+            name: name.clone(),
+            from: Some(version.clone()),
+            to: None,
+        });
+    }
+    changes
 }
 
 /// The set of lock packages an environment should contain for `env`, given
@@ -511,37 +534,20 @@ impl Backend for NativeBackend {
     fn upgrade(&self, dir: &Path, packages: &[String], dry_run: bool) -> Result<()> {
         let project = Project::require(dir)?;
         let (old, new) = self.relock(&project, packages, packages.is_empty(), dry_run)?;
-        let mut changes = 0;
-        for (name, version) in &new {
-            match old.get(name) {
-                Some(o) if o != version => {
-                    changes += 1;
-                    println!(
-                        "{} {name} v{o} -> v{version}",
-                        if dry_run { "Would update" } else { "Updated" }
-                    );
-                }
-                None => {
-                    changes += 1;
-                    println!(
-                        "{} {name} v{version}",
-                        if dry_run { "Would add" } else { "Added" }
-                    );
-                }
-                _ => {}
-            }
+        let changes = changes_between(&old, &new);
+        for c in &changes {
+            println!("{}", c.describe(!dry_run));
         }
-        for name in old.keys().filter(|n| !new.contains_key(*n)) {
-            changes += 1;
-            println!(
-                "{} {name}",
-                if dry_run { "Would remove" } else { "Removed" }
-            );
-        }
-        if changes == 0 {
+        if changes.is_empty() {
             println!("No lockfile changes detected");
         }
         Ok(())
+    }
+
+    fn outdated(&self, dir: &Path) -> Result<Vec<Change>> {
+        let project = Project::require(dir)?;
+        let (old, new) = self.relock(&project, &[], true, true)?;
+        Ok(changes_between(&old, &new))
     }
 
     /// PEP 517 by hand: a throwaway environment with `build-system.requires`

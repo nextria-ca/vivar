@@ -40,12 +40,16 @@ jobs:
           set -eu
           name=vivar-${{ matrix.target }}
           mkdir -p dist/$name
-          cp README.md THIRD_PARTY_LICENSES.md dist/$name/
+          cp README.md THIRD_PARTY_LICENSES.md LICENSE dist/$name/
           if [ "${{ runner.os }}" = Windows ]; then
             cp target/${{ matrix.target }}/release/vivar.exe dist/$name/
             (cd dist && 7z a -tzip $name.zip $name > /dev/null)
           else
             cp target/${{ matrix.target }}/release/vivar dist/$name/
+            # Man pages come from the binary itself; cross-built binaries can't run here.
+            if target/${{ matrix.target }}/release/vivar --version >/dev/null 2>&1; then
+              target/${{ matrix.target }}/release/vivar man dist/$name/man
+            fi
             tar -C dist -czf dist/$name.tar.gz $name
           fi
           rm -r dist/$name
@@ -97,8 +101,12 @@ jobs:
           version=${GITHUB_REF_NAME#v}
           case $t in x86_64-*) deb_arch=amd64; rpm_arch=x86_64 ;; aarch64-*) deb_arch=arm64; rpm_arch=aarch64 ;; esac
           pkg=pkg/vivar_${version}_$deb_arch
-          mkdir -p $pkg/DEBIAN $pkg/usr/bin
+          mkdir -p $pkg/DEBIAN $pkg/usr/bin $pkg/usr/share/man/man1
           install -m 755 target/$t/release/vivar $pkg/usr/bin/vivar
+          if target/$t/release/vivar --version >/dev/null 2>&1; then
+            target/$t/release/vivar man $pkg/usr/share/man/man1 && gzip -9n $pkg/usr/share/man/man1/*.1
+            mkdir -p man && target/$t/release/vivar man man >/dev/null
+          fi
           cat > $pkg/DEBIAN/control <<EOF
           Package: vivar
           Version: $version
@@ -109,7 +117,8 @@ jobs:
           EOF
           dpkg-deb --build --root-owner-group $pkg dist/vivar_${version}_$deb_arch.deb
           rpmbuild -bb packaging/vivar.spec --define "_topdir $PWD/rpm" --define "version $version" \
-            --define "arch $rpm_arch" --define "binary $PWD/target/$t/release/vivar" --target $rpm_arch
+            --define "arch $rpm_arch" --define "binary $PWD/target/$t/release/vivar" \
+            --define "mandir_src $PWD/man" --target $rpm_arch
           cp rpm/RPMS/*/vivar-*.rpm dist/
       - name: Windows installer (msi)
         if: runner.os == 'Windows'

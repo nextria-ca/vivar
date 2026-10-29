@@ -119,6 +119,12 @@ if [ -f "$HERE/policy.toml" ] || [ -n "${VIVAR_POLICY_URL:-}" ]; then
   fi
 fi
 
+# Man pages, when the archive carries them.
+if [ -d "$HERE/man" ]; then
+  MANDIR=${XDG_DATA_HOME:-$HOME/.local/share}/man/man1
+  mkdir -p "$MANDIR" && cp "$HERE"/man/*.1 "$MANDIR"/ && echo "installed man pages to $MANDIR"
+fi
+
 # Shell completions for the shell that runs this, into the directory that
 # shell loads on its own (zsh needs the fpath line once).
 if [ -z "${VIVAR_SKIP_COMPLETIONS:-}" ]; then

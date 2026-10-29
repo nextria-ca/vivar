@@ -1104,6 +1104,17 @@ fn bundle_integrity_and_diff() {
 
 #[test]
 fn doctor_env_completions_and_docker_export() {
+    let man_dir = std::env::temp_dir().join(format!("vivar-man-cli-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&man_dir);
+    let out = ok(Path::new("."), &["man", man_dir.to_str().unwrap()]);
+    assert!(stdout_of(&out).contains("man pages"), "{}", stdout_of(&out));
+    let add = read(&man_dir.join("vivar-add.1"));
+    assert!(
+        add.contains(".SH DESCRIPTION") && add.contains("policy"),
+        "{add}"
+    );
+    assert!(man_dir.join("vivar-python-install.1").is_file());
+    let _ = fs::remove_dir_all(&man_dir);
     let tmp = TempDir::new("misc");
     let dir = &tmp.0;
     init(dir);

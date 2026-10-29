@@ -14,6 +14,7 @@ mod json;
 mod kernel;
 mod licenses;
 mod lock;
+mod man;
 mod native;
 mod pep;
 mod project;
@@ -51,6 +52,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Create a new project in the current directory
+    #[command(
+        long_about = "Create a new project in the current directory: a PEP 621 pyproject.toml, a \
+.python-version pin, vivar's defaults, and (unless --no-sync) a .venv on the chosen Python \
+with a lockfile when uv is available. --template picks a shape: app (default), library \
+(build backend and src/ layout), service (library plus a `serve` task and entry point), \
+or notebook (ipykernel, jupyterlab, notebooks/ and a `lab` task). The result is a plain \
+Python project that uv and pip understand without vivar."
+    )]
     Init {
         /// Project name (defaults to the directory name)
         name: Option<String>,
@@ -68,6 +77,14 @@ enum Command {
         template: Option<String>,
     },
     /// Add dependencies to the project (checked against policy first)
+    #[command(
+        long_about = "Add dependencies to pyproject.toml, re-resolve the lockfile and sync the \
+environment, as one transaction: a package the policy denies, a licence outside the \
+allowlist or a failed install rolls pyproject.toml, uv.lock and the environment back. \
+Resolution uses uv when it is on PATH and vivar's own resolver otherwise (VIVAR_BACKEND=native \
+forces it). For torch, --cuda picks the PyTorch index for a CUDA or ROCm variant, or `auto` \
+for whatever this machine's driver supports."
+    )]
     Add {
         #[arg(required = true)]
         packages: Vec<String>,
@@ -89,6 +106,12 @@ enum Command {
     },
     /// Everything CI wants in one go: declared deps vs policy, lock freshness,
     /// hashes, licenses, vulnerabilities and a verify run
+    #[command(
+        long_about = "One command for CI: every declared dependency against the policy (deny list, \
+licence allowlist, hash and wheels-only requirements), the lockfile against pyproject.toml, \
+the OSV vulnerability database against the locked versions, and a `verify` run of the \
+environment. Exit status is non-zero on any failure; --json prints the findings."
+    )]
     Check {
         /// Skip the OSV vulnerability query (offline machines)
         #[arg(long)]
@@ -133,6 +156,13 @@ enum Command {
     /// Resolve dependencies and write the lockfile
     Lock,
     /// Make the environment match the lockfile exactly
+    #[command(
+        long_about = "Install exactly what uv.lock pins into .venv and remove anything else, \
+hash-checking every wheel. Without uv on PATH vivar's own installer does this from the \
+lock alone, offline when the wheels are cached or a wheelhouse is configured. --profile \
+installs one machine variant (cpu, cu124, rocm6.2 ...); `auto` picks the one matching the \
+GPU vivar detects."
+    )]
     Sync {
         /// Install this profile's packages (`auto` picks the one for this machine's GPU)
         #[arg(long)]
@@ -216,7 +246,18 @@ enum Command {
     },
     /// Print a shell completion script (bash, zsh, fish, powershell, elvish)
     Completions { shell: clap_complete::Shell },
+    /// Write man pages (vivar.1 and one per subcommand) into a directory
+    Man { dir: PathBuf },
     /// Archive the synced environment plus its Python for another machine
+    #[command(
+        long_about = "Archive the synced .venv, its standalone Python, pyproject.toml, uv.lock and \
+.python-version into one tar.gz that unpacks anywhere with the same OS and CPU: no uv, no \
+network, no Python required there. Everything a frozen environment never uses is left \
+out (bytecode and tool caches, the runtime's tests, pip, IDLE). Every file is listed with \
+its SHA-256 and `unpack` refuses an archive that does not match. --sign adds an Ed25519 \
+signature over that list; --target builds for another platform from the lockfile; --slim, \
+--use-host-cuda and --zstd trade size and speed."
+    )]
     Pack {
         /// Output file (default: <name>-<os>-<arch>.tar.gz in the current directory)
         #[arg(short, long)]
@@ -244,6 +285,13 @@ enum Command {
         sign: bool,
     },
     /// Extract a bundle made by `vivar pack` and make it activatable here
+    #[command(
+        long_about = "Extract a bundle made by `vivar pack`, check every file against the bundle's \
+checksum list (and its signature when there is one or when policy requires it), and \
+rewrite the environment's paths, launchers and activate scripts for this location. \
+--apply takes a delta from `vivar diff --patch` and upgrades an unpacked bundle in place; \
+--dedupe-with hard-links files identical to another unpacked bundle."
+    )]
     Unpack {
         archive: PathBuf,
         /// Directory to unpack into (default: the archive name without .tar.gz)
@@ -260,6 +308,14 @@ enum Command {
     },
     /// Check every installed package imports and its native libraries, CUDA
     /// driver, and scripts work on this machine
+    #[command(
+        long_about = "Run the environment's own Python over every installed package: import each \
+top-level module, load every native extension and name the shared libraries it cannot \
+find, check that CUDA or ROCm packages have a driver that supports them, run a tensor on \
+the GPU when torch is present, and confirm console scripts point at this environment. On \
+an unpacked bundle it also reports files changed since packing. --json prints a report \
+CI can gate on."
+    )]
     Verify {
         /// Project, bundle, or .venv directory (default: the current project)
         path: Option<PathBuf>,
@@ -1000,6 +1056,10 @@ fn main() -> Result<()> {
         Command::Clean { tools } => envs::clean(tools)?,
         Command::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "vivar", &mut std::io::stdout());
+        }
+        Command::Man { dir } => {
+            let names = man::write_all(&Cli::command(), &dir)?;
+            println!("wrote {} man pages to {}", names.len(), dir.display());
         }
         Command::Pack {
             output,

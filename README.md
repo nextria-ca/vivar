@@ -198,7 +198,8 @@ vivar key generate && vivar pack --sign     # sign bundles (Ed25519); `unpack --
 vivar export sbom --format spdx # CycloneDX (default) or SPDX bill of materials from the lock
 vivar doctor                    # what's installed, configured, broken
 vivar env list / vivar clean    # what vivar keeps on disk; drop script envs and caches
-vivar completions zsh           # shell completion (bash, zsh, fish, powershell, elvish)
+vivar completions zsh           # shell completion (bash, zsh, fish, powershell, elvish); installers set it up
+vivar man ~/.local/share/man/man1   # man pages, one per subcommand (packages and archives ship them)
 vivar upgrade                   # vivar itself (`--check` only reports)
 ```
 

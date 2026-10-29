@@ -105,6 +105,26 @@ def native_libs():
     return missing, needed
 
 
+def unloadable_extensions():
+    '''{path: error} for every extension module the dynamic loader refuses (macOS, Windows).
+
+    ldd is Linux-only; here each extension is loaded the way Python would, so a
+    missing dependent library (a CUDA runtime, a vendored .dylib) is named.
+    '''
+    exts = (".so", ".dylib") if sys.platform == "darwin" else (".pyd", ".dll")
+    bad = {}
+    for root, _, files in os.walk(SITE):
+        for f in files:
+            if not f.endswith(exts):
+                continue
+            path = os.path.join(root, f)
+            try:
+                ctypes.CDLL(path)
+            except OSError as e:
+                bad[path] = str(e).split(":")[-1].strip() or str(e)
+    return bad
+
+
 def cuda_problem(runtime):
     """runtime: the CUDA version the env's packages were built for, as (major, minor) or None."""
     lib = os.environ.get("VIVAR_CUDA_LIB", "nvcuda.dll" if sys.platform == "win32" else "libcuda.so.1")
@@ -237,12 +257,15 @@ def main():
             if VERBOSE:
                 say(f"  ok   {name} ({', '.join(mods) or 'no modules'})")
 
-    # 2. Native libraries resolve (Linux).
+    # 2. Native libraries resolve: ldd on Linux, the loader itself elsewhere.
     needed = set()
     if sys.platform.startswith("linux"):
         missing, needed = native_libs()
         for path, libs in sorted(missing.items()):
             report("ERR", os.path.relpath(path, SITE), f"needs {', '.join(libs)}, not found on this machine")
+    else:
+        for path, err in sorted(unloadable_extensions().items()):
+            report("ERR", os.path.relpath(path, SITE), f"cannot be loaded: {err}")
 
     # 3. CUDA packages need a driver.
     cuda_dists = [d.metadata["Name"] for d in dists if d.metadata["Name"].lower().startswith("nvidia-")]

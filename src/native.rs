@@ -4,10 +4,12 @@
 //! operations say so.
 
 use crate::backend::Backend;
+use crate::index::Index;
 use crate::lock::{Lock, Package};
-use crate::pep::{eval_marker, MarkerEnv};
-use crate::project::Policy;
-use crate::{dirs, install, sha256, upgrade, wheelhouse};
+use crate::pep::{eval_marker, MarkerEnv, Requirement, Version};
+use crate::project::{self, Policy, Project};
+use crate::resolve::{write_lock, Resolver, Roots};
+use crate::{dirs, install, sha256, upgrade, venv, wheelhouse};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -26,9 +28,104 @@ impl NativeBackend {
         }
     }
 
-    fn needs_uv(what: &str) -> anyhow::Error {
-        anyhow!("`{what}` needs dependency resolution, which vivar still delegates to uv; install uv (vivar's offline bundles include it) or sync from an existing uv.lock")
+    fn index(&self) -> Index {
+        Index::new(self.index_url.as_deref())
     }
+
+    /// Resolves the project's requirements and writes `uv.lock`. Returns the
+    /// previous lock's versions and the new ones, for reporting.
+    fn relock(
+        &self,
+        project: &Project,
+        upgrade: &[String],
+        upgrade_all: bool,
+        dry_run: bool,
+    ) -> Result<(BTreeMap<String, String>, BTreeMap<String, String>)> {
+        let root = project.venv_root();
+        let (deps, extras, groups) = project.requirement_sections();
+        let parse_all = |v: &[String]| -> Result<Vec<Requirement>> {
+            v.iter().map(|r| Requirement::parse(r)).collect()
+        };
+        let roots = Roots {
+            name: project.name(),
+            version: project.version().unwrap_or_else(|| "0.1.0".to_owned()),
+            requires_python: project.requires_python(),
+            dependencies: parse_all(&deps)?,
+            extras: extras
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), parse_all(v)?)))
+                .collect::<Result<_>>()?,
+            groups: groups
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), parse_all(v)?)))
+                .collect::<Result<_>>()?,
+        };
+        let floor = python_floor(project)?;
+        let old: BTreeMap<String, String> = Lock::read(root)
+            .map(|l| {
+                l.packages
+                    .iter()
+                    .filter(|p| p.source_kind == "registry")
+                    .map(|p| (p.name.clone(), p.version.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let prefer: BTreeMap<String, Version> = old
+            .iter()
+            .filter_map(|(n, v)| Version::parse(v).ok().map(|v| (n.clone(), v)))
+            .collect();
+        let index = self.index();
+        let resolution = Resolver::new(&index, floor, self.no_build)
+            .prefer(prefer)
+            .upgrade(upgrade, upgrade_all)
+            .resolve(&roots)?;
+        let new: BTreeMap<String, String> = resolution
+            .packages
+            .iter()
+            .map(|p| (p.name.clone(), p.version.to_string()))
+            .collect();
+        if !dry_run {
+            let text = write_lock(&roots, &resolution, index.url());
+            fs::write(root.join(crate::lock::LOCKFILE), text)?;
+            println!(
+                "resolved {} package(s) (native resolver, wheels only)",
+                resolution.packages.len()
+            );
+        }
+        Ok((old, new))
+    }
+
+    fn needs_uv(what: &str) -> anyhow::Error {
+        anyhow!("`{what}` is not supported by the native backend yet; install uv for it")
+    }
+}
+
+/// The Python the project targets: its pin, else the `requires-python` floor,
+/// else the env, else the newest installed.
+fn python_floor(project: &Project) -> Result<[u32; 3]> {
+    let root = project.venv_root();
+    if let Ok(v) = env_version(&root.join(".venv")) {
+        return Ok(v);
+    }
+    if let Ok(pin) = fs::read_to_string(root.join(".python-version")) {
+        let mut it = pin.trim().split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+        return Ok([
+            it.next().unwrap_or(3),
+            it.next().unwrap_or(12),
+            it.next().unwrap_or(0),
+        ]);
+    }
+    if let Some(rp) = project.requires_python() {
+        if let Some(v) = rp.split(',').find_map(|c| c.trim().strip_prefix(">=")) {
+            let mut it = v.trim().split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+            return Ok([
+                it.next().unwrap_or(3),
+                it.next().unwrap_or(12),
+                it.next().unwrap_or(0),
+            ]);
+        }
+    }
+    Ok(venv::interpreter(None)?.version)
 }
 
 /// The set of lock packages an environment should contain for `env`, given
@@ -292,16 +389,36 @@ impl NativeBackend {
 }
 
 impl Backend for NativeBackend {
-    fn add(&self, _dir: &Path, _packages: &[String], _group: Option<&str>) -> Result<()> {
-        Err(Self::needs_uv("vivar add"))
+    fn add(&self, dir: &Path, packages: &[String], group: Option<&str>) -> Result<()> {
+        let project = Project::require(dir)?;
+        for p in packages {
+            Requirement::parse(p)?; // fail before touching the file
+        }
+        for p in packages {
+            project::add_dependency(&project.root, p, group)?;
+        }
+        let project = Project::require(dir)?;
+        self.relock(&project, &[], false, false)?;
+        let groups: Vec<&str> = group.into_iter().collect();
+        self.sync_groups(dir, &groups)
     }
 
-    fn remove(&self, _dir: &Path, _packages: &[String]) -> Result<()> {
-        Err(Self::needs_uv("vivar remove"))
+    fn remove(&self, dir: &Path, packages: &[String]) -> Result<()> {
+        let project = Project::require(dir)?;
+        for p in packages {
+            if !project::remove_dependency(&project.root, p)? {
+                bail!("{p} is not a declared dependency");
+            }
+        }
+        let project = Project::require(dir)?;
+        self.relock(&project, &[], false, false)?;
+        self.sync(dir)
     }
 
-    fn lock(&self, _dir: &Path) -> Result<()> {
-        Err(Self::needs_uv("vivar lock"))
+    fn lock(&self, dir: &Path) -> Result<()> {
+        let project = Project::require(dir)?;
+        self.relock(&project, &[], false, false)?;
+        Ok(())
     }
 
     fn sync(&self, dir: &Path) -> Result<()> {
@@ -316,21 +433,104 @@ impl Backend for NativeBackend {
         self.sync_into(&root, &root.join(".venv"), &all)
     }
 
-    fn upgrade(&self, _dir: &Path, _packages: &[String], _dry_run: bool) -> Result<()> {
-        Err(Self::needs_uv("vivar upgrade-deps / outdated"))
+    fn upgrade(&self, dir: &Path, packages: &[String], dry_run: bool) -> Result<()> {
+        let project = Project::require(dir)?;
+        let (old, new) = self.relock(&project, packages, packages.is_empty(), dry_run)?;
+        let mut changes = 0;
+        for (name, version) in &new {
+            match old.get(name) {
+                Some(o) if o != version => {
+                    changes += 1;
+                    println!(
+                        "{} {name} v{o} -> v{version}",
+                        if dry_run { "Would update" } else { "Updated" }
+                    );
+                }
+                None => {
+                    changes += 1;
+                    println!(
+                        "{} {name} v{version}",
+                        if dry_run { "Would add" } else { "Added" }
+                    );
+                }
+                _ => {}
+            }
+        }
+        for name in old.keys().filter(|n| !new.contains_key(*n)) {
+            changes += 1;
+            println!(
+                "{} {name}",
+                if dry_run { "Would remove" } else { "Removed" }
+            );
+        }
+        if changes == 0 {
+            println!("No lockfile changes detected");
+        }
+        Ok(())
     }
 
-    fn build(&self, _dir: &Path) -> Result<()> {
+    fn build(&self, dir: &Path) -> Result<()> {
+        let _ = dir;
         Err(Self::needs_uv("vivar build"))
     }
 
+    /// Installs `specs` into the environment whose interpreter is `python`:
+    /// resolves them as a throwaway project and installs the result.
     fn install(&self, python: &Path, specs: &[String]) -> Result<()> {
-        let _ = (python, specs, self.no_build);
-        Err(Self::needs_uv("installing packages by name"))
+        let venv_dir = python
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| anyhow!("{} is not inside an environment", python.display()))?
+            .to_path_buf();
+        let version = env_version(&venv_dir)?;
+        let roots = Roots {
+            name: "vivar-tool".to_owned(),
+            version: "0".to_owned(),
+            requires_python: None,
+            dependencies: specs
+                .iter()
+                .map(|s| Requirement::parse(s))
+                .collect::<Result<_>>()?,
+            ..Default::default()
+        };
+        let index = self.index();
+        let resolution = Resolver::new(&index, version, self.no_build).resolve(&roots)?;
+        let lock_text = write_lock(&roots, &resolution, index.url());
+        let lock = Lock::parse(&lock_text)?;
+        let env = MarkerEnv::current(version);
+        let wanted = plan(&lock, &env, &[])?;
+        let series = format!("{}.{}", version[0], version[1]);
+        let target = wheelhouse::Target::new(None, &series)?;
+        let layout = install::Layout::venv(&venv_dir, &series, cfg!(windows));
+        // Additive: a tool env only ever gains what it asked for.
+        let present = install::installed(&layout.site)?;
+        let mut installed = 0;
+        for pkg in wanted.iter().filter(|p| p.source_kind == "registry") {
+            if present
+                .iter()
+                .any(|d| d.name == pkg.name && d.version == pkg.version)
+            {
+                continue;
+            }
+            if let Some(old) = present.iter().find(|d| d.name == pkg.name) {
+                install::uninstall(old)?;
+            }
+            let wheel = fetch_wheel(pkg, &target, self.wheelhouse_dir().as_deref())?;
+            install::install_wheel(&wheel, &layout)?;
+            installed += 1;
+        }
+        println!("native install: {installed} package(s)");
+        Ok(())
     }
 
-    fn add_requirements(&self, _dir: &Path, _file: &Path, _group: Option<&str>) -> Result<()> {
-        Err(Self::needs_uv("vivar import"))
+    fn add_requirements(&self, dir: &Path, file: &Path, group: Option<&str>) -> Result<()> {
+        let text = fs::read_to_string(file)?;
+        let reqs: Vec<String> = text
+            .lines()
+            .map(|l| l.split(" #").next().unwrap_or(l).trim().to_owned())
+            .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('-'))
+            .collect();
+        self.add(dir, &reqs, group)
     }
 
     fn lock_check(&self, dir: &Path) -> Result<()> {

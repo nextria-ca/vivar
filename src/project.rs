@@ -281,6 +281,106 @@ pub fn ensure_pep621(root: &Path, name: &str, python: Option<&str>) -> Result<()
     fs::write(&path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
 }
 
+/// Adds a requirement to `[project] dependencies` or a dependency group,
+/// replacing an existing entry for the same package.
+pub fn add_dependency(root: &Path, requirement: &str, group: Option<&str>) -> Result<()> {
+    let path = root.join(PYPROJECT);
+    let mut doc: DocumentMut = fs::read_to_string(&path)?.parse()?;
+    let name = normalize(requirement_name(requirement));
+    let array = dependency_array(&mut doc, group)?;
+    array.retain(|v| {
+        v.as_str()
+            .map(|r| normalize(requirement_name(r)) != name)
+            .unwrap_or(true)
+    });
+    array.push(requirement);
+    tidy_array(array);
+    fs::write(&path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Removes a package from `[project] dependencies` and every group.
+pub fn remove_dependency(root: &Path, package: &str) -> Result<bool> {
+    let path = root.join(PYPROJECT);
+    let mut doc: DocumentMut = fs::read_to_string(&path)?.parse()?;
+    let name = normalize(package);
+    let mut found = false;
+    let mut strip = |arr: &mut Array| {
+        let before = arr.len();
+        arr.retain(|v| {
+            v.as_str()
+                .map(|r| normalize(requirement_name(r)) != name)
+                .unwrap_or(true)
+        });
+        found |= arr.len() != before;
+        tidy_array(arr);
+    };
+    if let Some(a) = doc
+        .get_mut("project")
+        .and_then(|p| p.get_mut("dependencies"))
+        .and_then(Item::as_array_mut)
+    {
+        strip(a);
+    }
+    if let Some(t) = doc
+        .get_mut("project")
+        .and_then(|p| p.get_mut("optional-dependencies"))
+        .and_then(Item::as_table_like_mut)
+    {
+        for (_, item) in t.iter_mut() {
+            if let Some(a) = item.as_array_mut() {
+                strip(a);
+            }
+        }
+    }
+    if let Some(t) = doc
+        .get_mut("dependency-groups")
+        .and_then(Item::as_table_like_mut)
+    {
+        for (_, item) in t.iter_mut() {
+            if let Some(a) = item.as_array_mut() {
+                strip(a);
+            }
+        }
+    }
+    fs::write(&path, doc.to_string())?;
+    Ok(found)
+}
+
+fn dependency_array<'a>(doc: &'a mut DocumentMut, group: Option<&str>) -> Result<&'a mut Array> {
+    match group {
+        None => {
+            let project = doc
+                .entry("project")
+                .or_insert(Item::Table(Table::new()))
+                .as_table_mut()
+                .context("`project` is not a table")?;
+            let item = project.entry("dependencies").or_insert(value(Array::new()));
+            item.as_array_mut()
+                .context("`project.dependencies` is not an array")
+        }
+        Some(g) => {
+            let groups = doc
+                .entry("dependency-groups")
+                .or_insert(Item::Table(Table::new()))
+                .as_table_mut()
+                .context("`dependency-groups` is not a table")?;
+            let item = groups.entry(g).or_insert(value(Array::new()));
+            item.as_array_mut()
+                .context("dependency group is not an array")
+        }
+    }
+}
+
+/// One entry per line, as uv formats them.
+fn tidy_array(arr: &mut Array) {
+    for v in arr.iter_mut() {
+        v.decor_mut().set_prefix("\n    ");
+        v.decor_mut().set_suffix("");
+    }
+    arr.set_trailing("\n");
+    arr.set_trailing_comma(true);
+}
+
 /// A valid project name derived from the directory name.
 pub fn default_name(root: &Path) -> String {
     let raw = root
@@ -327,8 +427,10 @@ pub struct Policy {
     pub telemetry_off: bool,
     /// `vivar run`/`shell` tell Hugging Face, uv and friends not to touch the network.
     pub offline: bool,
-    /// `unpack` refuses bundles that aren't authenticated with the org's bundle key.
+    /// `unpack` refuses bundles that aren't authenticated with a trusted key.
     pub require_signed_bundles: bool,
+    /// Hex Ed25519 public keys whose bundle signatures `unpack` accepts.
+    pub trusted_keys: Vec<String>,
 }
 
 impl Policy {
@@ -429,6 +531,7 @@ impl Policy {
                 .and_then(|p| p.get("require-signed-bundles"))
                 .and_then(Item::as_bool)
                 .unwrap_or(false),
+            trusted_keys: list("trusted-keys"),
         }
     }
 
@@ -457,6 +560,11 @@ impl Policy {
         self.telemetry_off |= org.telemetry_off;
         self.offline |= org.offline;
         self.require_signed_bundles |= org.require_signed_bundles;
+        for k in org.trusted_keys {
+            if !self.trusted_keys.contains(&k) {
+                self.trusted_keys.push(k);
+            }
+        }
         self
     }
 }
@@ -488,6 +596,13 @@ pub fn org_policy() -> Result<Option<(PathBuf, Policy)>> {
     }
     Ok(None)
 }
+
+/// `(dependencies, extras, groups)` as requirement strings.
+pub type Sections = (
+    Vec<String>,
+    std::collections::BTreeMap<String, Vec<String>>,
+    std::collections::BTreeMap<String, Vec<String>>,
+);
 
 /// A project rooted at the directory containing `pyproject.toml`. In a uv
 /// workspace, `workspace` is the root project: that is where `.venv` lives.
@@ -585,6 +700,51 @@ impl Project {
             .and_then(|p| p.get("requires-python"))
             .and_then(Item::as_str)
             .map(str::to_owned)
+    }
+
+    /// `[project] version`, if declared.
+    pub fn version(&self) -> Option<String> {
+        self.doc
+            .get("project")
+            .and_then(|p| p.get("version"))
+            .and_then(Item::as_str)
+            .map(str::to_owned)
+    }
+
+    /// Requirements by section: `(dependencies, extras, groups)`.
+    pub fn requirement_sections(&self) -> Sections {
+        let strings = |item: Option<&Item>| -> Vec<String> {
+            item.and_then(Item::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let project = self.doc.get("project");
+        let deps = strings(project.and_then(|p| p.get("dependencies")));
+        let mut extras = std::collections::BTreeMap::new();
+        if let Some(t) = project
+            .and_then(|p| p.get("optional-dependencies"))
+            .and_then(Item::as_table_like)
+        {
+            for (k, item) in t.iter() {
+                extras.insert(normalize(k), strings(Some(item)));
+            }
+        }
+        let mut groups = std::collections::BTreeMap::new();
+        if let Some(t) = self
+            .doc
+            .get("dependency-groups")
+            .and_then(Item::as_table_like)
+        {
+            for (k, item) in t.iter() {
+                groups.insert(k.to_owned(), strings(Some(item)));
+            }
+        }
+        (deps, extras, groups)
     }
 
     /// `[tool.vivar] profiles`: dependency groups that are machine variants.
@@ -1093,6 +1253,28 @@ lint = ["ruff"]
         assert!(text.contains("packages = [\"src/acme\"]"), "{text}");
         // write_defaults must still have added the vivar policy table.
         assert!(text.contains("[tool.vivar.policy]"), "{text}");
+    }
+
+    #[test]
+    fn edits_dependencies_in_place() {
+        let tmp = TempDir::new("deps");
+        fs::write(
+            tmp.0.join(PYPROJECT),
+            "[project]\nname = \"t\"\nversion = \"0.1.0\"\ndependencies = [\n    \"six>=1\",\n]\n",
+        )
+        .unwrap();
+        add_dependency(&tmp.0, "requests>=2", None).unwrap();
+        add_dependency(&tmp.0, "six>=1.16", None).unwrap();
+        add_dependency(&tmp.0, "pytest", Some("dev")).unwrap();
+        let project = Project::load(&tmp.0).unwrap();
+        let (deps, _, groups) = project.requirement_sections();
+        assert_eq!(deps, vec!["requests>=2", "six>=1.16"]);
+        assert_eq!(groups["dev"], vec!["pytest"]);
+        assert!(remove_dependency(&tmp.0, "Six").unwrap());
+        assert!(!remove_dependency(&tmp.0, "nothing").unwrap());
+        let project = Project::load(&tmp.0).unwrap();
+        assert_eq!(project.requirement_sections().0, vec!["requests>=2"]);
+        assert_eq!(project.version().as_deref(), Some("0.1.0"));
     }
 
     #[test]

@@ -3,10 +3,12 @@ mod backend;
 mod bundle;
 mod dirs;
 mod doctor;
+mod ed25519;
 mod envs;
 mod export;
 mod gpu;
 mod import;
+mod index;
 mod install;
 mod json;
 mod kernel;
@@ -16,8 +18,10 @@ mod native;
 mod pep;
 mod project;
 mod python;
+mod resolve;
 mod sbom;
 mod sha256;
+mod sha512;
 mod sign;
 mod tool;
 mod upgrade;
@@ -92,7 +96,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Manage the shared key that authenticates bundles
+    /// Manage the key that signs bundles
     Key {
         #[command(subcommand)]
         command: KeyCommand,
@@ -352,12 +356,12 @@ enum ProfileCommand {
 
 #[derive(Subcommand)]
 enum KeyCommand {
-    /// Create the bundle key (32 random bytes) in the config directory
+    /// Create the signing key (and its public key) in the config directory
     Generate {
         #[arg(long)]
         force: bool,
     },
-    /// Print where the key is read from and whether one is configured
+    /// Print the public key and where the signing key is read from
     Show,
 }
 
@@ -576,17 +580,25 @@ fn main() -> Result<()> {
         }
         Command::Key { command } => match command {
             KeyCommand::Generate { force } => {
-                let path = sign::generate(force)?;
+                let (secret, public) = sign::generate(force)?;
                 println!(
-                    "wrote bundle key to {} (copy it to the machines that unpack)",
-                    path.display()
+                    "wrote bundle key to {} and its public key to {} (share the public key with the machines that unpack)",
+                    secret.display(),
+                    public.display()
                 );
             }
             KeyCommand::Show => {
-                let configured = sign::key()?.is_some();
+                match sign::public_key()? {
+                    Some(public) => println!("public key: {}", sha256::hex(&public)),
+                    None => println!("public key: none"),
+                }
                 println!(
                     "bundle key: {} (VIVAR_BUNDLE_KEY or {})",
-                    if configured { "configured" } else { "none" },
+                    if sign::key()?.is_some() {
+                        "configured"
+                    } else {
+                        "none"
+                    },
                     sign::key_path()?.display()
                 );
             }
@@ -1011,7 +1023,7 @@ fn main() -> Result<()> {
                 let dir = dest.ok_or_else(|| {
                     anyhow::anyhow!("--apply needs the unpacked bundle directory")
                 })?;
-                bundle::apply_delta(&archive, &dir, require_signature)?;
+                bundle::apply_delta(&archive, &dir, require_signature, &policy.trusted_keys)?;
                 return Ok(());
             }
             let dest = dest.unwrap_or_else(|| {
@@ -1022,7 +1034,13 @@ fn main() -> Result<()> {
                         .trim_end_matches(".tar.zst"),
                 )
             });
-            let dest = bundle::unpack(&archive, &dest, require_signature, dedupe_with.as_deref())?;
+            let dest = bundle::unpack(
+                &archive,
+                &dest,
+                require_signature,
+                &policy.trusted_keys,
+                dedupe_with.as_deref(),
+            )?;
             let bin = dest.join(".venv").join(venv::BIN);
             if cfg!(windows) {
                 println!(
@@ -1479,7 +1497,7 @@ fn print_policy(project: Option<&Project>, policy: &project::Policy, json: bool)
         };
         let path_json = |p: &std::path::Path| json::quote(&p.display().to_string());
         println!(
-            "{{\"deny\":{},\"index-url\":{},\"allow-licenses\":{},\"license-exceptions\":{},\"require-hashes\":{},\"require-wheels\":{},\"telemetry\":{},\"network\":{},\"sources\":{{\"project\":{},\"workspace\":{},\"org\":{}}}}}",
+            "{{\"deny\":{},\"index-url\":{},\"allow-licenses\":{},\"license-exceptions\":{},\"require-hashes\":{},\"require-wheels\":{},\"telemetry\":{},\"network\":{},\"require-signed-bundles\":{},\"trusted-keys\":{},\"sources\":{{\"project\":{},\"workspace\":{},\"org\":{}}}}}",
             list(&policy.deny),
             policy.index_url.as_deref().map_or("null".to_owned(), json::quote),
             policy.allow_licenses.as_deref().map_or("null".to_owned(), list),
@@ -1488,6 +1506,8 @@ fn print_policy(project: Option<&Project>, policy: &project::Policy, json: bool)
             policy.require_wheels,
             if policy.telemetry_off { "\"off\"" } else { "\"on\"" },
             if policy.offline { "\"offline\"" } else { "\"online\"" },
+            policy.require_signed_bundles,
+            list(&policy.trusted_keys),
             project.map_or("null".to_owned(), |p| path_json(&p.root.join(project::PYPROJECT))),
             project
                 .and_then(|p| p.workspace.as_deref())
@@ -1534,6 +1554,17 @@ fn print_policy(project: Option<&Project>, policy: &project::Policy, json: bool)
         "  network:            {}",
         if policy.offline { "offline" } else { "online" }
     );
+    println!(
+        "  signed bundles:     {}",
+        if policy.require_signed_bundles {
+            "required"
+        } else {
+            "optional"
+        }
+    );
+    if !policy.trusted_keys.is_empty() {
+        println!("  trusted-keys:       {}", policy.trusted_keys.join(", "));
+    }
     println!("from");
     match project {
         Some(p) => {

@@ -10,7 +10,7 @@ See [DESIGN.md](DESIGN.md) for the why and the roadmap, and
 ## Status
 
 **Usable today, pre-1.0.** Phases 0, 3 and 4 of the [design](DESIGN.md) are implemented,
-tested on Linux, macOS and Windows in CI (72 tests), and reviewed. No release has been
+tested on Linux, macOS and Windows in CI (96 tests), and reviewed. No release has been
 tagged yet; see Install for how to get it in the meantime.
 
 What works:
@@ -31,15 +31,17 @@ What works:
 - **Coming from elsewhere**: `import` for requirements.txt, conda environments, Pipfiles
   and poetry projects; `check` for CI; SBOM export; delta and signed bundles.
 
-How it is built: projects, virtual environments, Python builds, running, bundles,
-verification, policy and upgrades are vivar's own code; dependency resolution and
-installation (`add`, `remove`, `lock`, `sync`) are delegated to
-[`uv`](https://docs.astral.sh/uv/) for now. A vivar project is a plain, standards-based
+How it is built: everything is vivar's own code, with no runtime dependencies beyond
+the OS. That includes the wheel installer, the index client, the dependency resolver,
+the lockfile writer, and the Ed25519 signatures. When [`uv`](https://docs.astral.sh/uv/)
+is on PATH, vivar still delegates resolution and installation to it (it is faster and
+more battle-tested); without it, or with `VIVAR_BACKEND=native`, vivar does the same
+work itself. Both write the same `uv.lock`. A vivar project is a plain, standards-based
 Python project: `pyproject.toml` (PEP 621), `.python-version`, a normal `.venv`, and
 `uv.lock`. Anyone without vivar can still use it with `uv` or `pip`.
 
-Not yet: native (conda-forge) dependencies, delta bundles, an in-process resolver that
-removes the `uv` binary, and model-weight management (out of scope by decision).
+Not yet: native (conda-forge) dependencies, building packages without `uv`, and
+model-weight management (out of scope by decision).
 
 ## Install
 
@@ -192,7 +194,7 @@ vivar python pin 3.13           # repin the project and rebuild .venv on it
 vivar diff a.tar.gz b.tar.gz    # what changed between two bundles
 vivar diff --patch a.tar.gz b.tar.gz        # a delta archive; `vivar unpack --apply delta.tar.gz <unpacked-a>` upgrades in place
 vivar unpack --dedupe-with ./other b.tar.gz # hard-link files identical to an already unpacked bundle
-vivar key generate && vivar pack --sign     # authenticate bundles; `unpack --require-signature` or policy enforces it
+vivar key generate && vivar pack --sign     # sign bundles (Ed25519); `unpack --require-signature` or policy enforces it
 vivar export sbom --format spdx # CycloneDX (default) or SPDX bill of materials from the lock
 vivar doctor                    # what's installed, configured, broken
 vivar env list / vivar clean    # what vivar keeps on disk; drop script envs and caches
@@ -273,12 +275,15 @@ the files that changed (plus the new manifest and checksums). On the other machi
 refuses to apply onto anything but the exact base, and re-verifies every checksum
 afterwards. A torch upgrade travels as megabytes instead of gigabytes.
 
-**Authenticated bundles.** `vivar key generate` creates a 32-byte key in the config
-directory (copy it to the machines that unpack, or set `VIVAR_BUNDLE_KEY`).
-`pack --sign` writes an HMAC-SHA256 of the checksum list; `unpack --require-signature`,
-or `require-signed-bundles = true` in policy, refuses bundles that aren't signed with
-that key. It proves the bundle came from someone holding the key and wasn't altered;
-it is a shared secret, not a public-key signature.
+**Signed bundles.** `vivar key generate` creates an Ed25519 signing key (`bundle.key`,
+private, or `VIVAR_BUNDLE_KEY`) and its public key (`bundle.pub`) in the config directory;
+`vivar key show` prints the public key. `pack --sign` signs the checksum list and the
+inventory of everything else in the bundle (launchers, activate scripts, the manifest).
+Machines that unpack trust public keys from `trusted-keys = ["<hex>"]` in policy (the
+org policy file is the natural place), `VIVAR_TRUSTED_KEYS`, their own `bundle.pub`, or
+their own signing key. `unpack --require-signature`, or `require-signed-bundles = true`
+in policy, refuses bundles that aren't signed by a trusted key. The private key never
+leaves the machine that packs.
 
 **Dedupe.** `unpack --dedupe-with <other-unpacked-bundle>` hard-links every file that is
 byte-identical (per both checksum lists) instead of storing it twice. Same filesystem

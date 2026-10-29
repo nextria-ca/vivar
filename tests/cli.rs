@@ -1849,7 +1849,15 @@ fn delta_bundles_dedupe_and_signing() {
     let out = okr(dir, &["key", "generate"]);
     assert!(stdout_of(&out).contains("wrote bundle key"));
     assert!(!run(dir, &["key", "generate"]).status.success()); // never silently replaced
-    assert!(stdout_of(&okr(dir, &["key", "show"])).contains("configured"));
+    let shown = stdout_of(&okr(dir, &["key", "show"]));
+    assert!(shown.contains("configured"), "{shown}");
+    let public = shown
+        .lines()
+        .find_map(|l| l.strip_prefix("public key: "))
+        .expect("public key line")
+        .trim()
+        .to_owned();
+    assert_eq!(public.len(), 64, "{shown}");
 
     let a = tmp.0.join("a.tar.gz");
     okr(dir, &["pack", "--sign", "-o", a.to_str().unwrap()]);
@@ -1881,7 +1889,45 @@ fn delta_bundles_dedupe_and_signing() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("does not match"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("does not trust"));
+    // A verifier with no key of its own trusts the signer through policy
+    // `trusted-keys` (or VIVAR_TRUSTED_KEYS) and nothing else.
+    let trust = tmp.0.join("trust.toml");
+    fs::write(&trust, format!("[policy]\ntrusted-keys = [\"{public}\"]\n")).unwrap();
+    for (policy_file, env_keys, ok_expected) in [
+        (Some(&trust), None, true),
+        (None, Some(public.as_str()), true),
+        (None, None, false),
+    ] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_vivar"));
+        cmd.current_dir(&tmp.0)
+            .env("XDG_CONFIG_HOME", tmp.0.join("empty-conf"))
+            .env("APPDATA", tmp.0.join("empty-conf"))
+            .env_remove("VIVAR_BUNDLE_KEY")
+            .args([
+                "unpack",
+                "--require-signature",
+                a.to_str().unwrap(),
+                tmp.0.join("trusted").to_str().unwrap(),
+            ]);
+        if let Some(p) = policy_file {
+            cmd.env("VIVAR_POLICY", p);
+        }
+        if let Some(k) = env_keys {
+            cmd.env("VIVAR_TRUSTED_KEYS", k);
+        }
+        let out = cmd.output().unwrap();
+        assert_eq!(
+            out.status.success(),
+            ok_expected,
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if !ok_expected {
+            assert!(String::from_utf8_lossy(&out.stderr).contains("no trusted keys"));
+        }
+        let _ = fs::remove_dir_all(tmp.0.join("trusted"));
+    }
     // An unsigned bundle fails when a signature is required (here via org policy).
     let unsigned = tmp.0.join("u.tar.gz");
     ok(dir, &["pack", "-o", unsigned.to_str().unwrap()]);
@@ -2376,10 +2422,63 @@ fn native_backend_syncs_from_the_lock_without_uv() {
         "{}",
         stdout_of(&out)
     );
-    // Resolution still needs uv, and says so clearly.
-    let out = native(dir, &["add", "rich"]);
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("delegates to uv"));
+    // Resolution is native too: add edits pyproject, writes a lock uv accepts,
+    // and installs; remove takes the package and its orphans back out.
+    let out = okn(dir, &["add", "pytest>=8"]);
+    assert!(read(&dir.join("pyproject.toml")).contains("pytest>=8"));
+    assert!(
+        read(&dir.join("uv.lock")).contains("name = \"pluggy\""),
+        "{}",
+        stdout_of(&out)
+    );
+    okn(dir, &["run", "python", "-c", "import pytest, pluggy"]);
+    if let Ok(out) = Command::new("uv")
+        .current_dir(dir)
+        .args(["lock", "--check"])
+        .output()
+    {
+        assert!(
+            out.status.success(),
+            "uv rejects the native lock: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert!(stdout_of(&okn(dir, &["outdated"])).contains("No lockfile changes"));
+    okn(dir, &["remove", "pytest"]);
+    assert!(!read(&dir.join("pyproject.toml")).contains("pytest"));
+    assert!(!read(&dir.join("uv.lock")).contains("name = \"pluggy\""));
+    assert!(!native(dir, &["run", "python", "-c", "import pytest"])
+        .status
+        .success());
+    assert!(!native(dir, &["run", "python", "-c", "import pluggy"])
+        .status
+        .success());
+    // A tool environment resolves and installs natively as well.
+    let home = tmp.0.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
+        .current_dir(dir)
+        .env("VIVAR_BACKEND", "native")
+        .env("PATH", bare_path())
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("APPDATA", &home)
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("UV_PYTHON_INSTALL_DIR", real_python_dir())
+        .args(["tool", "install", "pycodestyle"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout_of(&out).contains("pycodestyle"),
+        "{}",
+        stdout_of(&out)
+    );
     if cfg!(unix) {
         let here = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
         let archive = tmp.0.join("native-x.tar.gz");

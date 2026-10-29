@@ -808,6 +808,7 @@ pub fn unpack(
     archive: &Path,
     dest: &Path,
     require_signature: bool,
+    trusted_keys: &[String],
     dedupe_with: Option<&Path>,
 ) -> Result<PathBuf> {
     fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
@@ -825,7 +826,7 @@ pub fn unpack(
             archive.display()
         );
     }
-    check_signature(&dest, require_signature)?;
+    check_signature(&dest, require_signature, trusted_keys)?;
     let mut bad = verify_checksums(&dest)?;
     if dest.join(INVENTORY).is_file() {
         bad.extend(verify_inventory(&dest)?);
@@ -868,9 +869,9 @@ fn extract(archive: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Verifies the signature when there is one or when one is required; the
-/// key comes from `VIVAR_BUNDLE_KEY` or the config directory.
-fn check_signature(dir: &Path, required: bool) -> Result<()> {
+/// Verifies the signature when there is one or when one is required, against
+/// the keys this machine trusts (policy, `VIVAR_TRUSTED_KEYS`, its own).
+fn check_signature(dir: &Path, required: bool, trusted_keys: &[String]) -> Result<()> {
     let has_sig = dir.join(crate::sign::SIGNATURE).is_file();
     if !has_sig && !required {
         return Ok(());
@@ -878,9 +879,9 @@ fn check_signature(dir: &Path, required: bool) -> Result<()> {
     if !has_sig {
         bail!("this bundle is not signed and policy (or --require-signature) demands it");
     }
-    let key = crate::sign::require_key()?;
-    crate::sign::verify(dir, &key)?;
-    println!("signature verified with the bundle key");
+    let trusted = crate::sign::trusted_keys(trusted_keys)?;
+    crate::sign::verify(dir, &trusted)?;
+    println!("signature verified with a trusted key");
     Ok(())
 }
 
@@ -1166,7 +1167,12 @@ pub fn make_delta(old: &Path, new: &Path, output: &Path) -> Result<String> {
 
 /// `vivar unpack --apply delta dir`: brings an unpacked bundle up to the new
 /// one. The directory must still match the delta's base checksum list.
-pub fn apply_delta(delta: &Path, dir: &Path, require_signature: bool) -> Result<()> {
+pub fn apply_delta(
+    delta: &Path,
+    dir: &Path,
+    require_signature: bool,
+    trusted_keys: &[String],
+) -> Result<()> {
     let dir = absolute(dir)?;
     if !dir.join(CHECKSUMS).is_file() {
         bail!("{} is not an unpacked vivar bundle", dir.display());
@@ -1200,7 +1206,7 @@ pub fn apply_delta(delta: &Path, dir: &Path, require_signature: bool) -> Result<
                 damaged.len()
             );
         }
-        check_signature(&tmp, require_signature)?;
+        check_signature(&tmp, require_signature, trusted_keys)?;
         // Only members the base actually had can be removed, and only inside it.
         let base_members: std::collections::HashSet<String> =
             parse_checksums(&fs::read_to_string(dir.join(CHECKSUMS))?)

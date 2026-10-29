@@ -1,0 +1,340 @@
+//! A client for the simple repository API (PEP 503 HTML, PEP 691 JSON) and
+//! wheel metadata (PEP 658), through curl like every other download.
+
+use crate::json::{self, Value};
+use crate::pep::{Requirement, Version};
+use crate::{dirs, sha256, upgrade, zip};
+use anyhow::{anyhow, bail, Context, Result};
+use std::collections::BTreeMap;
+use std::fs;
+
+pub const PYPI: &str = "https://pypi.org/simple";
+
+/// One downloadable file of a project on the index.
+#[derive(Debug, Clone)]
+pub struct File {
+    pub filename: String,
+    pub url: String,
+    pub sha256: Option<String>,
+    pub requires_python: Option<String>,
+    pub yanked: bool,
+    /// PEP 658: `<url>.metadata` exists and is this file's core metadata.
+    pub has_metadata: bool,
+}
+
+impl File {
+    pub fn is_wheel(&self) -> bool {
+        self.filename.ends_with(".whl")
+    }
+
+    /// The version in the file name (`name-1.2.3-py3-none-any.whl`, `name-1.2.3.tar.gz`).
+    pub fn version(&self, name: &str) -> Option<Version> {
+        let stem = self
+            .filename
+            .trim_end_matches(".whl")
+            .trim_end_matches(".tar.gz")
+            .trim_end_matches(".zip");
+        let mut parts = stem.split('-');
+        let file_name = parts.next()?;
+        if crate::project::normalize(file_name) != crate::project::normalize(name) {
+            return None;
+        }
+        Version::parse(parts.next()?).ok()
+    }
+}
+
+/// Parsed core metadata: what the resolver needs from METADATA.
+#[derive(Debug, Clone, Default)]
+pub struct Metadata {
+    pub requires_dist: Vec<Requirement>,
+    pub requires_python: Option<String>,
+    pub provides_extra: Vec<String>,
+}
+
+pub struct Index {
+    base: String,
+    listings: std::cell::RefCell<BTreeMap<String, Vec<File>>>,
+}
+
+impl Index {
+    /// `index_url` from policy when it is an HTTP(S) URL, else PyPI.
+    pub fn new(index_url: Option<&str>) -> Index {
+        let base = index_url
+            .filter(|u| u.contains("://"))
+            .map(|u| u.trim_end_matches('/').to_owned())
+            .unwrap_or_else(|| PYPI.to_owned());
+        Index {
+            base,
+            listings: Default::default(),
+        }
+    }
+
+    pub fn url(&self) -> &str {
+        &self.base
+    }
+
+    /// Every file of `name`, newest listings cached for the process.
+    pub fn files(&self, name: &str) -> Result<Vec<File>> {
+        let name = crate::project::normalize(name);
+        if let Some(cached) = self.listings.borrow().get(&name) {
+            return Ok(cached.clone());
+        }
+        let url = crate::backend::with_credentials(&format!("{}/{name}/", self.base));
+        let body = upgrade::fetch(
+            &url,
+            Some("application/vnd.pypi.simple.v1+json, text/html;q=0.1"),
+        )
+        .with_context(|| format!("looking up {name} on {}", self.base))?;
+        let text = String::from_utf8_lossy(&body);
+        let files = if text.trim_start().starts_with('{') {
+            parse_json(&text)?
+        } else {
+            parse_html(&text, &url)
+        };
+        self.listings.borrow_mut().insert(name, files.clone());
+        Ok(files)
+    }
+
+    /// Core metadata for a wheel: the PEP 658 sidecar when offered, else the
+    /// wheel itself (cached by hash so each is read at most once).
+    pub fn metadata(&self, file: &File) -> Result<Metadata> {
+        let cache = dirs::cache()?.join("metadata");
+        fs::create_dir_all(&cache)?;
+        let key = file.sha256.clone().unwrap_or_else(|| {
+            sha256::hex(&{
+                let mut h = sha256::Sha256::new();
+                h.update(file.url.as_bytes());
+                h.finish()
+            })
+        });
+        let cached = cache.join(format!("{key}.metadata"));
+        let text = if let Ok(t) = fs::read_to_string(&cached) {
+            t
+        } else {
+            let text = if file.has_metadata {
+                String::from_utf8_lossy(&upgrade::fetch(&format!("{}.metadata", file.url), None)?)
+                    .into_owned()
+            } else {
+                let data = upgrade::fetch(&file.url, None).with_context(|| {
+                    format!("downloading {} to read its metadata", file.filename)
+                })?;
+                if let Some(h) = &file.sha256 {
+                    let mut hasher = sha256::Sha256::new();
+                    hasher.update(&data);
+                    if sha256::hex(&hasher.finish()) != *h {
+                        bail!(
+                            "{} does not match the hash the index advertises",
+                            file.filename
+                        );
+                    }
+                }
+                metadata_from_wheel(&data)
+                    .with_context(|| format!("reading METADATA from {}", file.filename))?
+            };
+            let _ = fs::write(&cached, &text);
+            text
+        };
+        Ok(parse_metadata(&text))
+    }
+}
+
+fn parse_json(text: &str) -> Result<Vec<File>> {
+    let doc = json::parse(text)?;
+    let files = doc
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("index response has no `files`"))?;
+    Ok(files
+        .iter()
+        .filter_map(|f| {
+            let filename = f.get("filename")?.as_str()?.to_owned();
+            let url = f.get("url")?.as_str()?.to_owned();
+            let sha256 = f
+                .get("hashes")
+                .and_then(|h| h.get("sha256"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let requires_python = f
+                .get("requires-python")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let yanked = match f.get("yanked") {
+                Some(Value::Bool(b)) => *b,
+                Some(Value::String(_)) => true,
+                _ => false,
+            };
+            let has_metadata = ["core-metadata", "data-dist-info-metadata"]
+                .iter()
+                .any(|k| matches!(f.get(k), Some(Value::Bool(true)) | Some(Value::Object(_))));
+            Some(File {
+                filename,
+                url,
+                sha256,
+                requires_python,
+                yanked,
+                has_metadata,
+            })
+        })
+        .collect())
+}
+
+/// PEP 503: `<a href="…#sha256=…" data-requires-python="…" data-dist-info-metadata>name</a>`.
+fn parse_html(text: &str, page_url: &str) -> Vec<File> {
+    let mut out = Vec::new();
+    for chunk in text.split("<a ").skip(1) {
+        let Some(tag_end) = chunk.find('>') else {
+            continue;
+        };
+        let tag = &chunk[..tag_end];
+        let filename = chunk[tag_end + 1..]
+            .split('<')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        let attr = |name: &str| -> Option<String> {
+            let pos = tag.find(&format!("{name}=\""))?;
+            let rest = &tag[pos + name.len() + 2..];
+            Some(html_unescape(&rest[..rest.find('"')?]))
+        };
+        let Some(href) = attr("href") else { continue };
+        let (url, fragment) = href.split_once('#').unwrap_or((&href, ""));
+        let url = if url.contains("://") {
+            url.to_owned()
+        } else {
+            join_url(page_url, url)
+        };
+        out.push(File {
+            filename,
+            url,
+            sha256: fragment.strip_prefix("sha256=").map(str::to_owned),
+            requires_python: attr("data-requires-python"),
+            yanked: tag.contains("data-yanked"),
+            has_metadata: tag.contains("data-core-metadata")
+                || tag.contains("data-dist-info-metadata"),
+        });
+    }
+    out
+}
+
+fn html_unescape(s: &str) -> String {
+    s.replace("&gt;", ">")
+        .replace("&lt;", "<")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
+fn join_url(page: &str, rel: &str) -> String {
+    if let Some(path) = rel.strip_prefix('/') {
+        let scheme_end = page.find("://").map(|i| i + 3).unwrap_or(0);
+        let host_end = page[scheme_end..]
+            .find('/')
+            .map(|i| scheme_end + i)
+            .unwrap_or(page.len());
+        return format!("{}/{path}", &page[..host_end]);
+    }
+    let base = page.trim_end_matches('/');
+    let mut parts: Vec<&str> = base.split('/').collect();
+    let mut rel_parts = rel.split('/').peekable();
+    while let Some(p) = rel_parts.peek() {
+        match *p {
+            ".." => {
+                parts.pop();
+                rel_parts.next();
+            }
+            "." => {
+                rel_parts.next();
+            }
+            _ => break,
+        }
+    }
+    format!(
+        "{}/{}",
+        parts.join("/"),
+        rel_parts.collect::<Vec<_>>().join("/")
+    )
+}
+
+/// METADATA out of a wheel's `.dist-info`.
+pub fn metadata_from_wheel(data: &[u8]) -> Result<String> {
+    let entries = zip::entries(data)?;
+    let entry = entries
+        .iter()
+        .find(|e| e.name.ends_with(".dist-info/METADATA") && e.name.matches('/').count() == 1)
+        .ok_or_else(|| anyhow!("wheel has no METADATA"))?;
+    Ok(String::from_utf8_lossy(&zip::read(data, entry)?).into_owned())
+}
+
+pub fn parse_metadata(text: &str) -> Metadata {
+    let mut m = Metadata::default();
+    let mut last: Option<&mut String> = None;
+    let mut lines: Vec<String> = Vec::new();
+    // Headers end at the first blank line; continuation lines start with whitespace.
+    for line in text.lines() {
+        if line.is_empty() {
+            break;
+        }
+        if line.starts_with([' ', '\t']) {
+            if let Some(l) = last.as_deref_mut() {
+                l.push(' ');
+                l.push_str(line.trim());
+            }
+            continue;
+        }
+        lines.push(line.to_owned());
+        last = lines.last_mut();
+    }
+    for line in &lines {
+        if let Some(v) = line.strip_prefix("Requires-Dist:") {
+            if let Ok(r) = Requirement::parse(v.trim()) {
+                m.requires_dist.push(r);
+            }
+        } else if let Some(v) = line.strip_prefix("Requires-Python:") {
+            m.requires_python = Some(v.trim().to_owned());
+        } else if let Some(v) = line.strip_prefix("Provides-Extra:") {
+            m.provides_extra.push(crate::project::normalize(v.trim()));
+        }
+    }
+    m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_json_and_html_listings() {
+        let json = r#"{"files":[{"filename":"six-1.17.0-py2.py3-none-any.whl","url":"https://files/six.whl","hashes":{"sha256":"abc"},"requires-python":">=2.7","yanked":false,"core-metadata":{"sha256":"d"}},{"filename":"six-1.17.0.tar.gz","url":"https://files/six.tar.gz","hashes":{},"yanked":"broken"}]}"#;
+        let files = parse_json(json).unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files[0].is_wheel() && files[0].has_metadata && !files[0].yanked);
+        assert_eq!(files[0].sha256.as_deref(), Some("abc"));
+        assert_eq!(files[0].version("Six").unwrap().to_string(), "1.17.0");
+        assert!(files[1].yanked && files[1].sha256.is_none());
+
+        let html = r#"<html><body><a href="../../packages/six-1.16.0.tar.gz#sha256=1e61" data-requires-python="&gt;=2.7">six-1.16.0.tar.gz</a><br/><a href="/packages/six-1.17.0-py2.py3-none-any.whl#sha256=4f1d" data-dist-info-metadata="sha256=x" data-yanked="">six-1.17.0-py2.py3-none-any.whl</a></body></html>"#;
+        let files = parse_html(html, "https://mirror.example/simple/six/");
+        assert_eq!(files.len(), 2);
+        assert_eq!(
+            files[0].url,
+            "https://mirror.example/packages/six-1.16.0.tar.gz"
+        );
+        assert_eq!(files[0].requires_python.as_deref(), Some(">=2.7"));
+        assert_eq!(
+            files[1].url,
+            "https://mirror.example/packages/six-1.17.0-py2.py3-none-any.whl"
+        );
+        assert!(files[1].has_metadata && files[1].yanked);
+    }
+
+    #[test]
+    fn parses_metadata() {
+        let m = parse_metadata("Metadata-Version: 2.1\nName: x\nRequires-Python: >=3.9\nRequires-Dist: numpy>=1.20\nRequires-Dist: rich ; extra == 'cli'\nRequires-Dist: long-one>=1,\n  <2\nProvides-Extra: cli\n\nRequires-Dist: not-a-header\n");
+        assert_eq!(m.requires_python.as_deref(), Some(">=3.9"));
+        assert_eq!(m.requires_dist.len(), 3);
+        assert_eq!(m.requires_dist[1].marker.as_deref(), Some("extra == 'cli'"));
+        assert_eq!(m.requires_dist[2].specifier.to_string(), ">=1,<2");
+        assert_eq!(m.provides_extra, vec!["cli"]);
+    }
+}

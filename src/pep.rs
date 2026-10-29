@@ -232,14 +232,8 @@ impl Specifier {
         Ok(Specifier { clauses })
     }
 
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.clauses.is_empty()
-    }
-
     /// Whether `v` satisfies every clause. Pre-releases only match when the
     /// specifier mentions one, as pip and uv do.
-    #[allow(dead_code)]
     pub fn matches(&self, v: &Version) -> bool {
         let mentions_pre = self.clauses.iter().any(|(_, s)| {
             Version::parse(s)
@@ -325,7 +319,6 @@ fn clause(op: &str, spec: &str, v: &Version) -> bool {
 
 /// A PEP 508 requirement: `name[extra1,extra2]>=1,<2; marker`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // the resolver's input type; constructed there
 pub struct Requirement {
     pub name: String,
     pub extras: Vec<String>,
@@ -335,7 +328,6 @@ pub struct Requirement {
     pub url: Option<String>,
 }
 
-#[allow(dead_code)]
 impl Requirement {
     pub fn parse(s: &str) -> Result<Requirement> {
         let (body, marker) = match s.split_once(';') {

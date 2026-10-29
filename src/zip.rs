@@ -9,6 +9,7 @@ pub struct Entry {
     pub name: String,
     pub size: u64,
     /// Unix permission bits when the archive recorded them (0 otherwise).
+    #[cfg_attr(windows, allow(dead_code))]
     pub mode: u32,
     method: u16,
     compressed: u64,

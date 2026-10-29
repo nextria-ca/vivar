@@ -247,12 +247,22 @@ pub fn uninstall(dist: &Installed) -> Result<()> {
         }
     }
     let _ = fs::remove_dir_all(&dist.dist_info);
-    // Deepest first, so emptied parents go too.
+    // Bytecode caches are made at import time and never recorded; a package
+    // directory holding only one of those is gone too. Deepest first, then
+    // every emptied ancestor up to site-packages.
     let mut dirs: Vec<PathBuf> = dirs.into_iter().collect();
     dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
     for d in dirs {
-        if d.starts_with(&site) && d != site {
-            let _ = fs::remove_dir(&d);
+        let mut cur = d;
+        while cur.starts_with(&site) && cur != site {
+            let _ = fs::remove_dir_all(cur.join("__pycache__"));
+            if fs::remove_dir(&cur).is_err() {
+                break;
+            }
+            cur = cur
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| site.clone());
         }
     }
     Ok(())

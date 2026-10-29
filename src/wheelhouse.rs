@@ -65,7 +65,7 @@ impl Target {
     }
 
     /// Whether a wheel (by file name) runs on this target. Higher is a better fit.
-    fn score(&self, filename: &str) -> Option<u32> {
+    pub fn score(&self, filename: &str) -> Option<u32> {
         let stem = filename.strip_suffix(".whl")?;
         let mut parts = stem.rsplitn(3, '-');
         let plat = parts.next()?;

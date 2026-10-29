@@ -321,6 +321,7 @@ fn main() -> Result<()> {
             if let Some(cuda) = &cuda {
                 project::route_to_cuda_index(&project.root, &packages, cuda)?;
             }
+            let env_before = venv::fingerprint(&project.venv_root().join(".venv"));
             // A failed add (bad index, unresolvable spec) is rolled back like a policy failure.
             let added = backend
                 .add(&cwd, &packages, group.as_deref())
@@ -330,13 +331,15 @@ fn main() -> Result<()> {
                 });
             if let Err(e) = added {
                 println!("rolling back the add");
-                // uv rewrites the lock before touching the env: an unchanged lock
-                // means nothing was installed and the env must be left alone.
+                // Resync only if the env actually changed: uv may restore the lock
+                // itself after a half-finished install, so the lock alone can't tell.
                 let lock_path = project.venv_root().join(lock::LOCKFILE);
-                let env_touched = snapshot
+                let lock_changed = snapshot
                     .iter()
                     .find(|(p, _)| *p == lock_path)
                     .is_some_and(|(_, before)| std::fs::read(&lock_path).ok() != *before);
+                let env_touched = lock_changed
+                    || venv::fingerprint(&project.venv_root().join(".venv")) != env_before;
                 for (path, contents) in snapshot {
                     match contents {
                         Some(bytes) => std::fs::write(&path, bytes)?,

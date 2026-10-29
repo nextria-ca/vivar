@@ -48,6 +48,9 @@ pub struct Resolver<'a> {
     /// For environments standing in for a whole minor: the lowest and highest
     /// patch of that minor inside the project's range (none for this machine).
     patch_bounds: Vec<Option<(Version, Version)>>,
+    /// The last release rejected for a marker that would split a minor, for
+    /// the final diagnostic when no alternative worked out.
+    last_split: Option<String>,
     wheels_only: bool,
     /// Versions to keep when still acceptable (the current lock).
     prefer: BTreeMap<String, Version>,
@@ -102,6 +105,7 @@ impl<'a> Resolver<'a> {
             envs: Vec::new(),
             pythons: Vec::new(),
             patch_bounds: Vec::new(),
+            last_split: None,
             wheels_only,
             prefer: BTreeMap::new(),
             upgrade: BTreeSet::new(),
@@ -276,12 +280,13 @@ impl<'a> Resolver<'a> {
 
     /// The environments (indices) where `marker` holds, given the extras
     /// requested of the package that carries it, within `within`.
+    /// `Err` carries the diagnostic for a marker that would split a minor.
     fn where_holds(
         &self,
         marker: Option<&str>,
         extras: &Extras,
         within: &BTreeSet<usize>,
-    ) -> Result<BTreeSet<usize>> {
+    ) -> std::result::Result<BTreeSet<usize>, String> {
         let Some(m) = marker else {
             return Ok(within.clone());
         };
@@ -311,10 +316,10 @@ impl<'a> Resolver<'a> {
             if verdicts.iter().all(|v| *v) {
                 out.insert(i);
             } else if verdicts.iter().any(|v| *v) {
-                bail!(
+                return Err(format!(
                     "the marker `{m}` distinguishes patch releases of Python {}; vivar's resolver works per minor (uv can fork such a lock)",
                     e.python_version
-                );
+                ));
             }
         }
         Ok(out)
@@ -415,19 +420,38 @@ impl<'a> Resolver<'a> {
         let mut state = State::default();
         let root_name = crate::project::normalize(&roots.name);
         let all = self.all_envs();
-        for r in roots
+        let root_reqs: Vec<&Requirement> = roots
             .dependencies
             .iter()
             .chain(roots.extras.values().flatten())
             .chain(roots.groups.values().flatten())
-        {
-            let envs = self.where_holds(r.marker.as_deref(), &Extras::new(), &all)?;
+            .collect();
+        let mut root_envs = Vec::with_capacity(root_reqs.len());
+        for r in &root_reqs {
+            // A root requirement has no alternative: a split here is final.
+            let envs = self
+                .where_holds(r.marker.as_deref(), &Extras::new(), &all)
+                .map_err(|m| anyhow!("{m}"))?;
+            // Extras asked of a package anywhere in the roots are known before
+            // its first expansion, so the outcome does not depend on order.
+            for e in &r.extras {
+                state
+                    .extras
+                    .entry(r.name.clone())
+                    .or_default()
+                    .entry(e.clone())
+                    .or_default()
+                    .extend(envs.iter().copied());
+            }
+            root_envs.push(envs);
+        }
+        for (r, envs) in root_reqs.iter().zip(root_envs) {
             if envs.is_empty() {
                 continue;
             }
-            state.edges.push((root_name.clone(), r.clone()));
+            state.edges.push((root_name.clone(), (*r).clone()));
             state.pending.push_back(Pending {
-                req: r.clone(),
+                req: (*r).clone(),
                 envs,
             });
         }
@@ -602,7 +626,15 @@ impl<'a> Resolver<'a> {
             return Ok(false);
         }
         for dep in &meta.requires_dist {
-            let envs = self.where_holds(dep.marker.as_deref(), &extras, &within)?;
+            // A release whose edge would split a minor is one candidate down,
+            // not the end of the resolution: older releases may not have it.
+            let envs = match self.where_holds(dep.marker.as_deref(), &extras, &within) {
+                Ok(envs) => envs,
+                Err(split) => {
+                    self.last_split = Some(format!("{name} {version}: {split}"));
+                    return Ok(false);
+                }
+            };
             if envs.is_empty() {
                 continue;
             }
@@ -621,7 +653,12 @@ impl<'a> Resolver<'a> {
     fn backtrack(&mut self, frames: &mut Vec<Frame>, culprit: &str) -> Result<State> {
         loop {
             let Some(frame) = frames.last_mut() else {
-                bail!("dependency conflict involving {culprit}: no combination of versions satisfies every constraint");
+                let split = self
+                    .last_split
+                    .as_deref()
+                    .map(|s| format!("; also rejected {s}"))
+                    .unwrap_or_default();
+                bail!("dependency conflict involving {culprit}: no combination of versions satisfies every constraint{split}");
             };
             if frame.next >= frame.candidates.len() {
                 frames.pop();

@@ -715,29 +715,58 @@ impl Project {
         Ok(Some(project))
     }
 
+    /// `tool.uv.workspace.<key>` globs (`members`, `exclude`).
+    fn member_patterns(&self, key: &str) -> Vec<String> {
+        self.doc
+            .get("tool")
+            .and_then(|t| t.get("uv"))
+            .and_then(|u| u.get("workspace"))
+            .and_then(|w| w.get(key))
+            .and_then(Item::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Whether `dir` matches the root's `members` globs and none of `exclude`.
     fn has_member(&self, dir: &Path) -> bool {
         let Ok(rel) = dir.strip_prefix(&self.root) else {
             return false;
         };
         let rel = rel.to_string_lossy().replace('\\', "/");
-        let patterns = |key: &str| -> Vec<String> {
-            self.doc
-                .get("tool")
-                .and_then(|t| t.get("uv"))
-                .and_then(|u| u.get("workspace"))
-                .and_then(|w| w.get(key))
-                .and_then(Item::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str())
-                        .map(str::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default()
+        self.member_patterns("members")
+            .iter()
+            .any(|p| glob_match(p, &rel))
+            && !self
+                .member_patterns("exclude")
+                .iter()
+                .any(|p| glob_match(p, &rel))
+    }
+
+    /// Packages `[tool.uv.sources]` binds to the workspace (`{ workspace = true }`).
+    pub fn uv_workspace_sources(&self) -> Vec<String> {
+        let Some(t) = self
+            .doc
+            .get("tool")
+            .and_then(|t| t.get("uv"))
+            .and_then(|u| u.get("sources"))
+            .and_then(Item::as_table_like)
+        else {
+            return Vec::new();
         };
-        patterns("members").iter().any(|p| glob_match(p, &rel))
-            && !patterns("exclude").iter().any(|p| glob_match(p, &rel))
+        t.iter()
+            .filter(|(_, item)| {
+                source_entries(item)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|e| e.get("workspace").and_then(|w| w.as_bool()) == Some(true))
+            })
+            .map(|(pkg, _)| normalize(pkg))
+            .collect()
     }
 
     fn is_workspace_root(&self) -> bool {
@@ -921,8 +950,15 @@ impl Project {
         if !self.is_workspace_root() {
             return Ok(Vec::new());
         }
+        // Walk as deep as the member globs reach (a glob segment per level).
+        let max_depth = self
+            .member_patterns("members")
+            .iter()
+            .map(|p| p.trim_matches('/').matches('/').count() + 1)
+            .max()
+            .unwrap_or(1);
         let mut found = Vec::new();
-        let mut stack = vec![(self.root.clone(), 0usize)];
+        let mut stack = vec![(self.root.clone(), 1usize)];
         while let Some((dir, depth)) = stack.pop() {
             let Ok(entries) = fs::read_dir(&dir) else {
                 continue;
@@ -941,7 +977,7 @@ impl Project {
                 if path.join(PYPROJECT).is_file() && self.has_member(&path) {
                     found.push(path.clone());
                 }
-                if depth < 4 {
+                if depth < max_depth {
                     stack.push((path, depth + 1));
                 }
             }

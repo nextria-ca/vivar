@@ -71,13 +71,6 @@ impl NativeBackend {
         upgrade_all: bool,
         dry_run: bool,
     ) -> Result<(BTreeMap<String, String>, BTreeMap<String, String>)> {
-        let unsupported = project.uv_only_features();
-        if !unsupported.is_empty() {
-            bail!(
-                "this project uses {}, which vivar's resolver does not handle yet; install uv for it",
-                unsupported.join(" and ")
-            );
-        }
         let root = project.venv_root().to_path_buf();
         // In a workspace the lock belongs to the root and covers every member.
         let ws_root;
@@ -88,8 +81,30 @@ impl NativeBackend {
             }
             None => project,
         };
+        let members = project.members()?;
+        for p in std::iter::once(project).chain(members.iter()) {
+            let unsupported = p.uv_only_features();
+            if !unsupported.is_empty() {
+                bail!(
+                    "{} uses {}, which vivar's resolver does not handle yet; install uv for it",
+                    p.root.join(project::PYPROJECT).display(),
+                    unsupported.join(" and ")
+                );
+            }
+        }
         let mut roots = roots_of(project)?;
-        for m in project.members()? {
+        // Members: roots of their own, and their Python requirements narrow
+        // the lock's. Their sources and indexes join the root's (root first).
+        let mut rp_clauses: Vec<String> = roots
+            .requires_python
+            .iter()
+            .flat_map(|r| r.split(',').map(|c| c.trim().to_owned()))
+            .filter(|c| !c.is_empty())
+            .collect();
+        let mut sources = project.uv_sources();
+        let mut indexes = project.uv_indexes();
+        let mut workspace_bound = project.uv_workspace_sources();
+        for m in &members {
             let rel = m
                 .root
                 .strip_prefix(&project.root)
@@ -97,13 +112,52 @@ impl NativeBackend {
                 .display()
                 .to_string()
                 .replace('\\', "/");
+            let mr = roots_of(m)?;
+            for c in mr.requires_python.iter().flat_map(|r| r.split(',')) {
+                let c = c.trim().to_owned();
+                if !c.is_empty() && !rp_clauses.contains(&c) {
+                    rp_clauses.push(c);
+                }
+            }
+            for (pkg, entries) in m.uv_sources() {
+                sources.entry(pkg).or_insert(entries);
+            }
+            for i in m.uv_indexes() {
+                if !indexes.iter().any(|x| x.url == i.url) {
+                    indexes.push(i);
+                }
+            }
+            workspace_bound.extend(m.uv_workspace_sources());
             roots.members.push(crate::resolve::Member {
-                roots: roots_of(&m)?,
+                roots: mr,
                 path: rel,
             });
         }
+        if !rp_clauses.is_empty() {
+            roots.requires_python = Some(rp_clauses.join(", "));
+        }
+        // `{ workspace = true }` must name a member (or the root); otherwise the
+        // package would quietly come from an index instead.
+        {
+            let local: BTreeSet<String> = std::iter::once(project::normalize(&roots.name))
+                .chain(
+                    roots
+                        .members
+                        .iter()
+                        .map(|m| project::normalize(&m.roots.name)),
+                )
+                .collect();
+            if let Some(missing) = workspace_bound.iter().find(|p| !local.contains(*p)) {
+                bail!("[tool.uv.sources] binds {missing} to the workspace, but no member is named {missing}");
+            }
+        }
         let machine = python_floor(project)?;
-        let floor = declared_floor(project).unwrap_or(machine);
+        // The lock's floor: the highest lower bound any root declares.
+        let floor = std::iter::once(project)
+            .chain(members.iter())
+            .filter_map(declared_floor)
+            .max()
+            .unwrap_or(machine);
         let old: BTreeMap<String, String> = Lock::read(&root)
             .map(|l| {
                 l.packages
@@ -123,11 +177,10 @@ impl NativeBackend {
         // PyPI is the index of last resort; non-explicit project indexes are
         // searched before it; `[tool.uv.sources]` routes packages to one.
         let wheelhouse = self.wheelhouse_dir().is_some();
-        let indexes = if wheelhouse {
-            Vec::new()
-        } else {
-            project.uv_indexes()
-        };
+        if wheelhouse {
+            indexes.clear();
+            sources.clear();
+        }
         let main_url = self
             .index_url
             .clone()
@@ -139,11 +192,6 @@ impl NativeBackend {
             backend: self,
             series: format!("{}.{}", machine[0], machine[1]),
             index_urls: index_urls.clone(),
-        };
-        let sources = if wheelhouse {
-            Default::default()
-        } else {
-            project.uv_sources()
         };
         let index_url = |name: &str| -> Result<String> {
             indexes
@@ -247,15 +295,17 @@ impl NativeBackend {
             }
         } else {
             let mut base_roots = roots.clone();
-            base_roots.groups.retain(|g, _| !profile_groups.contains(g));
+            base_roots.retain_groups(&profile_groups, false);
             let base = resolve(&base_roots, None, prefer.clone())?;
             let mut profiles = Vec::new();
             for g in &profile_groups {
-                let Some(reqs) = roots.groups.get(g) else {
+                let declared = roots.groups.contains_key(g)
+                    || roots.members.iter().any(|m| m.roots.groups.contains_key(g));
+                if !declared {
                     continue;
-                };
+                }
                 let mut pr = base_roots.clone();
-                pr.groups.insert(g.clone(), reqs.clone());
+                pr.restore_group(&roots, g);
                 let mut keep = prefer.clone();
                 keep.extend(base.assigned.clone());
                 profiles.push((g.clone(), resolve(&pr, Some(g), keep)?));

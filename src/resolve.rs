@@ -38,6 +38,25 @@ pub struct Member {
 }
 
 impl Roots {
+    /// Drops `groups` from the root and every member (a profile's groups
+    /// leave the base), or keeps only them when `keep` is set.
+    pub fn retain_groups(&mut self, groups: &[String], keep: bool) {
+        self.groups.retain(|g, _| groups.contains(g) == keep);
+        for m in &mut self.members {
+            m.roots.retain_groups(groups, keep);
+        }
+    }
+
+    /// Puts group `g` back into the root and members from `full`.
+    pub fn restore_group(&mut self, full: &Roots, g: &str) {
+        if let Some(reqs) = full.groups.get(g) {
+            self.groups.insert(g.to_owned(), reqs.clone());
+        }
+        for (m, fm) in self.members.iter_mut().zip(&full.members) {
+            m.roots.restore_group(&fm.roots, g);
+        }
+    }
+
     /// Every requirement of the project and its members, with the root
     /// package that declares it.
     fn all_reqs(&self) -> Vec<(String, &Requirement)> {
@@ -1030,11 +1049,16 @@ impl<'a> Resolver<'a> {
             // itself; its version is checked, nothing is fetched.
             if let Some(v) = locals.get(&req.name) {
                 if !req.specifier.matches_allowing_pre(v) {
-                    bail!(
-                        "{} is a workspace member at version {v}, which does not satisfy {}",
-                        req.name,
-                        req.specifier
-                    );
+                    // The member's version is fixed; the candidate that asked
+                    // for another may not be. Try older ones first.
+                    if frames.is_empty() {
+                        bail!(
+                            "{} is a workspace member at version {v}, which does not satisfy {}",
+                            req.name,
+                            req.specifier
+                        );
+                    }
+                    state = self.backtrack(&mut frames, &req.name)?;
                 }
                 continue;
             }

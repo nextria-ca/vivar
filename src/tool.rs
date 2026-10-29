@@ -183,7 +183,23 @@ fn link_commands(env: &Path, commands: &[Cmd]) -> Result<()> {
     for c in commands {
         let link = bin.join(&c.file);
         let _ = fs::remove_file(&link);
-        link_or_copy(&env.join(venv::BIN).join(&c.file), &link)?;
+        let target = env.join(venv::BIN).join(&c.file);
+        if cfg!(windows) && c.file.ends_with(".cmd") {
+            // A shim resolves python relative to itself; the copy in ~/.local/bin
+            // names the tool env outright instead.
+            let scripts = env.join(venv::BIN);
+            fs::write(
+                &link,
+                format!(
+                    "@echo off\r\n\"{}\" \"{}\" %*\r\n",
+                    scripts.join("python.exe").display(),
+                    scripts.join(format!("{}-script.py", c.name)).display()
+                ),
+            )
+            .with_context(|| format!("writing {}", link.display()))?;
+        } else {
+            link_or_copy(&target, &link)?;
+        }
     }
     let files: Vec<&str> = commands.iter().map(|c| c.file.as_str()).collect();
     fs::write(env.join(LINKS), files.join("\n") + "\n")?;
@@ -211,11 +227,15 @@ fn is_tool_link(link: &Path) -> Result<bool> {
         let Ok(entries) = fs::read_dir(&tools) else {
             return Ok(false);
         };
-        Ok(entries.flatten().any(|e| {
-            fs::read(e.path().join(venv::BIN).join(name))
-                .map(|theirs| theirs == mine)
-                .unwrap_or(false)
-        }))
+        // A copied launcher matches a tool env's byte for byte; a shim vivar
+        // wrote names the tool env's directory.
+        let names_a_tool = String::from_utf8_lossy(&mine).contains(&tools.display().to_string());
+        Ok(names_a_tool
+            || entries.flatten().any(|e| {
+                fs::read(e.path().join(venv::BIN).join(name))
+                    .map(|theirs| theirs == mine)
+                    .unwrap_or(false)
+            }))
     }
 }
 
@@ -297,10 +317,18 @@ fn commands_of(env: &Path) -> Result<Vec<Cmd>> {
                 } else if in_console {
                     if let Some((name, _)) = line.split_once('=') {
                         let name = name.trim().to_owned();
-                        scripts.push(Cmd {
-                            file: exe(&name),
-                            name,
-                        });
+                        // uv makes `name.exe` launchers on Windows; vivar's own
+                        // installer makes `name.cmd` shims.
+                        let shim = format!("{name}.cmd");
+                        let file = if cfg!(windows)
+                            && !bin.join(exe(&name)).exists()
+                            && bin.join(&shim).exists()
+                        {
+                            shim
+                        } else {
+                            exe(&name)
+                        };
+                        scripts.push(Cmd { file, name });
                     }
                 }
             }
@@ -320,8 +348,12 @@ fn commands_of(env: &Path) -> Result<Vec<Cmd>> {
                     continue;
                 }
                 if let Some(file) = full.file_name().and_then(|n| n.to_str()) {
+                    if file.ends_with("-script.py") {
+                        continue; // the body behind a `.cmd` shim, not a command
+                    }
                     let name = file
                         .strip_suffix(std::env::consts::EXE_SUFFIX)
+                        .or_else(|| file.strip_suffix(".cmd"))
                         .unwrap_or(file);
                     if !name.starts_with("python") && !name.starts_with("activate") {
                         scripts.push(Cmd {

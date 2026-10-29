@@ -10,7 +10,7 @@ See [DESIGN.md](DESIGN.md) for the why and the roadmap, and
 ## Status
 
 **Usable today, pre-1.0.** Phases 0, 3 and 4 of the [design](DESIGN.md) are implemented,
-tested on Linux, macOS and Windows in CI (99 tests), and reviewed. No release has been
+tested on Linux, macOS and Windows in CI (100 tests), and reviewed. No release has been
 tagged yet; see Install for how to get it in the meantime.
 
 What works:

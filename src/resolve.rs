@@ -156,12 +156,34 @@ impl<'a> Resolver<'a> {
     /// what 3.13 would need.
     pub fn requires_python(mut self, spec: Option<&str>) -> Self {
         if let Some(spec) = spec.and_then(|s| Specifier::parse(s).ok()) {
-            let keep: Vec<bool> = self
-                .pythons
-                .iter()
-                .enumerate()
-                .map(|(i, p)| i == 0 || spec.matches_allowing_pre(p))
-                .collect();
+            // A minor stays when any patch of it is in range (`!=3.13.0` does
+            // not rule out 3.13): the environment then samples that patch.
+            let mut keep = Vec::with_capacity(self.pythons.len());
+            for i in 0..self.pythons.len() {
+                if i == 0 || spec.matches_allowing_pre(&self.pythons[i]) {
+                    keep.push(true);
+                    continue;
+                }
+                let (maj, min) = {
+                    let s = self.pythons[i].to_string();
+                    let mut it = s.split('.');
+                    (
+                        it.next().unwrap_or("3").to_owned(),
+                        it.next().unwrap_or("0").to_owned(),
+                    )
+                };
+                let fallback = (0..=30)
+                    .filter_map(|patch| Version::parse(&format!("{maj}.{min}.{patch}")).ok())
+                    .find(|v| spec.matches_allowing_pre(v));
+                match fallback {
+                    Some(v) => {
+                        self.envs[i].0.python_full_version = v.to_string();
+                        self.pythons[i] = v;
+                        keep.push(true);
+                    }
+                    None => keep.push(false),
+                }
+            }
             let mut i = 0;
             self.envs.retain(|_| {
                 i += 1;
@@ -647,6 +669,13 @@ pub fn split_extra(marker: &str) -> (Option<String>, Option<String>) {
 /// Serialises a resolution as a uv.lock document (version 1).
 pub fn write_lock(roots: &Roots, resolution: &Resolution, registry: &str) -> String {
     use toml_edit::{value, Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table};
+    // Root requirements that apply in no targeted environment were not
+    // resolved; the graph leaves them out while the metadata keeps them.
+    let resolved: BTreeSet<&str> = resolution
+        .packages
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect();
     let mut doc = DocumentMut::new();
     doc["version"] = value(1);
     doc["revision"] = value(3);
@@ -670,7 +699,7 @@ pub fn write_lock(roots: &Roots, resolution: &Resolution, registry: &str) -> Str
     };
     let dep_array = |reqs: &[Requirement]| {
         let mut a = Array::new();
-        for r in reqs {
+        for r in reqs.iter().filter(|r| resolved.contains(r.name.as_str())) {
             a.push(dep_entry(r, r.marker.as_deref()));
         }
         a
@@ -856,6 +885,26 @@ mod tests {
     }
 
     #[test]
+    fn python_range_keeps_minors_with_an_in_range_patch() {
+        let index = Index::new(None);
+        let r =
+            Resolver::new(&index, [3, 12, 0], true).requires_python(Some(">=3.12,!=3.13.0,<3.14"));
+        let pythons: BTreeSet<String> = r.pythons.iter().skip(1).map(|p| p.to_string()).collect();
+        assert_eq!(
+            pythons,
+            BTreeSet::from(["3.12.0".to_owned(), "3.13.1".to_owned()]),
+            "{pythons:?}"
+        );
+        assert!(r
+            .envs
+            .iter()
+            .skip(1)
+            .all(|(e, _)| e.python_full_version != "3.13.0"));
+        let single = Resolver::new(&index, [3, 12, 0], true).single();
+        assert_eq!(single.envs.len(), 1);
+    }
+
+    #[test]
     fn lock_puts_extra_edges_under_the_extra() {
         let roots = Roots {
             name: "app".into(),
@@ -886,6 +935,12 @@ mod tests {
             "https://pypi.org/simple",
         );
         assert!(text.contains("source = { editable = \".\" }"), "{text}");
+        // pytest was never resolved (its marker ruled it out): the graph skips
+        // it, the metadata still declares it.
+        assert!(
+            text.contains("[package.optional-dependencies]\ntest = []"),
+            "{text}"
+        );
         assert!(
             text.contains("[package.optional-dependencies]\nsocks = [{ name = \"pysocks\" }]"),
             "{text}"

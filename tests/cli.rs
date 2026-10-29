@@ -1110,10 +1110,36 @@ fn workspace_members_share_the_root_env() {
     // The root's policy reaches members.
     fails_with(&member, &["add", "left-pad"], "deny list");
 
-    // A virtual root (no [project]) still gets its environment rolled back after a
-    // policy rejection: the rejected package must not stay installed.
+    // A virtual root (no [project] at all) still gets its environment rolled
+    // back after a policy rejection: the rejected package must not stay installed.
+    let vroot = tmp.0.join("virtual");
+    fs::create_dir_all(vroot.join("pkgs").join("b").join("src").join("b")).unwrap();
+    fs::write(
+        vroot
+            .join("pkgs")
+            .join("b")
+            .join("src")
+            .join("b")
+            .join("__init__.py"),
+        "",
+    )
+    .unwrap();
+    fs::write(
+        vroot.join("pkgs").join("b").join("pyproject.toml"),
+        "[project]\nname = \"b\"\nversion = \"0.1.0\"\nrequires-python = \">=3.12\"\ndependencies = []\n\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n",
+    )
+    .unwrap();
+    fs::write(
+        vroot.join("pyproject.toml"),
+        "[tool.uv.workspace]\nmembers = [\"pkgs/*\"]\n\n[dependency-groups]\ndev = [\"six\"]\n",
+    )
+    .unwrap();
+    fs::write(vroot.join(".python-version"), "3.12\n").unwrap();
+    ok(&vroot, &["sync"]);
+    ok(&vroot, &["run", "python", "-c", "import six"]);
     let strict = tmp.0.join("strict.toml");
     fs::write(&strict, "[policy]\nallow-licenses = [\"MIT\"]\n").unwrap();
+    let root = &vroot;
     let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
         .current_dir(root)
         .env("VIVAR_POLICY", &strict)
@@ -1129,6 +1155,7 @@ fn workspace_members_share_the_root_env() {
     assert!(!read(&root.join("pyproject.toml")).contains("typing-extensions"));
     let out = vivar(root, &["run", "python", "-c", "import typing_extensions"]);
     assert!(!out.status.success(), "rejected package is still installed");
+    ok(root, &["run", "python", "-c", "import six"]);
 }
 
 #[test]
@@ -2164,18 +2191,24 @@ fn import_rolls_back_on_policy_and_handles_poetry_in_place() {
         "rolled-back import left a .venv behind"
     );
 
-    // A stray .venv directory that is not an environment survives a failed import.
+    // A stray .venv directory that is not an environment: the failed import keeps
+    // its files and removes only the environment it had started to build there.
     let d = tmp.0.join("stray");
     fs::create_dir_all(d.join(".venv")).unwrap();
     fs::write(d.join(".venv").join("keep.txt"), "mine").unwrap();
     fs::write(d.join("pyproject.toml"), original).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
         .current_dir(&d)
-        .args(["import", "pyproject.toml", "--python", "9.99"])
+        .env("VIVAR_POLICY", &strict)
+        .args(["import", "pyproject.toml"])
         .output()
         .unwrap();
     assert!(!out.status.success());
     assert_eq!(read(&d.join(".venv").join("keep.txt")), "mine");
+    assert!(
+        !d.join(".venv").join("pyvenv.cfg").exists(),
+        "environment left behind in a stray directory"
+    );
     assert_eq!(read(&d.join("pyproject.toml")), original);
 
     // A poetry-only pyproject in place gets [project] metadata and its deps.

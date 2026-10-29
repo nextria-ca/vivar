@@ -101,6 +101,25 @@ pub fn write_activate_scripts(
     Ok(())
 }
 
+/// Removes what `create` put into `venv`, leaving any other files there alone
+/// (a rollback for an environment the failed operation created in place).
+pub fn remove_created(venv: &Path) {
+    for name in ["pyvenv.cfg", ".gitignore", SYNCED, PROFILE] {
+        let _ = fs::remove_file(venv.join(name));
+    }
+    for dir in [BIN, "lib", "Lib", "include", "share", "etc"] {
+        let _ = fs::remove_dir_all(venv.join(dir));
+    }
+    let _ = fs::remove_file(venv.join("lib64"));
+    // Empty afterwards: it was ours entirely.
+    if fs::read_dir(venv)
+        .map(|mut d| d.next().is_none())
+        .unwrap_or(false)
+    {
+        let _ = fs::remove_dir(venv);
+    }
+}
+
 /// Makes sure `root/.venv` exists, creating it on the project's pinned Python
 /// (`.python-version`, else the newest installed, else a fresh download).
 pub fn ensure(root: &Path, prompt: &str) -> Result<()> {

@@ -458,7 +458,9 @@ fn build_for_target(
         }
         // uv's --target writes console scripts under site-packages/bin with a
         // host shebang; they belong in the venv's bin, pointing at its python.
-        // Wheel data that belongs beside site-packages, not inside it.
+        // Wheel data that belongs beside site-packages, not inside it. RECORD
+        // files follow, so metadata lookups and uninstalls still find it.
+        let mut moved = Vec::new();
         for dir in ["share", "include", "etc"] {
             let from = site.join(dir);
             if from.is_dir() && !from.join("__init__.py").exists() {
@@ -468,6 +470,28 @@ fn build_for_target(
                     fs::rename(entry.path(), to.join(entry.file_name()))?;
                 }
                 fs::remove_dir_all(&from)?;
+                moved.push(dir);
+            }
+        }
+        if !moved.is_empty() {
+            for entry in fs::read_dir(&site)?.flatten() {
+                let record = entry.path().join("RECORD");
+                let Ok(text) = fs::read_to_string(&record) else {
+                    continue;
+                };
+                let rewritten: String = text
+                    .lines()
+                    .map(|line| {
+                        // site-packages is three levels below the venv root.
+                        match moved.iter().find(|d| line.starts_with(&format!("{d}/"))) {
+                            Some(_) => format!("../../../{line}\n"),
+                            None => format!("{line}\n"),
+                        }
+                    })
+                    .collect();
+                if rewritten != text {
+                    fs::write(&record, rewritten)?;
+                }
             }
         }
         if let Ok(entries) = fs::read_dir(site.join("bin")) {
@@ -475,11 +499,23 @@ fn build_for_target(
                 let dest = bin.join(entry.file_name());
                 let data = fs::read(entry.path())?;
                 let first_line = data.split(|b| *b == b'\n').next().unwrap_or(&[]);
-                // Only Python launchers point at the venv; a `#!/bin/sh` script stays as is.
-                if data.starts_with(b"#!") && first_line.windows(6).any(|w| w == b"python") {
-                    let body = data.splitn(2, |b| *b == b'\n').nth(1).unwrap_or(&[]);
+                let python_shebang =
+                    data.starts_with(b"#!") && first_line.windows(6).any(|w| w == b"python");
+                // A host path with spaces makes uv emit a 3-line `#!/bin/sh` trampoline
+                // (`'''exec' "<python>" "$0" "$@"`) ahead of the Python code.
+                let sh_trampoline =
+                    data.starts_with(b"#!/bin/sh") && data.windows(8).any(|w| w == b"'''exec'");
+                // Only Python launchers point at the venv; a real shell script stays as is.
+                if python_shebang || sh_trampoline {
+                    let skip = if sh_trampoline { 3 } else { 1 };
+                    let body: Vec<u8> = data
+                        .split_inclusive(|b| *b == b'\n')
+                        .skip(skip)
+                        .flatten()
+                        .copied()
+                        .collect();
                     let mut script = format!("#!{fake_venv}/bin/python\n").into_bytes();
-                    script.extend_from_slice(body);
+                    script.extend_from_slice(&body);
                     fs::write(&dest, script)?;
                 } else {
                     fs::write(&dest, data)?;
@@ -499,6 +535,7 @@ fn build_for_target(
         ),
     )?;
     crate::venv::write_activate_scripts(&bin, &fake_venv, name, "bin", false)?;
+    crate::venv::mark_profile(stage, profile);
     // The same license policy a local sync enforces, on what was actually staged.
     crate::licenses::check(
         &venv_dir,

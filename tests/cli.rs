@@ -1542,6 +1542,16 @@ fn profiles_env_files_and_policy_env() {
         &["pack", "--profile", "nope", "-o", "x.tar.gz"],
         "no profile named",
     );
+    // A profile add that cannot resolve is rolled back without disturbing the active profile.
+    assert!(!vivar(
+        dir,
+        &["profile", "add", "cu999", "definitely-not-on-any-index-xyz"]
+    )
+    .status
+    .success());
+    let text = read(&dir.join("pyproject.toml"));
+    assert!(!text.contains("cu999"), "{text}");
+    ok(dir, &["run", "python", "-c", "import mpmath"]);
     if cfg!(unix) {
         let here = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
         let xarchive = tmp.0.join("xprof.tar.gz");

@@ -896,6 +896,7 @@ fn transact(
     ];
     let snapshot: Vec<Option<Vec<u8>>> = files.iter().map(|p| std::fs::read(p).ok()).collect();
     let env_before = venv::fingerprint(&venv_dir);
+    let profile_before = venv::current_profile(project.venv_root());
     let Err(e) = op() else {
         return Ok(());
     };
@@ -910,10 +911,22 @@ fn transact(
         }
     }
     if lock_changed || venv::fingerprint(&venv_dir) != env_before {
-        // Keep the group that was being added to installed, as before; a group
-        // the operation itself created no longer exists to sync.
-        let group = group.filter(|g| Project::load(&project.root).is_ok_and(|p| p.has_group(g)));
-        let _ = backend.sync_group(cwd, group);
+        // Back to what was installed before: the active profile plus the group
+        // being added to, if they still exist (a group the operation created doesn't).
+        let restored = Project::load(&project.root).ok();
+        let exists = |g: &str| restored.as_ref().is_some_and(|p| p.has_group(g));
+        let mut groups: Vec<&str> = Vec::new();
+        if let Some(p) = profile_before.as_deref().filter(|p| exists(p)) {
+            groups.push(p);
+        }
+        if let Some(g) = group.filter(|g| exists(g) && !groups.contains(g)) {
+            groups.push(g);
+        }
+        let _ = backend.sync_groups(cwd, &groups);
+        venv::mark_profile(
+            project.venv_root(),
+            profile_before.as_deref().filter(|p| exists(p)),
+        );
         venv::mark_synced(project.venv_root());
     }
     Err(e)

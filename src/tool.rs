@@ -475,13 +475,14 @@ pub fn run_script(
     policy: &Policy,
     script: &Path,
     args: &[String],
+    extra: &[(String, String)],
 ) -> Result<i32> {
     let meta = script_metadata(script)?
         .ok_or_else(|| anyhow!("{} has no `# /// script` metadata block", script.display()))?;
     let env = script_env(backend, policy, &meta)?;
     let mut full = vec!["python".to_owned(), script.to_string_lossy().into_owned()];
     full.extend_from_slice(args);
-    venv::exec(&env, &full)
+    venv::exec_with(&env, &full, extra)
 }
 
 #[cfg(test)]

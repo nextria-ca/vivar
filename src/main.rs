@@ -178,6 +178,9 @@ enum Command {
         /// Leave out the NVIDIA libraries from nvidia-* wheels; the target machine provides CUDA
         #[arg(long)]
         use_host_cuda: bool,
+        /// Profile to bundle (default: the one .venv was last synced with)
+        #[arg(long)]
+        profile: Option<String>,
     },
     /// Extract a bundle made by `vivar pack` and make it activatable here
     Unpack {
@@ -372,53 +375,12 @@ fn main() -> Result<()> {
             let project = require(project, &cwd)?;
             project.check_requirements(&packages)?;
             venv::ensure(project.venv_root(), &project.name())?;
-            // Snapshot what `add` rewrites, so a policy failure can be undone exactly.
-            let snapshot: Vec<(std::path::PathBuf, Option<Vec<u8>>)> = [
-                project.root.join(project::PYPROJECT),
-                project.venv_root().join(lock::LOCKFILE),
-            ]
-            .into_iter()
-            .map(|p| (p.clone(), std::fs::read(&p).ok()))
-            .collect();
-            route_pytorch(&project, &packages, cuda.as_deref())?;
-            let env_before = venv::fingerprint(&project.venv_root().join(".venv"));
-            // A failed add (bad index, unresolvable spec) is rolled back like a policy failure.
-            let added = backend
-                .add(&cwd, &packages, group.as_deref())
-                .and_then(|()| {
-                    venv::mark_synced(project.venv_root());
-                    after_install(&project, &policy)
-                });
-            if let Err(e) = added {
-                println!("rolling back the add");
-                // Resync only if the env actually changed: uv may restore the lock
-                // itself after a half-finished install, so the lock alone can't tell.
-                let lock_path = project.venv_root().join(lock::LOCKFILE);
-                let lock_changed = snapshot
-                    .iter()
-                    .find(|(p, _)| *p == lock_path)
-                    .is_some_and(|(_, before)| std::fs::read(&lock_path).ok() != *before);
-                let env_touched = lock_changed
-                    || venv::fingerprint(&project.venv_root().join(".venv")) != env_before;
-                for (path, contents) in snapshot {
-                    match contents {
-                        Some(bytes) => std::fs::write(&path, bytes)?,
-                        None => {
-                            let _ = std::fs::remove_file(&path);
-                        }
-                    }
-                }
-                // Keep the group that was being added to installed, as before the
-                // add; a group the add itself created no longer exists to sync.
-                if env_touched {
-                    let group = group
-                        .as_deref()
-                        .filter(|g| Project::load(&project.root).is_ok_and(|p| p.has_group(g)));
-                    let _ = backend.sync_group(&cwd, group);
-                    venv::mark_synced(project.venv_root());
-                }
-                return Err(e);
-            }
+            transact(&project, &backend, &cwd, group.as_deref(), || {
+                route_pytorch(&project, &packages, cuda.as_deref())?;
+                backend.add(&cwd, &packages, group.as_deref())?;
+                venv::mark_synced(project.venv_root());
+                after_install(&project, &policy)
+            })?;
         }
         Command::Remove { packages } => {
             let project = require(project, &cwd)?;
@@ -437,10 +399,12 @@ fn main() -> Result<()> {
                 let project = require(project, &cwd)?;
                 project.check_requirements(&packages)?;
                 venv::ensure(project.venv_root(), &project.name())?;
-                project::declare_profile(&project.root, &name, &packages)?;
-                backend.add(&cwd, &packages, Some(&name))?;
-                venv::mark_synced(project.venv_root());
-                after_install(&project, &policy)?;
+                transact(&project, &backend, &cwd, Some(&name), || {
+                    project::declare_profile(&project.root, &name, &packages)?;
+                    backend.add(&cwd, &packages, Some(&name))?;
+                    venv::mark_synced(project.venv_root());
+                    after_install(&project, &policy)
+                })?;
                 println!("profile `{name}` ready; `vivar sync --profile {name}` (or `--profile auto`) installs it");
             }
             ProfileCommand::List => {
@@ -508,6 +472,7 @@ fn main() -> Result<()> {
                 }
             };
             backend.sync_group(&cwd, group.as_deref())?;
+            venv::mark_profile(project.venv_root(), group.as_deref());
             venv::mark_synced(project.venv_root());
             after_install(&project, &policy)?;
         }
@@ -520,7 +485,13 @@ fn main() -> Result<()> {
                 && script.is_file()
                 && tool::script_metadata(script)?.is_some()
             {
-                std::process::exit(tool::run_script(&backend, &policy, script, &args[1..])?);
+                std::process::exit(tool::run_script(
+                    &backend,
+                    &policy,
+                    script,
+                    &args[1..],
+                    &extra,
+                )?);
             }
             let project = require(project, &cwd)?;
             project.check_declared()?;
@@ -718,9 +689,16 @@ fn main() -> Result<()> {
             python,
             zstd,
             use_host_cuda,
+            profile,
         } => {
             let project = require(project, &cwd)?;
             project.check_declared()?;
+            let profile = profile.or_else(|| venv::current_profile(project.venv_root()));
+            if let Some(p) = &profile {
+                if !project.profiles().iter().any(|x| x == p) {
+                    bail!("no profile named {p}; `vivar profile list` shows them");
+                }
+            }
             let opts = bundle::PackOptions {
                 slim,
                 zstd,
@@ -739,19 +717,22 @@ fn main() -> Result<()> {
                     check_hashes(&project, &policy)?;
                     bundle::pack_for_target(
                         &backend,
+                        &policy,
                         project.venv_root(),
                         &project.name(),
                         output.as_deref(),
                         t.os(),
                         t.arch(),
                         &python,
+                        profile.as_deref(),
                         opts,
                     )?
                 }
                 None => {
                     venv::ensure(project.venv_root(), &project.name())?;
-                    backend.sync(&cwd)?;
+                    backend.sync_group(&cwd, profile.as_deref())?;
                     venv::mark_synced(project.venv_root());
+                    venv::mark_profile(project.venv_root(), profile.as_deref());
                     after_install(&project, &policy)?;
                     bundle::pack(
                         project.venv_root(),
@@ -897,6 +878,47 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Runs `op` (an add or a profile add) so that a failure, including a policy
+/// rejection after install, leaves the project files and the environment as
+/// they were: pyproject.toml and uv.lock are restored, and the env is re-synced
+/// only if something actually changed in it.
+fn transact(
+    project: &Project,
+    backend: &UvBackend,
+    cwd: &std::path::Path,
+    group: Option<&str>,
+    op: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let venv_dir = project.venv_root().join(".venv");
+    let files = [
+        project.root.join(project::PYPROJECT),
+        project.venv_root().join(lock::LOCKFILE),
+    ];
+    let snapshot: Vec<Option<Vec<u8>>> = files.iter().map(|p| std::fs::read(p).ok()).collect();
+    let env_before = venv::fingerprint(&venv_dir);
+    let Err(e) = op() else {
+        return Ok(());
+    };
+    println!("rolling back");
+    let lock_changed = std::fs::read(&files[1]).ok() != snapshot[1];
+    for (path, contents) in files.iter().zip(snapshot) {
+        match contents {
+            Some(bytes) => std::fs::write(path, bytes)?,
+            None => {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+    if lock_changed || venv::fingerprint(&venv_dir) != env_before {
+        // Keep the group that was being added to installed, as before; a group
+        // the operation itself created no longer exists to sync.
+        let group = group.filter(|g| Project::load(&project.root).is_ok_and(|p| p.has_group(g)));
+        let _ = backend.sync_group(cwd, group);
+        venv::mark_synced(project.venv_root());
+    }
+    Err(e)
+}
+
 /// Environment for `run`/`shell`: the policy's variables, then the env file's.
 fn runtime_env(
     policy: &project::Policy,
@@ -961,12 +983,15 @@ fn print_policy(project: Option<&Project>, policy: &project::Policy, json: bool)
         };
         let path_json = |p: &std::path::Path| json::quote(&p.display().to_string());
         println!(
-            "{{\"deny\":{},\"index-url\":{},\"allow-licenses\":{},\"license-exceptions\":{},\"require-hashes\":{},\"sources\":{{\"project\":{},\"workspace\":{},\"org\":{}}}}}",
+            "{{\"deny\":{},\"index-url\":{},\"allow-licenses\":{},\"license-exceptions\":{},\"require-hashes\":{},\"require-wheels\":{},\"telemetry\":{},\"network\":{},\"sources\":{{\"project\":{},\"workspace\":{},\"org\":{}}}}}",
             list(&policy.deny),
             policy.index_url.as_deref().map_or("null".to_owned(), json::quote),
             policy.allow_licenses.as_deref().map_or("null".to_owned(), list),
             list(&policy.license_exceptions),
             policy.require_hashes,
+            policy.require_wheels,
+            if policy.telemetry_off { "\"off\"" } else { "\"on\"" },
+            if policy.offline { "\"offline\"" } else { "\"online\"" },
             project.map_or("null".to_owned(), |p| path_json(&p.root.join(project::PYPROJECT))),
             project
                 .and_then(|p| p.workspace.as_deref())
@@ -1004,6 +1029,15 @@ fn print_policy(project: Option<&Project>, policy: &project::Policy, json: bool)
         );
     }
     println!("  require-hashes:     {}", policy.require_hashes);
+    println!("  require-wheels:     {}", policy.require_wheels);
+    println!(
+        "  telemetry:          {}",
+        if policy.telemetry_off { "off" } else { "on" }
+    );
+    println!(
+        "  network:            {}",
+        if policy.offline { "offline" } else { "online" }
+    );
     println!("from");
     match project {
         Some(p) => {

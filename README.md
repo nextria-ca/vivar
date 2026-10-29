@@ -188,7 +188,8 @@ leaves PyPI alone.
 **Profiles** are machine variants of one project that share a lockfile:
 `vivar profile add cu124 torch torchvision` and `vivar profile add cpu torch` create
 mutually exclusive dependency groups routed to the right indexes, and
-`vivar sync --profile auto` installs the one that fits the current machine.
+`vivar sync --profile auto` installs the one that fits the current machine. `pack`
+bundles the profile `.venv` was last synced with (`--profile` overrides).
 
 `vivar verify` goes beyond the driver check when torch is installed: it runs a matmul
 on the GPU (or MPS), reports cuDNN and NCCL, and compares the driver's CUDA version

@@ -203,8 +203,13 @@ print(json.dumps(out))
             results.append((level, "torch", f"built for CUDA {info['cuda_built']} but torch.cuda.is_available() is False"
                                              f" ({info.get('error') or 'no usable GPU/driver'})"))
     elif info.get("hip_built"):
-        results.append(("ok" if info.get("cuda_available") else ("WARN" if ALLOW_MISSING_GPU else "ERR"),
-                        "torch", f"built for {built_for}; GPU {'available' if info.get('cuda_available') else 'not available'}"))
+        if info.get("cuda_available") and info.get("matmul_ok"):
+            results.append(("ok", "torch", f"{built_for} works on {info.get('device')}"))
+        elif info.get("cuda_available"):
+            results.append(("ERR", "torch", f"{built_for} matmul failed on {info.get('device')}: {info.get('error', 'wrong result')}"))
+        else:
+            results.append(("WARN" if ALLOW_MISSING_GPU else "ERR", "torch",
+                            f"built for {built_for} but no usable GPU ({info.get('error') or 'torch.cuda.is_available() is False'})"))
     elif info.get("mps"):
         results.append(("ok" if info.get("matmul_ok") else "ERR", "torch",
                         f"MPS {'works' if info.get('matmul_ok') else 'failed: ' + str(info.get('error'))}"))

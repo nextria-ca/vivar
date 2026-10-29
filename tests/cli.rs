@@ -1514,7 +1514,62 @@ fn profiles_env_files_and_policy_env() {
         "import os; print(os.environ['DO_NOT_TRACK'], os.environ['HF_HUB_OFFLINE'], os.environ['MYKEY'], os.environ['QUOTED'])"]);
     assert_eq!(stdout_of(&out).trim(), "1 1 hello a b");
     let policy = stdout_of(&ok(dir, &["policy", "--json"]));
-    assert!(policy.contains("\"require-hashes\""));
+    assert!(
+        policy.contains("\"require-hashes\"")
+            && policy.contains("\"telemetry\":\"off\"")
+            && policy.contains("\"network\":\"offline\""),
+        "{policy}"
+    );
+    assert!(stdout_of(&ok(dir, &["policy"])).contains("telemetry:          off"));
+
+    // The profile .venv was synced with is what pack bundles, locally and cross-target.
+    ok(dir, &["sync", "--profile", "cpu"]);
+    let archive = tmp.0.join("prof.tar.gz");
+    ok(dir, &["pack", "-o", archive.to_str().unwrap()]);
+    let dest = tmp.0.join("prof-dest");
+    ok(
+        &tmp.0,
+        &["unpack", archive.to_str().unwrap(), dest.to_str().unwrap()],
+    );
+    ok(&dest, &["run", "python", "-c", "import mpmath"]);
+    assert!(stdout_of(&ok(
+        dir,
+        &["run", "python", "-c", "import mpmath; print('still here')"]
+    ))
+    .contains("still here"));
+    fails_with(
+        dir,
+        &["pack", "--profile", "nope", "-o", "x.tar.gz"],
+        "no profile named",
+    );
+    if cfg!(unix) {
+        let here = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+        let xarchive = tmp.0.join("xprof.tar.gz");
+        ok(
+            dir,
+            &[
+                "pack",
+                "--target",
+                &here,
+                "--python",
+                "3.12",
+                "--profile",
+                "cpu",
+                "-o",
+                xarchive.to_str().unwrap(),
+            ],
+        );
+        let xdest = tmp.0.join("xprof-dest");
+        ok(
+            &tmp.0,
+            &[
+                "unpack",
+                xarchive.to_str().unwrap(),
+                xdest.to_str().unwrap(),
+            ],
+        );
+        ok(&xdest, &["run", "python", "-c", "import mpmath"]);
+    }
 }
 
 #[test]
@@ -1534,6 +1589,9 @@ fn kernel_registration_and_cuda_docker_base() {
     let out = run(&["kernel", "install"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("ipykernel is not installed"));
+    let out = run(&["kernel", "uninstall", ".."]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not a usable kernel name"));
     // Stand in for ipykernel: the check only needs the distribution to exist.
     fs::create_dir_all(site_packages(dir).join("ipykernel-6.0.0.dist-info")).unwrap();
     let out = run(&["kernel", "install", "--name", "My Demo"]);

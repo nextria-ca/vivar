@@ -381,12 +381,14 @@ const FAKE_ROOT: &str = "/vivar-bundle";
 #[allow(clippy::too_many_arguments)]
 pub fn pack_for_target(
     backend: &dyn crate::backend::Backend,
+    policy: &crate::project::Policy,
     root: &Path,
     name: &str,
     output: Option<&Path>,
     os: &str,
     arch: &str,
     python: &str,
+    profile: Option<&str>,
     opts: PackOptions,
 ) -> Result<PathBuf> {
     if os == "windows" {
@@ -398,7 +400,9 @@ pub fn pack_for_target(
     let stage = std::env::temp_dir().join(format!("vivar-xpack-{}", std::process::id()));
     let _ = fs::remove_dir_all(&stage);
     fs::create_dir_all(&stage)?;
-    let result = build_for_target(backend, root, name, output, os, arch, python, opts, &stage);
+    let result = build_for_target(
+        backend, policy, root, name, output, os, arch, python, profile, opts, &stage,
+    );
     let _ = fs::remove_dir_all(&stage);
     result
 }
@@ -406,12 +410,14 @@ pub fn pack_for_target(
 #[allow(clippy::too_many_arguments)]
 fn build_for_target(
     backend: &dyn crate::backend::Backend,
+    policy: &crate::project::Policy,
     root: &Path,
     name: &str,
     output: Option<&Path>,
     os: &str,
     arch: &str,
     python: &str,
+    profile: Option<&str>,
     opts: PackOptions,
     stage: &Path,
 ) -> Result<PathBuf> {
@@ -427,7 +433,14 @@ fn build_for_target(
         .join(format!("python{mm}"))
         .join("site-packages");
     fs::create_dir_all(&site)?;
-    backend.install_for_target(root, &crate::python::triple_for(os, arch), &mm, &site)?;
+    let full = format!("{major}.{minor}.{patch}");
+    backend.install_for_target(
+        root,
+        &crate::python::triple_for(os, arch),
+        &full,
+        profile,
+        &site,
+    )?;
 
     // 3. A venv around them, with the paths unpack will rewrite.
     let fake_venv = format!("{FAKE_ROOT}/.venv");
@@ -445,11 +458,25 @@ fn build_for_target(
         }
         // uv's --target writes console scripts under site-packages/bin with a
         // host shebang; they belong in the venv's bin, pointing at its python.
+        // Wheel data that belongs beside site-packages, not inside it.
+        for dir in ["share", "include", "etc"] {
+            let from = site.join(dir);
+            if from.is_dir() && !from.join("__init__.py").exists() {
+                let to = venv_dir.join(dir);
+                fs::create_dir_all(&to)?;
+                for entry in fs::read_dir(&from)?.flatten() {
+                    fs::rename(entry.path(), to.join(entry.file_name()))?;
+                }
+                fs::remove_dir_all(&from)?;
+            }
+        }
         if let Ok(entries) = fs::read_dir(site.join("bin")) {
             for entry in entries.flatten() {
                 let dest = bin.join(entry.file_name());
                 let data = fs::read(entry.path())?;
-                if data.starts_with(b"#!") {
+                let first_line = data.split(|b| *b == b'\n').next().unwrap_or(&[]);
+                // Only Python launchers point at the venv; a `#!/bin/sh` script stays as is.
+                if data.starts_with(b"#!") && first_line.windows(6).any(|w| w == b"python") {
                     let body = data.splitn(2, |b| *b == b'\n').nth(1).unwrap_or(&[]);
                     let mut script = format!("#!{fake_venv}/bin/python\n").into_bytes();
                     script.extend_from_slice(body);
@@ -472,6 +499,12 @@ fn build_for_target(
         ),
     )?;
     crate::venv::write_activate_scripts(&bin, &fake_venv, name, "bin", false)?;
+    // The same license policy a local sync enforces, on what was actually staged.
+    crate::licenses::check(
+        &venv_dir,
+        policy.allow_licenses.as_deref(),
+        &policy.license_exceptions,
+    )?;
 
     // 4. The project files, so the bundle is a project too.
     for file in ["pyproject.toml", "uv.lock", ".python-version"] {

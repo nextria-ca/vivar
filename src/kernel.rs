@@ -34,8 +34,11 @@ fn kernels_dir() -> Result<PathBuf> {
         .join("kernels"))
 }
 
-fn slug(name: &str) -> String {
-    name.chars()
+/// A kernel directory name: lowercase, filesystem-safe, never a path.
+fn slug(name: &str) -> Result<String> {
+    let slug: String = name
+        .trim()
+        .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
                 c.to_ascii_lowercase()
@@ -43,7 +46,13 @@ fn slug(name: &str) -> String {
                 '-'
             }
         })
-        .collect()
+        .collect();
+    // No hidden directories, no `..`: leading dots and dashes go.
+    let slug = slug.trim_start_matches(['.', '-']).to_owned();
+    if slug.is_empty() {
+        bail!("{name:?} is not a usable kernel name");
+    }
+    Ok(slug)
 }
 
 pub fn install(root: &Path, project_name: &str, name: Option<&str>) -> Result<()> {
@@ -58,7 +67,7 @@ pub fn install(root: &Path, project_name: &str, name: Option<&str>) -> Result<()
     if !has_ipykernel {
         bail!("ipykernel is not installed in this environment; run `vivar add --group dev ipykernel` first");
     }
-    let name = slug(name.unwrap_or(project_name));
+    let name = slug(name.unwrap_or(project_name))?;
     let dir = kernels_dir()?.join(&name);
     fs::create_dir_all(&dir)?;
     let python = venv::python(&venv_dir);
@@ -74,12 +83,13 @@ pub fn install(root: &Path, project_name: &str, name: Option<&str>) -> Result<()
 }
 
 pub fn uninstall(name: &str) -> Result<()> {
-    let dir = kernels_dir()?.join(slug(name));
+    let slug = slug(name)?;
+    let dir = kernels_dir()?.join(&slug);
     if !dir.join("kernel.json").exists() {
-        bail!("no Jupyter kernel named {}", slug(name));
+        bail!("no Jupyter kernel named {slug}");
     }
     fs::remove_dir_all(&dir)?;
-    println!("removed Jupyter kernel `{}`", slug(name));
+    println!("removed Jupyter kernel `{slug}`");
     Ok(())
 }
 
@@ -107,4 +117,20 @@ pub fn list() -> Result<()> {
         println!("no Jupyter kernels in {}", dir.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::slug;
+
+    #[test]
+    fn kernel_names_stay_inside_their_directory() {
+        assert_eq!(slug("My Demo").unwrap(), "my-demo");
+        assert_eq!(slug("../x").unwrap(), "x");
+        assert_eq!(slug(".hidden").unwrap(), "hidden");
+        assert!(slug("..").is_err());
+        assert!(slug(".").is_err());
+        assert!(slug("").is_err());
+        assert!(slug("///").is_err());
+    }
 }

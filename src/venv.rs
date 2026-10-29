@@ -154,6 +154,28 @@ pub fn fingerprint(venv: &Path) -> String {
     entries.join("\n")
 }
 
+/// Which profile `.venv` was last synced with, so `pack` keeps it.
+const PROFILE: &str = "vivar-profile";
+
+pub fn mark_profile(root: &Path, profile: Option<&str>) {
+    let path = root.join(".venv").join(PROFILE);
+    match profile {
+        Some(p) => {
+            let _ = fs::write(path, p);
+        }
+        None => {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+pub fn current_profile(root: &Path) -> Option<String> {
+    fs::read_to_string(root.join(".venv").join(PROFILE))
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
 /// Records that `root/.venv` matches `root/uv.lock` right now.
 pub fn mark_synced(root: &Path) {
     let venv = root.join(".venv");

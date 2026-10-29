@@ -185,9 +185,26 @@ pub fn declare_profile(root: &Path, name: &str, packages: &[String]) -> Result<(
     vivar["profiles"] = value(list);
 
     // uv must know the groups exclude each other, or it resolves them together.
+    // Only the set made of profile groups is ours; other conflict sets stay.
     let uv = tool["uv"]
         .as_table_mut()
         .context("`tool.uv` is not a table")?;
+    let mut conflicts: Array = uv
+        .get("conflicts")
+        .and_then(Item::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let is_profile_set = |v: &toml_edit::Value| {
+        v.as_array().is_some_and(|set| {
+            set.iter().all(|m| {
+                m.as_inline_table()
+                    .and_then(|t| t.get("group"))
+                    .and_then(|g| g.as_str())
+                    .is_some_and(|g| profiles.iter().any(|p| p == g))
+            })
+        })
+    };
+    conflicts.retain(|v| !is_profile_set(v));
     if profiles.len() > 1 {
         let mut set = Array::new();
         for p in &profiles {
@@ -195,8 +212,11 @@ pub fn declare_profile(root: &Path, name: &str, packages: &[String]) -> Result<(
             t.insert("group", p.as_str().into());
             set.push(t);
         }
-        let mut conflicts = Array::new();
         conflicts.push(set);
+    }
+    if conflicts.is_empty() {
+        uv.remove("conflicts");
+    } else {
         uv["conflicts"] = value(conflicts);
     }
     fs::write(&path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
@@ -940,6 +960,16 @@ lint = ["ruff"]
         assert!(text.contains("download.pytorch.org/whl/cpu"), "{text}");
         assert!(text.contains("download.pytorch.org/whl/cu124"), "{text}");
         assert!(text.contains("conflicts"), "{text}");
+        // An unrelated conflict set survives profile changes.
+        let with_extra = text.replace(
+            "conflicts = [",
+            "conflicts = [[{ extra = \"a\" }, { extra = \"b\" }], ",
+        );
+        fs::write(tmp.0.join(PYPROJECT), with_extra).unwrap();
+        declare_profile(&tmp.0, "cu128", &["torch".into()]).unwrap();
+        let text = fs::read_to_string(tmp.0.join(PYPROJECT)).unwrap();
+        assert!(text.contains("{ extra = \"a\" }"), "{text}");
+        assert_eq!(text.matches("group = \"cu128\"").count(), 2, "{text}");
         assert!(
             text.contains("{ index = \"pytorch-cpu\", group = \"cpu\" }"),
             "{text}"

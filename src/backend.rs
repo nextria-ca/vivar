@@ -28,13 +28,15 @@ pub trait Backend {
     /// Writes the lock as a pinned, hashed `requirements.txt`.
     fn export_requirements(&self, dir: &Path, output: &Path) -> Result<()>;
     /// Lays out the lock's packages for another machine (`triple`, `python`
-    /// as `3.12`) into `target`: site-packages plus a `bin/` of scripts.
-    /// Wheels only; nothing is executed.
+    /// as `3.12.4`) into `target`: site-packages plus a `bin/` of scripts,
+    /// optionally with a dependency group (profile). Wheels only; nothing is
+    /// executed; each package comes from the artifact the lock pins.
     fn install_for_target(
         &self,
         dir: &Path,
         triple: &str,
         python: &str,
+        group: Option<&str>,
         target: &Path,
     ) -> Result<()>;
 }
@@ -216,23 +218,32 @@ impl Backend for UvBackend {
         dir: &Path,
         triple: &str,
         python: &str,
+        group: Option<&str>,
         target: &Path,
     ) -> Result<()> {
-        let reqs = std::env::temp_dir().join(format!("vivar-reqs-{}.txt", std::process::id()));
+        // pylock.toml carries each package's artifact URLs, so per-package
+        // index routing (the PyTorch indexes) survives the trip.
+        let lock = std::env::temp_dir().join(format!("pylock.vivar-{}.toml", std::process::id()));
         let mut export = self.uv(dir);
         export
             .args([
                 "export",
                 "--format",
-                "requirements.txt",
+                "pylock.toml",
                 "--no-dev",
                 "--frozen",
                 "--no-emit-project",
                 "--quiet",
                 "--output-file",
             ])
-            .arg(&reqs);
+            .arg(&lock);
+        if let Some(group) = group {
+            export.args(["--group", group]);
+        }
         Self::check(export)?;
+        // The host interpreter only drives the layout (same series is enough);
+        // `--python-version` is the exact target version markers resolve against.
+        let series = python.split('.').take(2).collect::<Vec<_>>().join(".");
         let mut cmd = self.uv(dir);
         cmd.args([
             "pip",
@@ -240,6 +251,8 @@ impl Backend for UvBackend {
             "--reinstall",
             "--only-binary",
             ":all:",
+            "--python",
+            &series,
             "--python-platform",
             triple,
             "--python-version",
@@ -248,9 +261,9 @@ impl Backend for UvBackend {
         ])
         .arg(target)
         .arg("--requirements")
-        .arg(&reqs);
+        .arg(&lock);
         let result = Self::check(cmd);
-        let _ = std::fs::remove_file(&reqs);
+        let _ = std::fs::remove_file(&lock);
         result
     }
 

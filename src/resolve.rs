@@ -243,6 +243,11 @@ impl<'a> Resolver<'a> {
         let Some(m) = marker else {
             return within.clone();
         };
+        // Environments sample one patch per minor; a marker comparing patch
+        // levels is tried at both ends of the minor so `>= '3.12.1'` is not
+        // lost on a 3.12.0 sample. Including a doubtful environment is safe
+        // (the dependency is then resolved); dropping one is not.
+        let patch_sensitive = m.contains("python_full_version");
         within
             .iter()
             .copied()
@@ -254,6 +259,13 @@ impl<'a> Resolver<'a> {
                     .filter(|(_, envs)| envs.contains(&i))
                     .map(|(k, _)| k.clone())
                     .collect();
+                if eval_marker(m, &e).unwrap_or(false) {
+                    return true;
+                }
+                if !patch_sensitive {
+                    return false;
+                }
+                e.python_full_version = format!("{}.99", e.python_version);
                 eval_marker(m, &e).unwrap_or(false)
             })
             .collect()
@@ -902,6 +914,20 @@ mod tests {
             .all(|(e, _)| e.python_full_version != "3.13.0"));
         let single = Resolver::new(&index, [3, 12, 0], true).single();
         assert_eq!(single.envs.len(), 1);
+
+        // Patch-level markers are not pruned by the per-minor sampling.
+        let r = Resolver::new(&index, [3, 12, 0], true).requires_python(Some(">=3.12,<3.13"));
+        let all = r.all_envs();
+        let none = Extras::new();
+        assert!(!r
+            .where_holds(Some("python_full_version >= '3.12.1'"), &none, &all)
+            .is_empty());
+        assert!(r
+            .where_holds(Some("python_full_version < '3.12'"), &none, &all)
+            .is_empty());
+        assert!(r
+            .where_holds(Some("python_version >= '3.13'"), &none, &all)
+            .is_empty());
     }
 
     #[test]

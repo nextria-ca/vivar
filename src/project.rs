@@ -572,6 +572,12 @@ impl Project {
         self.doc.get("project").is_some()
     }
 
+    /// A poetry manifest with no PEP 621 metadata: uv can't sync it, vivar
+    /// converts it on import.
+    pub fn is_poetry_only(&self) -> bool {
+        !self.has_project_table() && self.doc.get("tool").and_then(|t| t.get("poetry")).is_some()
+    }
+
     /// `[project] requires-python`, if declared.
     pub fn requires_python(&self) -> Option<String> {
         self.doc

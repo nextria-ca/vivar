@@ -1320,7 +1320,8 @@ fn transact(
     ];
     let snapshot: Vec<Option<Vec<u8>>> = files.iter().map(|p| std::fs::read(p).ok()).collect();
     let env_before = venv::fingerprint(&venv_dir);
-    let had_venv = venv_dir.join("pyvenv.cfg").exists();
+    // Only a directory the operation itself creates may be removed on failure.
+    let had_venv_dir = venv_dir.exists();
     let profile_before = venv::current_profile(project.venv_root());
     let Err(e) = op() else {
         return Ok(());
@@ -1335,19 +1336,20 @@ fn transact(
             }
         }
     }
-    if !had_venv && venv_dir.exists() {
+    if !had_venv_dir && venv_dir.exists() {
         // The operation created the environment (a fresh import, a converted
         // poetry project): there is nothing to sync back to, so it goes.
         let _ = std::fs::remove_dir_all(&venv_dir);
         return Err(e);
     }
-    let restored_is_project = Project::load(&project.root)
-        .map(|p| p.has_project_table())
+    // A poetry-only manifest is the one thing uv cannot sync against; a virtual
+    // uv project (a workspace root with only dependency groups) is fine.
+    let restored_poetry_only = Project::load(&project.root)
+        .map(|p| p.is_poetry_only())
         .unwrap_or(false);
-    if !restored_is_project {
-        // Nothing uv could sync against; say so rather than pretend.
+    if restored_poetry_only {
         println!(
-            "note: {} has no [project] table after the rollback, so .venv was left as it is",
+            "note: {} is a poetry-only manifest after the rollback, so .venv was left as it is",
             project.root.join(project::PYPROJECT).display()
         );
         return Err(e);

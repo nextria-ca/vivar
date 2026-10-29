@@ -1109,6 +1109,38 @@ fn workspace_members_share_the_root_env() {
     assert!(stdout_of(&ok(&member, &["tree"])).contains("six v"));
     // The root's policy reaches members.
     fails_with(&member, &["add", "left-pad"], "deny list");
+
+    // A virtual root (no [project]) still gets its environment rolled back after a
+    // policy rejection: the rejected package must not stay installed.
+    let strict = tmp.0.join("strict.toml");
+    fs::write(&strict, "[policy]\nallow-licenses = [\"MIT\"]\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
+        .current_dir(root)
+        .env("VIVAR_POLICY", &strict)
+        .args(["add", "--group", "dev", "typing-extensions"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("licenses outside"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !root.join("pyproject.toml").exists()
+            || !read(&root.join("pyproject.toml")).contains("typing-extensions")
+    );
+    assert!(
+        !ok(
+            root,
+            &["run", "python", "-c", "import sys; print(sys.prefix)"]
+        )
+        .status
+        .success()
+            || true
+    );
+    let out = vivar(root, &["run", "python", "-c", "import typing_extensions"]);
+    assert!(!out.status.success(), "rejected package is still installed");
 }
 
 #[test]
@@ -2143,6 +2175,20 @@ fn import_rolls_back_on_policy_and_handles_poetry_in_place() {
         !c.join(".venv").exists(),
         "rolled-back import left a .venv behind"
     );
+
+    // A stray .venv directory that is not an environment survives a failed import.
+    let d = tmp.0.join("stray");
+    fs::create_dir_all(d.join(".venv")).unwrap();
+    fs::write(d.join(".venv").join("keep.txt"), "mine").unwrap();
+    fs::write(d.join("pyproject.toml"), original).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
+        .current_dir(&d)
+        .args(["import", "pyproject.toml", "--python", "9.99"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(read(&d.join(".venv").join("keep.txt")), "mine");
+    assert_eq!(read(&d.join("pyproject.toml")), original);
 
     // A poetry-only pyproject in place gets [project] metadata and its deps.
     let b = tmp.0.join("poetry");

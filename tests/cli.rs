@@ -1503,9 +1503,41 @@ fn cross_target_pack_builds_a_runnable_bundle() {
     );
     if cfg!(windows) {
         assert!(!out.status.success());
-        assert!(String::from_utf8_lossy(&out.stderr).contains("Windows"));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("Linux or macOS"));
         return;
     }
+    // A Windows bundle built here has vivar's own Windows layout: the venv
+    // launchers from the bundled Python, `.cmd` shims, Lib\site-packages.
+    let win = tmp.0.join("win.tar.gz");
+    ok(
+        dir,
+        &[
+            "pack",
+            "--target",
+            "windows-x86_64",
+            "--python",
+            "3.12",
+            "-o",
+            win.to_str().unwrap(),
+        ],
+    );
+    let listing = Command::new("tar")
+        .args(["-tzf", win.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&listing.stdout);
+    for member in [
+        ".venv/Scripts/python.exe",
+        ".venv/Scripts/pythonw.exe",
+        ".venv/Scripts/pycodestyle.cmd",
+        ".venv/Scripts/pycodestyle-script.py",
+        ".venv/Scripts/activate.bat",
+        ".venv/Lib/site-packages/six.py",
+        ".venv/pyvenv.cfg",
+    ] {
+        assert!(listing.contains(member), "{member} missing from\n{listing}");
+    }
+    assert!(!listing.contains(".venv/bin/"), "{listing}");
     assert!(
         out.status.success(),
         "{}",

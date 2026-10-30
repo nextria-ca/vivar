@@ -267,8 +267,13 @@ direct references (`name @ https://…/x.whl`, `.tar.gz`, `git+https://…@rev`,
 uv-style `url`/`git` sources) and source distributions built through the same PEP 517
 driver, cached under `~/.cache/vivar/built` by hash or commit.
 
-Deferred: native dependencies via conda-forge (phase 2), Windows launcher stubs for
-cross-target Windows bundles.
+`pack --target windows-*` from a Unix host builds with the native layout (CPython's own
+venv launchers copied from the bundled Python, `.cmd` shims), so no launcher stubs are
+needed. The resolver prefetches listings and newest metadata of each release's
+dependencies on eight background threads; a torch-class project (79 packages) resolves
+in well under a minute cold and in half a second warm, and `uv lock --check` accepts it.
+
+Deferred: native dependencies via conda-forge (phase 2).
 
 ## 13. Open questions
 

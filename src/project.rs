@@ -950,13 +950,18 @@ impl Project {
         if !self.is_workspace_root() {
             return Ok(Vec::new());
         }
-        // Walk as deep as the member globs reach (a glob segment per level).
-        let max_depth = self
-            .member_patterns("members")
-            .iter()
-            .map(|p| p.trim_matches('/').matches('/').count() + 1)
-            .max()
-            .unwrap_or(1);
+        // Walk as deep as the member globs reach: a segment per level, and
+        // without limit when one says `**`.
+        let patterns = self.member_patterns("members");
+        let max_depth = if patterns.iter().any(|p| p.contains("**")) {
+            usize::MAX
+        } else {
+            patterns
+                .iter()
+                .map(|p| p.trim_matches('/').matches('/').count() + 1)
+                .max()
+                .unwrap_or(1)
+        };
         let mut found = Vec::new();
         let mut stack = vec![(self.root.clone(), 1usize)];
         while let Some((dir, depth)) = stack.pop() {

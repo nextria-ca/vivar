@@ -234,7 +234,8 @@ warning: NVIDIA's minor-version compatibility usually covers it).
 Linux or macOS machine from any Linux or macOS host: the target's Python build is
 downloaded, the lock's wheels are laid out for it, and the venv is assembled by hand.
 Nothing from the target is executed, so wheels only (`require-wheels` enforces that
-at add time). Windows bundles are built on Windows. `--zstd` compresses multi-GB
+at add time). Windows bundles can be built from Linux or macOS too: they get vivar's
+own layout (the bundled Python's venv launchers and `.cmd` shims). `--zstd` compresses multi-GB
 environments several times faster (the unpacking machine needs zstd too);
 `--use-host-cuda` leaves out the NVIDIA libraries from `nvidia-*` wheels when the
 target provides CUDA itself.

@@ -123,7 +123,8 @@ impl NativeBackend {
                 sources.entry(pkg).or_insert(entries);
             }
             for i in m.uv_indexes() {
-                if !indexes.iter().any(|x| x.url == i.url) {
+                // Another name for a URL already declared stays: sources refer to names.
+                if !indexes.iter().any(|x| x.url == i.url && x.name == i.name) {
                     indexes.push(i);
                 }
             }

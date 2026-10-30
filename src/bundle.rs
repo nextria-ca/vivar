@@ -71,12 +71,13 @@ fn excluded(rel: &Path, python_dir: &str, mm: &str, opts: PackOptions) -> bool {
     false
 }
 
-/// Files `unpack` relocates by rewriting: never hashed.
+/// Files `unpack` relocates by rewriting: never hashed. The venv's bin is
+/// `bin` or `Scripts` by the bundle's platform, not this machine's.
 fn relocated(rel: &Path) -> bool {
     let parts: Vec<&str> = rel.iter().filter_map(|c| c.to_str()).collect();
     parts.first() == Some(&".venv")
         && (parts.get(1) == Some(&"pyvenv.cfg")
-            || (parts.get(1) == Some(&VENV_BIN) && parts.len() == 3))
+            || (matches!(parts.get(1), Some(&"bin") | Some(&"Scripts")) && parts.len() == 3))
 }
 
 fn walk(base: &Path, rel: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -145,13 +146,16 @@ fn inventory(
     if venv.join("pyvenv.cfg").is_file() {
         files.push((".venv/pyvenv.cfg".to_owned(), venv.join("pyvenv.cfg")));
     }
-    if let Ok(entries) = fs::read_dir(venv.join(VENV_BIN)) {
+    for bin_name in ["bin", "Scripts"] {
+        let Ok(entries) = fs::read_dir(venv.join(bin_name)) else {
+            continue;
+        };
         let mut entries: Vec<_> = entries.flatten().collect();
         entries.sort_by_key(|e| e.file_name());
         for e in entries {
             if e.path().is_file() && !e.path().is_symlink() {
                 files.push((
-                    format!(".venv/{VENV_BIN}/{}", e.file_name().to_string_lossy()),
+                    format!(".venv/{bin_name}/{}", e.file_name().to_string_lossy()),
                     e.path(),
                 ));
             }
@@ -512,9 +516,6 @@ pub fn pack_for_target(
     profile: Option<&str>,
     opts: PackOptions,
 ) -> Result<PathBuf> {
-    if os == "windows" {
-        bail!("Windows bundles need .exe launchers only a Windows host can produce; run `vivar pack` on a Windows machine");
-    }
     if !cfg!(unix) {
         bail!("cross-target bundles can be built on Linux or macOS hosts only");
     }
@@ -547,14 +548,28 @@ fn build_for_target(
     let [major, minor, patch] = version;
     let mm = format!("{major}.{minor}");
 
-    // 2. The locked packages, laid out for the target by the backend.
+    // 2. The locked packages, laid out for the target by the backend. A
+    // Windows bundle always uses vivar's own layout: its console scripts are
+    // `.cmd` shims beside `python.exe`, which need no launcher binaries.
     let venv_dir = stage.join(".venv");
-    let site = venv_dir
-        .join("lib")
-        .join(format!("python{mm}"))
-        .join("site-packages");
+    let windows = os == "windows";
+    let site = if windows {
+        venv_dir.join("Lib").join("site-packages")
+    } else {
+        venv_dir
+            .join("lib")
+            .join(format!("python{mm}"))
+            .join("site-packages")
+    };
     fs::create_dir_all(&site)?;
     let full = format!("{major}.{minor}.{patch}");
+    let native;
+    let backend: &dyn crate::backend::Backend = if windows {
+        native = crate::native::NativeBackend::new(policy);
+        &native
+    } else {
+        backend
+    };
     backend.install_for_target(
         root,
         &crate::python::triple_for(os, arch),
@@ -565,11 +580,39 @@ fn build_for_target(
 
     // 3. A venv around them, with the paths unpack will rewrite.
     let fake_venv = format!("{FAKE_ROOT}/.venv");
-    let fake_home = format!("{FAKE_ROOT}/{key}/bin");
-    let bin = venv_dir.join("bin");
+    let fake_home = if windows {
+        format!("{FAKE_ROOT}/{key}")
+    } else {
+        format!("{FAKE_ROOT}/{key}/bin")
+    };
+    let bin_name = if windows { "Scripts" } else { "bin" };
+    let bin = venv_dir.join(bin_name);
     fs::create_dir_all(&bin)?;
+    if windows {
+        // CPython's own venv launchers from the bundled Python: they read
+        // pyvenv.cfg and start `home\python.exe`, wherever the bundle lands.
+        let launchers = stage
+            .join(&key)
+            .join("Lib")
+            .join("venv")
+            .join("scripts")
+            .join("nt");
+        for exe in ["python.exe", "pythonw.exe"] {
+            fs::copy(launchers.join(exe), bin.join(exe)).with_context(|| {
+                format!("copying the venv launcher from {}", launchers.display())
+            })?;
+        }
+        // Console-script shims and their bodies move beside python.exe as they
+        // are: a shim finds python.exe relative to itself.
+        if let Ok(entries) = fs::read_dir(site.join("bin")) {
+            for entry in entries.flatten() {
+                fs::rename(entry.path(), bin.join(entry.file_name()))?;
+            }
+            fs::remove_dir_all(site.join("bin"))?;
+        }
+    }
     #[cfg(unix)]
-    {
+    if !windows {
         use std::os::unix::fs::{symlink, PermissionsExt};
         symlink(format!("{fake_home}/python{mm}"), bin.join("python"))?;
         symlink("python", bin.join("python3"))?;
@@ -655,7 +698,7 @@ fn build_for_target(
             v = format!("{major}.{minor}.{patch}"),
         ),
     )?;
-    crate::venv::write_activate_scripts(&bin, &fake_venv, name, "bin", false)?;
+    crate::venv::write_activate_scripts(&bin, &fake_venv, name, bin_name, windows)?;
     crate::venv::mark_profile(stage, profile);
     // The same license policy a local sync enforces, on what was actually staged.
     crate::licenses::check(

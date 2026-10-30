@@ -186,6 +186,17 @@ impl Lockable {
         let mut packages: Vec<ResolvedPackage> = Vec::new();
         let mut root_pins = None;
         let mut fork_markers = Vec::new();
+        // A release seen from several sides may list different dependencies
+        // (another platform's wheel): an edge one side lacks is scoped to the
+        // sides that have it.
+        let scope = |r: &Requirement, side: &str| -> Requirement {
+            let mut r = r.clone();
+            r.marker = Some(match &r.marker {
+                Some(m) => format!("({m}) and ({side})"),
+                None => side.to_owned(),
+            });
+            r
+        };
         for (marker, r) in sides {
             if root_pins.is_none() {
                 root_pins = Some(r.pins);
@@ -195,14 +206,32 @@ impl Lockable {
                     .iter_mut()
                     .find(|q| q.name == p.name && q.version == p.version && q.source == p.source)
                 {
-                    existing.resolution_markers.push(marker.clone());
-                    for d in p.dependencies {
-                        if !existing.dependencies.iter().any(|e| {
-                            e.name == d.name && e.extras == d.extras && e.marker == d.marker
-                        }) {
-                            existing.dependencies.push(d);
+                    let same = |a: &Requirement, b: &Requirement| {
+                        a.name == b.name && a.extras == b.extras && a.marker == b.marker
+                    };
+                    let only_mine: Vec<Requirement> = p
+                        .dependencies
+                        .iter()
+                        .filter(|d| !existing.dependencies.iter().any(|e| same(e, d)))
+                        .cloned()
+                        .collect();
+                    let only_theirs: Vec<usize> = existing
+                        .dependencies
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, e)| !p.dependencies.iter().any(|d| same(e, d)))
+                        .map(|(i, _)| i)
+                        .collect();
+                    if !only_theirs.is_empty() {
+                        let theirs = existing.resolution_markers.join(" or ");
+                        for i in only_theirs {
+                            existing.dependencies[i] = scope(&existing.dependencies[i], &theirs);
                         }
                     }
+                    for d in only_mine {
+                        existing.dependencies.push(scope(&d, &marker));
+                    }
+                    existing.resolution_markers.push(marker.clone());
                 } else {
                     p.resolution_markers = vec![marker.clone()];
                     packages.push(p);
@@ -342,7 +371,10 @@ impl std::error::Error for ForkNeeded {}
 /// invert, `and`/`or` swap (De Morgan). Anything the splitter does not
 /// recognise is an error rather than a guess.
 pub fn negate_marker(marker: &str) -> Result<String> {
-    let m = marker.trim();
+    // Markers may space their operators any way; one space makes the
+    // and/or splitter and the operator table see them all.
+    let normalized = marker.split_whitespace().collect::<Vec<_>>().join(" ");
+    let m = normalized.as_str();
     let inner = m
         .strip_prefix('(')
         .and_then(|r| r.strip_suffix(')'))
@@ -398,6 +430,22 @@ fn balanced(s: &str) -> bool {
     depth == 0
 }
 
+/// Whether a marker holds on at least one of the platforms vivar targets,
+/// sampled at the first patch of each minor from 3.8 to 3.14.
+fn marker_holds_somewhere(marker: &str) -> bool {
+    for os in ["linux", "macos", "windows"] {
+        for arch in ["x86_64", "aarch64"] {
+            for minor in 8..=14 {
+                let env = MarkerEnv::for_target(os, arch, [3, minor, 0]);
+                if eval_marker(marker, &env).unwrap_or(true) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Splits on `sep` outside parentheses and quotes.
 fn split_top<'s>(s: &'s str, sep: &str) -> Vec<&'s str> {
     let mut parts = Vec::new();
@@ -444,17 +492,21 @@ pub fn resolve_with_forks<'a>(
 ) -> Result<Vec<(String, Resolution)>> {
     match build(&restrictions)?.resolve(roots) {
         Ok(r) => {
+            // Each side's marker, compound ones in parentheses, joined by `and`.
+            let paren = |m: String| {
+                if split_top(&m, " or ").len() > 1 || split_top(&m, " and ").len() > 1 {
+                    format!("({m})")
+                } else {
+                    m
+                }
+            };
             let marker = restrictions
                 .iter()
                 .map(|(m, holds)| {
                     if *holds {
-                        if m.contains(" or ") {
-                            format!("({m})")
-                        } else {
-                            m.clone()
-                        }
+                        paren(m.clone())
                     } else {
-                        negate_marker(m).unwrap_or_else(|_| m.clone())
+                        paren(negate_marker(m).unwrap_or_else(|_| m.clone()))
                     }
                 })
                 .collect::<Vec<_>>()
@@ -508,6 +560,9 @@ pub struct Resolver<'a> {
     /// Direct references already fetched or built, by (name, URL): the name
     /// is part of the key because the artifact is checked against it.
     direct_cache: BTreeMap<(String, String), Direct>,
+    /// A fork the graph seemed to need: raised once every other choice is
+    /// exhausted, since an earlier candidate may avoid it.
+    fork_hint: Option<ForkNeeded>,
 }
 
 /// A requirement on a package together with the environments it applies to.
@@ -573,6 +628,7 @@ impl<'a> Resolver<'a> {
             cache: BTreeMap::new(),
             fetch: None,
             direct_cache: BTreeMap::new(),
+            fork_hint: None,
         };
         r.set_envs(python_floor, python_floor);
         r
@@ -1000,6 +1056,19 @@ impl<'a> Resolver<'a> {
         let locals = roots.local_names();
         let all = self.all_envs();
         let all_reqs = roots.all_reqs();
+        // A root's own requirement on a member is fixed on both ends: nothing
+        // to backtrack over, so it is checked before anything is searched.
+        for (from, r) in &all_reqs {
+            if let Some(v) = locals.get(&r.name) {
+                if !r.specifier.matches_allowing_pre(v) {
+                    bail!(
+                        "{from} requires {} {}, but the workspace member is at version {v}",
+                        r.name,
+                        r.specifier
+                    );
+                }
+            }
+        }
         let root_reqs: Vec<&Requirement> = all_reqs.iter().map(|(_, r)| *r).collect();
         let mut root_envs = Vec::with_capacity(root_reqs.len());
         for r in &root_reqs {
@@ -1040,6 +1109,9 @@ impl<'a> Resolver<'a> {
         loop {
             steps += 1;
             if steps > 20_000 {
+                if let Some(f) = self.fork_hint.take() {
+                    return Err(anyhow::Error::new(f));
+                }
                 bail!("resolution did not converge after {steps} steps; the constraints may be contradictory");
             }
             let Some(Pending { req, envs }) = state.pending.pop_front() else {
@@ -1158,10 +1230,10 @@ impl<'a> Resolver<'a> {
                     .is_empty()
                 {
                     if let Some(marker) = self.fork(&constraints) {
-                        return Err(anyhow::Error::new(ForkNeeded {
+                        self.fork_hint.get_or_insert(ForkNeeded {
                             name: req.name.clone(),
                             marker,
-                        }));
+                        });
                     }
                 }
                 state = self.backtrack(&mut frames, &req.name)?;
@@ -1175,12 +1247,15 @@ impl<'a> Resolver<'a> {
             let candidates = self.candidates(&req.name, &constraints, &state.directs)?;
             if candidates.is_empty() {
                 if let Some(marker) = self.fork(&constraints) {
-                    return Err(anyhow::Error::new(ForkNeeded {
+                    self.fork_hint.get_or_insert(ForkNeeded {
                         name: req.name.clone(),
                         marker,
-                    }));
+                    });
                 }
                 if frames.is_empty() {
+                    if let Some(f) = self.fork_hint.take() {
+                        return Err(anyhow::Error::new(f));
+                    }
                     bail!(
                         "no version of {} satisfies {} (wheels-only: {}) on {}",
                         req.name,
@@ -1308,6 +1383,18 @@ impl<'a> Resolver<'a> {
         if !self.python_ok(meta.requires_python.as_deref(), &within) {
             return Ok(false);
         }
+        // Listings and newest metadata of everything this release pulls in are
+        // fetched ahead, in parallel, while the resolver works through the queue.
+        let ahead: Vec<String> = meta
+            .requires_dist
+            .iter()
+            .filter(|d| d.url.is_none() && !self.routes.iter().any(|(n, _)| *n == d.name))
+            .map(|d| d.name.clone())
+            .collect();
+        if !ahead.is_empty() {
+            let series = self.envs[0].0.python_version.clone();
+            self.index.prefetch(&ahead, &series);
+        }
         for dep in &meta.requires_dist {
             // A release whose edge would split a minor is one candidate down,
             // not the end of the resolution: older releases may not have it.
@@ -1336,6 +1423,9 @@ impl<'a> Resolver<'a> {
     fn backtrack(&mut self, frames: &mut Vec<Frame>, culprit: &str) -> Result<State> {
         loop {
             let Some(frame) = frames.last_mut() else {
+                if let Some(f) = self.fork_hint.take() {
+                    return Err(anyhow::Error::new(f));
+                }
                 let split = self
                     .last_split
                     .as_deref()
@@ -1490,6 +1580,22 @@ pub fn write_lock(roots: &Roots, lock: &Lockable) -> String {
         }
         doc["resolution-markers"] = value(a);
     }
+    let source_table = |source: &Source| {
+        let mut src = InlineTable::new();
+        match source {
+            Source::Registry(u) => src.insert("registry", u.as_str().into()),
+            Source::Url(u) => src.insert("url", u.as_str().into()),
+            Source::Git { url, rev, commit } => src.insert(
+                "git",
+                match rev {
+                    Some(r) => format!("{url}?rev={r}#{commit}"),
+                    None => format!("{url}#{commit}"),
+                }
+                .into(),
+            ),
+        };
+        src
+    };
     // An edge into a name with several variants says which one: by version,
     // and by source when the same version comes from two places.
     let dep_entry =
@@ -1500,20 +1606,7 @@ pub fn write_lock(roots: &Roots, lock: &Lockable) -> String {
                 if let Some(pin) = pins.and_then(|p| p.get(&r.name)) {
                     t.insert("version", pin.version.to_string().into());
                     if lock.same_version_variants(&r.name, &pin.version) > 1 {
-                        let mut src = InlineTable::new();
-                        match &pin.source {
-                            Source::Registry(u) => src.insert("registry", u.as_str().into()),
-                            Source::Url(u) => src.insert("url", u.as_str().into()),
-                            Source::Git { url, rev, commit } => src.insert(
-                                "git",
-                                match rev {
-                                    Some(r) => format!("{url}?rev={r}#{commit}"),
-                                    None => format!("{url}#{commit}"),
-                                }
-                                .into(),
-                            ),
-                        };
-                        t.insert("source", src.into());
+                        t.insert("source", source_table(&pin.source).into());
                     }
                 }
             }
@@ -1529,10 +1622,68 @@ pub fn write_lock(roots: &Roots, lock: &Lockable) -> String {
             }
             t
         };
+    // In a forked lock an edge into a forked name is written once per
+    // variant, pinned to it and scoped by its markers (as uv does); every
+    // other edge is written once.
+    let fork_entries = |r: &Requirement| -> Vec<InlineTable> {
+        let variants: Vec<&ResolvedPackage> = lock
+            .packages
+            .iter()
+            .filter(|p| p.name == r.name && !p.resolution_markers.is_empty())
+            .collect();
+        if lock.pin_edges || variants.len() < 2 {
+            return vec![dep_entry(r, r.marker.as_deref(), None)];
+        }
+        variants
+            .iter()
+            .filter_map(|v| {
+                let side = if v.resolution_markers.len() == 1 {
+                    v.resolution_markers[0].clone()
+                } else {
+                    v.resolution_markers
+                        .iter()
+                        .map(|m| format!("({m})"))
+                        .collect::<Vec<_>>()
+                        .join(" or ")
+                };
+                let marker = match &r.marker {
+                    Some(m) if *m == side => side,
+                    Some(m) => format!("({m}) and ({side})"),
+                    None => side,
+                };
+                // An edge whose own marker and the variant's side never meet
+                // is not written: `plan` would never follow it anyway.
+                if !marker_holds_somewhere(&marker) {
+                    return None;
+                }
+                let mut t = InlineTable::new();
+                t.insert("name", r.name.as_str().into());
+                t.insert("version", v.version.to_string().into());
+                if lock.same_version_variants(&v.name, &v.version) > 1 {
+                    t.insert("source", source_table(&v.source).into());
+                }
+                if !r.extras.is_empty() {
+                    let mut a = Array::new();
+                    for e in &r.extras {
+                        a.push(e.as_str());
+                    }
+                    t.insert("extra", a.into());
+                }
+                t.insert("marker", marker.into());
+                Some(t)
+            })
+            .collect()
+    };
     let dep_array = |reqs: &[Requirement], pins: Option<&BTreeMap<String, Pin>>| {
         let mut a = Array::new();
         for r in reqs.iter().filter(|r| resolved.contains(&r.name)) {
-            a.push(dep_entry(r, r.marker.as_deref(), pins));
+            if lock.pin_edges {
+                a.push(dep_entry(r, r.marker.as_deref(), pins));
+            } else {
+                for t in fork_entries(r) {
+                    a.push(t);
+                }
+            }
         }
         a
     };
@@ -2089,7 +2240,14 @@ mod tests {
         assert_eq!(lock.packages.len(), 2);
         let text = write_lock(&roots, &lock);
         assert!(text.contains("resolution-markers = ["), "{text}");
-        assert!(text.contains("dependencies = [{ name = \"fk\", marker = \"python_version < '3.13'\" }, { name = \"fk\", marker = \"python_version >= '3.13'\" }]"), "{text}");
+        assert!(
+            text.contains("dependencies = [{ name = \"fk\", version = \"1.0\", marker = \"python_version < '3.13'\" }, { name = \"fk\", version = \"2.0\", marker = \"python_version >= '3.13'\" }]"),
+            "{text}"
+        );
+        assert_eq!(
+            negate_marker("sys_platform == 'win32'\tand  python_version >= '3.12'").unwrap(),
+            "(sys_platform != 'win32') or (python_version < '3.12')"
+        );
         let parsed = crate::lock::Lock::parse(&text).unwrap();
         let names = |v: [u32; 3]| -> Vec<String> {
             crate::native::plan(&parsed, &MarkerEnv::for_target("linux", "x86_64", v), &[])

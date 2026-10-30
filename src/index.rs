@@ -56,6 +56,141 @@ pub struct Index {
     /// A wheelhouse directory instead of a server: the only source, offline.
     local: Option<std::path::PathBuf>,
     listings: std::cell::RefCell<BTreeMap<String, Vec<File>>>,
+    /// Names whose listing (and newest metadata) are being fetched ahead.
+    prefetched: std::cell::RefCell<std::collections::BTreeSet<String>>,
+}
+
+/// Where this index's listings are cached on disk.
+fn listing_cache_dir(base: &str) -> Result<std::path::PathBuf> {
+    let mut h = sha256::Sha256::new();
+    h.update(base.as_bytes());
+    Ok(dirs::cache()?
+        .join("index")
+        .join(&sha256::hex(&h.finish())[..16]))
+}
+
+fn listing_ttl() -> u64 {
+    std::env::var("VIVAR_INDEX_TTL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600)
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Fetches a listing page and caches it (whole, then renamed), the way
+/// `listing_body` does, from any thread. Errors are the caller's to decide on.
+fn fetch_listing_to_cache(base: &str, authed_page: &str, name: &str) -> Result<String> {
+    let cache = listing_cache_dir(base)?;
+    let path = cache.join(format!("{name}.listing"));
+    let body = upgrade::fetch(
+        authed_page,
+        Some("application/vnd.pypi.simple.v1+json, text/html;q=0.1"),
+    );
+    let text = match body {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Err(e) if format!("{e:#}").contains(" 404") => String::new(),
+        Err(e) => return Err(e),
+    };
+    if listing_ttl() > 0 {
+        let _ = fs::create_dir_all(&cache);
+        let tmp = cache.join(format!("{name}.listing.{}.tmp", std::process::id()));
+        if fs::write(&tmp, format!("{}\n{text}", unix_now())).is_ok() {
+            let _ = fs::rename(&tmp, &path);
+        }
+        let _ = fs::remove_file(&tmp);
+    }
+    Ok(text)
+}
+
+/// One prefetch job: the listing of `name` into the cache (unless fresh), then
+/// the PEP 658 metadata of its newest wheel for `target`. Quiet on failure;
+/// the real lookup reports what matters.
+fn prefetch_one(
+    base: &str,
+    name: &str,
+    authed_page: &str,
+    target: Option<&crate::wheelhouse::Target>,
+) {
+    let cached = listing_cache_dir(base)
+        .ok()
+        .and_then(|d| fs::read_to_string(d.join(format!("{name}.listing"))).ok())
+        .and_then(|t| {
+            let (stamp, body) = t.split_once('\n')?;
+            let stamp: u64 = stamp.parse().ok()?;
+            (unix_now().saturating_sub(stamp) < listing_ttl()).then(|| body.to_owned())
+        });
+    let text = match cached {
+        Some(t) => t,
+        None => match fetch_listing_to_cache(base, authed_page, name) {
+            Ok(t) => t,
+            Err(_) => return,
+        },
+    };
+    let Some(target) = target else { return };
+    let page_plain = format!("{base}/{name}/");
+    let files = if text.trim_start().starts_with('{') {
+        parse_json(&text, &page_plain).unwrap_or_default()
+    } else {
+        parse_html(&text, &page_plain)
+    };
+    let mut by_version: BTreeMap<Version, Vec<&File>> = BTreeMap::new();
+    for f in files.iter().filter(|f| f.is_wheel() && !f.yanked) {
+        if let Some(v) = f.version(name) {
+            by_version.entry(v).or_default().push(f);
+        }
+    }
+    let Some((_, wheels)) = by_version.iter().next_back() else {
+        return;
+    };
+    let Some(file) = wheels
+        .iter()
+        .find(|f| target.score(&f.filename).is_some() && f.has_metadata)
+        .or_else(|| wheels.iter().find(|f| f.has_metadata))
+    else {
+        return;
+    };
+    let Ok(path) = metadata_cache_path(file) else {
+        return;
+    };
+    if path.is_file() {
+        return;
+    }
+    let url = format!("{}.metadata", file.url);
+    let url = if same_origin(&url, base) {
+        crate::backend::with_credentials(&url)
+    } else {
+        url
+    };
+    if let Ok(body) = upgrade::fetch(&url, None) {
+        let text = String::from_utf8_lossy(&body);
+        if text.starts_with("Metadata-Version:") {
+            let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+            if fs::write(&tmp, text.as_bytes()).is_ok() {
+                let _ = fs::rename(&tmp, &path);
+            }
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+}
+
+/// The cached metadata file for an artifact.
+fn metadata_cache_path(file: &File) -> Result<std::path::PathBuf> {
+    let key = file.sha256.clone().unwrap_or_else(|| {
+        sha256::hex(&{
+            let mut h = sha256::Sha256::new();
+            h.update(file.url.as_bytes());
+            h.finish()
+        })
+    });
+    let cache = dirs::cache()?.join("metadata");
+    fs::create_dir_all(&cache)?;
+    Ok(cache.join(format!("{key}.metadata")))
 }
 
 impl Index {
@@ -71,28 +206,74 @@ impl Index {
                     base: dir.clone(),
                     local: Some(std::path::PathBuf::from(dir)),
                     listings: Default::default(),
+                    prefetched: Default::default(),
                 }
             }
             Some(u) if u.contains("://") => Index {
                 base: u.trim_end_matches('/').to_owned(),
                 local: None,
                 listings: Default::default(),
+                prefetched: Default::default(),
             },
             Some(dir) => Index {
                 base: dir.to_owned(),
                 local: Some(std::path::PathBuf::from(dir)),
                 listings: Default::default(),
+                prefetched: Default::default(),
             },
             None => Index {
                 base: PYPI.to_owned(),
                 local: None,
                 listings: Default::default(),
+                prefetched: Default::default(),
             },
         }
     }
 
     pub fn url(&self) -> &str {
         &self.base
+    }
+
+    /// Fetches the listings of `names`, and the newest release's PEP 658
+    /// metadata for `series`, into the on-disk cache on background threads
+    /// (eight at a time), so the resolver's next lookups are local reads. A
+    /// name already asked for, or a wheelhouse, is skipped; failures are left
+    /// for the real lookup to report.
+    pub fn prefetch(&self, names: &[String], series: &str) {
+        if self.local.is_some() || listing_ttl() == 0 {
+            return;
+        }
+        let fresh: Vec<String> = {
+            let mut seen = self.prefetched.borrow_mut();
+            names
+                .iter()
+                .map(|n| crate::project::normalize(n))
+                .filter(|n| seen.insert(n.clone()))
+                .collect()
+        };
+        if fresh.is_empty() {
+            return;
+        }
+        let base = self.base.clone();
+        let jobs: Vec<(String, String)> = fresh
+            .into_iter()
+            .map(|n| {
+                let page = format!("{base}/{n}/");
+                (n.clone(), self.authed(&page))
+            })
+            .collect();
+        let target = crate::wheelhouse::Target::new(None, series).ok();
+        let jobs = std::sync::Arc::new(std::sync::Mutex::new(jobs));
+        for _ in 0..8 {
+            let jobs = std::sync::Arc::clone(&jobs);
+            let base = base.clone();
+            let target = target.clone();
+            std::thread::spawn(move || {
+                while let Some((name, page)) = jobs.lock().ok().and_then(|mut j| j.pop()) {
+                    prefetch_one(&base, &name, &page, target.as_ref());
+                }
+            });
+        }
     }
 
     /// Credentials for the index go to the index's own host only.

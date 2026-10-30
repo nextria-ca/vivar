@@ -81,7 +81,18 @@ impl NativeBackend {
     }
 
     fn index(&self) -> Index {
-        Index::new(self.index_url.as_deref())
+        self.index_at(self.index_url.as_deref())
+    }
+
+    /// An index for resolution: under a locked policy it serves what its
+    /// allowed hosts serve and nothing else, so other artifacts never enter
+    /// a resolution, no metadata is downloaded and no sdist built from them.
+    fn index_at(&self, url: Option<&str>) -> Index {
+        let index = Index::new(url);
+        match self.policy.locked_index() {
+            true => index.locked_to(&self.policy.artifact_hosts),
+            false => index,
+        }
     }
 
     /// Resolves the project's requirements and writes `uv.lock`. Returns the
@@ -93,6 +104,9 @@ impl NativeBackend {
         upgrade_all: bool,
         dry_run: bool,
     ) -> Result<(BTreeMap<String, String>, BTreeMap<String, String>)> {
+        // Every resolution, dry runs included, starts from declarations
+        // policy accepts: nothing is listed, fetched or built otherwise.
+        project.check_declared()?;
         let root = project.venv_root().to_path_buf();
         // In a workspace the lock belongs to the root and covers every member.
         let ws_root;
@@ -211,7 +225,7 @@ impl NativeBackend {
             .index_url
             .clone()
             .or_else(|| indexes.iter().find(|i| i.default).map(|i| i.url.clone()));
-        let index = Index::new(main_url.as_deref());
+        let index = self.index_at(main_url.as_deref());
         let mut index_urls = vec![index.url().to_owned()];
         index_urls.extend(indexes.iter().map(|i| i.url.clone()));
         let builder = Builder {
@@ -316,7 +330,7 @@ impl NativeBackend {
                     ..
                 }) = entry_for(pkg, entries, selector, restrictions)?
                 {
-                    out.push((pkg.clone(), Index::new(Some(&index_url(&idx)?))));
+                    out.push((pkg.clone(), self.index_at(Some(&index_url(&idx)?))));
                 }
             }
             Ok(out)
@@ -389,7 +403,7 @@ impl NativeBackend {
             indexes
                 .iter()
                 .filter(|i| !i.explicit && !i.default)
-                .map(|i| Index::new(Some(&i.url)))
+                .map(|i| self.index_at(Some(&i.url)))
                 .collect()
         };
         let build = |roots: &Roots,
@@ -496,6 +510,10 @@ impl NativeBackend {
         }
         if !dry_run {
             let text = write_lock(&roots, &lockable);
+            // Checked before it is written: a lock that policy refuses is
+            // never on disk, let alone installed.
+            self.policy
+                .check_lock(Some(project), &Lock::parse(&text)?)?;
             fs::write(root.join(crate::lock::LOCKFILE), text)?;
             println!(
                 "resolved {} package(s) (native resolver, wheels only)",
@@ -723,6 +741,11 @@ struct Source<'a> {
     /// go to these hosts and no other.
     index_urls: Vec<String>,
     wheelhouse_dir: Option<&'a Path>,
+    /// A locked wheelhouse is the only source: a wheel it lacks is an
+    /// error, not a download.
+    locked: bool,
+    /// Says which hosts a download may come from.
+    policy: &'a Policy,
     /// Builds wheels from source distributions and git checkouts, for this
     /// machine only (a cross-target layout gets none).
     builder: Option<Builder<'a>>,
@@ -756,6 +779,29 @@ fn fetch_wheel(pkg: &Package, target: &wheelhouse::Target, source: &Source) -> R
             pkg.version
         )
     })?;
+    // A locked wheelhouse is the only source, wheel or sdist: nothing it
+    // lacks is fetched from the URL the lock names, and what it has must
+    // match the lock's hash (checked here, ahead of any cached copy).
+    if let Some(dir) = source.wheelhouse_dir.filter(|_| source.locked) {
+        let local = dir.join(artifact.filename());
+        if !local.is_file() {
+            bail!(
+                "{} is not in the wheelhouse {}, the only source under the locked policy",
+                artifact.filename(),
+                dir.display()
+            );
+        }
+        if let Some(expected) = artifact.sha256() {
+            let actual = sha256::file(&local)?;
+            if actual != expected {
+                bail!(
+                    "{} in the wheelhouse {} does not match the hash in uv.lock (got {actual}, expected {expected})",
+                    artifact.filename(),
+                    dir.display()
+                );
+            }
+        }
+    }
     if !is_wheel {
         let builder = source.builder.as_ref().ok_or_else(|| {
             anyhow!(
@@ -771,9 +817,16 @@ fn fetch_wheel(pkg: &Package, target: &wheelhouse::Target, source: &Source) -> R
                 pkg.version
             );
         }
+        // The wheelhouse's copy when it has one (the lock's URL may be
+        // unreachable, or off limits); its hash is checked like any other.
+        let local = source
+            .wheelhouse_dir
+            .map(|d| d.join(artifact.filename()))
+            .filter(|p| p.is_file())
+            .map(|p| crate::index::file_url(&p));
         let sdist = File {
             filename: artifact.filename(),
-            url: artifact.url.clone(),
+            url: local.unwrap_or_else(|| artifact.url.clone()),
             sha256: artifact.sha256().map(str::to_owned),
             requires_python: None,
             yanked: false,
@@ -802,6 +855,12 @@ fn fetch_wheel(pkg: &Package, target: &wheelhouse::Target, source: &Source) -> R
             fs::copy(&local, &dest)?;
             return Ok(dest);
         }
+        if source.locked {
+            bail!(
+                "{name} in the wheelhouse {} does not match the hash in uv.lock",
+                dir.display()
+            );
+        }
     }
     eprintln!("downloading {name}");
     // Index credentials go to the configured index's own host only: not to a
@@ -815,7 +874,11 @@ fn fetch_wheel(pkg: &Package, target: &wheelhouse::Target, source: &Source) -> R
     } else {
         artifact.url.clone()
     };
-    upgrade::fetch_to(&url, &dest)?;
+    if source.policy.locked_index() {
+        upgrade::fetch_to_guarded(&url, &dest, &|u| source.policy.allows_download(u))?;
+    } else {
+        upgrade::fetch_to(&url, &dest)?;
+    }
     let actual = sha256::file(&dest)?;
     if actual != expected {
         let _ = fs::remove_file(&dest);
@@ -1215,12 +1278,10 @@ fn env_version(venv_dir: &Path) -> Result<[u32; 3]> {
 }
 
 impl NativeBackend {
+    /// The policy wheelhouse, whether or not it is there right now: a
+    /// missing one is an error at fetch time, never a reason to download.
     fn wheelhouse_dir(&self) -> Option<PathBuf> {
-        self.index_url
-            .as_deref()
-            .map(Path::new)
-            .filter(|p| p.is_dir())
-            .map(Path::to_path_buf)
+        self.index().local_dir().map(Path::to_path_buf)
     }
 
     /// The policy index plus the project's `[[tool.uv.index]]` URLs, when a
@@ -1246,6 +1307,8 @@ impl NativeBackend {
         f(&Source {
             index_urls: self.index_urls_with(index.url()),
             wheelhouse_dir: wheelhouse.as_deref(),
+            locked: self.policy.locked,
+            policy: &self.policy,
             builder: series.map(|s| Builder {
                 backend: self,
                 series: s.to_owned(),
@@ -1262,6 +1325,11 @@ impl NativeBackend {
         extras: &[&str],
     ) -> Result<()> {
         let lock = Lock::read(lock_root)?;
+        // The installation boundary: whatever wrote this lock (this run, an
+        // older policy, a rollback), nothing is installed from it unless
+        // policy accepts it.
+        let owner = Project::load(lock_root).ok();
+        self.policy.check_lock(owner.as_ref(), &lock)?;
         let version = env_version(venv_dir)?;
         let env = MarkerEnv::current(version);
         let wanted = plan_with(&lock, &env, groups, extras)?;
@@ -1346,6 +1414,9 @@ impl NativeBackend {
         venv::create(&build_env, &python, "build")?;
         let result = (|| -> Result<Vec<String>> {
             let py = venv::python(&build_env);
+            // Build requirements answer to policy like any other: the deny
+            // list, and no direct references under a locked index.
+            self.policy.check_deny(&requires)?;
             if !requires.is_empty() {
                 self.install(&py, &requires)?;
             }
@@ -1389,6 +1460,7 @@ impl NativeBackend {
             if !extra.is_empty() {
                 let mut all = requires.clone();
                 all.extend(extra);
+                self.policy.check_deny(&all)?;
                 self.install(&py, &all)?;
             }
             let mut built = Vec::new();
@@ -1452,10 +1524,14 @@ impl Builder<'_> {
                 file.url.clone()
             };
             let part = dir.join(format!("{}.part-{}", file.filename, std::process::id()));
+            let policy = &self.backend.policy;
             let fetched = match crate::index::local_path(&file.url) {
                 Some(local) => fs::copy(&local, &part)
                     .map(|_| ())
                     .with_context(|| format!("copying {}", local.display())),
+                None if policy.locked_index() => {
+                    upgrade::fetch_to_guarded(&url, &part, &|u| policy.allows_download(u))
+                }
                 None => upgrade::fetch_to(&url, &part),
             };
             if let Err(e) = fetched {
@@ -1574,6 +1650,9 @@ impl Builder<'_> {
     /// A git checkout at a commit: `source` is the lock's
     /// `https://host/repo?subdirectory=<sub>&rev=<rev>#<commit>`.
     fn wheel_from_git(&self, name: &str, source: &str) -> Result<PathBuf> {
+        if self.backend.policy.locked_index() {
+            bail!("{name} comes from git, which the locked policy index does not allow");
+        }
         let git = GitLock::parse(source)
             .ok_or_else(|| anyhow!("{name}: git source {source:?} has no commit"))?;
         if self.backend.no_build {
@@ -1723,6 +1802,11 @@ impl Builder<'_> {
         reference: Option<GitRef>,
         subdirectory: Option<String>,
     ) -> Result<Direct> {
+        // Every git build comes through here (declared sources, direct
+        // references, `outdated`'s dry runs): a locked index allows none.
+        if self.backend.policy.locked_index() {
+            bail!("{name} comes from git ({repo}), which the locked policy index does not allow");
+        }
         if self.backend.no_build {
             bail!("{name} comes from git and would have to be built; policy requires wheels");
         }
@@ -1837,6 +1921,14 @@ impl Fetch for Builder<'_> {
     fn direct(&self, req: &Requirement) -> Result<Direct> {
         let url = req.url.clone().context("not a direct reference")?;
         let name = project::normalize(&req.name);
+        // Reached for transitive requirements too (a dependency's own
+        // metadata may name a URL): the locked index allows none, and the
+        // refusal comes before anything is fetched or built.
+        if self.backend.policy.locked_index() {
+            bail!(
+                "{name} is a direct reference to {url}, which the locked policy index does not allow"
+            );
+        }
         let metadata_of = |wheel: &Path| wheel_metadata(&name, wheel);
         if url.starts_with("git+") {
             let subdirectory = crate::resolve::git_subdirectory(&url)?;
@@ -1958,6 +2050,9 @@ impl Backend for NativeBackend {
             project::add_path_source(&project.root, name, rel, *editable)?;
         }
         let project = Project::require(dir)?;
+        // Every declared source is resolved (git ones cloned and built)
+        // from here on: policy has its say first.
+        project.check_declared()?;
         self.native_lock(&project, false)?;
         self.relock(&project, &[], false, false)?;
         let groups: Vec<&str> = group.into_iter().collect();
@@ -1983,6 +2078,7 @@ impl Backend for NativeBackend {
             project::remove_source(&project.root, p)?;
         }
         let project = Project::require(dir)?;
+        project.check_declared()?;
         self.native_lock(&project, false)?;
         self.relock(&project, &[], false, false)?;
         self.sync(dir)
@@ -2085,6 +2181,7 @@ impl Backend for NativeBackend {
             .resolve(&roots)?;
         let lock_text = write_lock(&roots, &Lockable::single(resolution));
         let lock = Lock::parse(&lock_text)?;
+        self.policy.check_lock(None, &lock)?;
         let env = MarkerEnv::current(version);
         let wanted = plan(&lock, &env, &[])?;
         let series = format!("{}.{}", version[0], version[1]);
@@ -2200,6 +2297,7 @@ impl Backend for NativeBackend {
             bail!("a project with native dependencies is packed where it is synced; `pack --target` cannot lay out a conda prefix for another machine yet");
         }
         let lock = Lock::read(project.venv_root())?;
+        self.policy.check_lock(Some(&project), &lock)?;
         let (os, arch) = triple_parts(triple)?;
         let mut it = python.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
         let version = [

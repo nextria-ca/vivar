@@ -176,15 +176,21 @@ impl UvBackend {
     fn uv(&self, dir: &Path) -> Command {
         let mut cmd = Command::new("uv");
         cmd.current_dir(dir);
-        match &self.index_url {
-            // A directory of wheels (an offline wheelhouse) is the only package source.
-            Some(dir) if Path::new(dir).is_dir() => {
+        let wheelhouse = self.index_url.as_deref().and_then(|u| {
+            crate::index::Index::new(Some(u))
+                .local_dir()
+                .map(Path::to_path_buf)
+        });
+        match (&wheelhouse, &self.index_url) {
+            // A directory of wheels (an offline wheelhouse, a path or a
+            // file:// URL) is the only package source.
+            (Some(dir), _) => {
                 cmd.env("UV_FIND_LINKS", dir).env("UV_NO_INDEX", "1");
             }
-            Some(url) => {
+            (None, Some(url)) => {
                 cmd.env("UV_DEFAULT_INDEX", with_credentials(url));
             }
-            None => {}
+            (None, None) => {}
         }
         if self.no_build {
             cmd.env("UV_NO_BUILD", "1");

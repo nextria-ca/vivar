@@ -619,6 +619,15 @@ pub struct Policy {
     /// Where channels named by name live: an internal mirror, else
     /// `https://conda.anaconda.org`.
     pub conda_url: Option<String>,
+    /// Hosts, besides the index's own, that a locked index may hand
+    /// artifacts out from (a CDN in front of a mirror). PyPI's
+    /// files.pythonhosted.org is always one of pypi.org's.
+    pub artifact_hosts: Vec<String>,
+    /// Set by an administrator's policy: its `index-url`, `conda-url`,
+    /// `allow-anaconda-defaults` and `trusted-keys` beat every layer under
+    /// it, and the verifier trusts no key the policy doesn't name (no
+    /// `VIVAR_TRUSTED_KEYS`, no `bundle.pub` of the machine's own).
+    pub locked: bool,
 }
 
 impl Policy {
@@ -662,6 +671,17 @@ impl Policy {
                 "blocked by [tool.vivar.policy] deny list: {}",
                 blocked.join(", ")
             );
+        }
+        // A direct reference (`pkg @ https://...`, a git URL, a local
+        // archive) names its own source; under a locked index only the
+        // index may supply packages, wherever the requirement is written
+        // (a project, a tool, a script's inline metadata).
+        if let Some(index) = self.index_url.as_deref().filter(|_| self.locked) {
+            if let Some(direct) = reqs.iter().map(AsRef::as_ref).find(|r| r.contains('@')) {
+                bail!(
+                    "{direct:?} is a direct reference, which the locked policy index {index} does not allow"
+                );
+            }
         }
         Ok(())
     }
@@ -728,19 +748,32 @@ impl Policy {
                 .and_then(|p| p.get("conda-url"))
                 .and_then(Item::as_str)
                 .map(|s| s.trim_end_matches('/').to_owned()),
+            artifact_hosts: list("artifact-hosts")
+                .iter()
+                .map(|h| h.trim().to_lowercase())
+                .collect(),
+            locked: table
+                .and_then(|p| p.get("locked"))
+                .and_then(Item::as_bool)
+                .unwrap_or(false),
         }
     }
 
     /// Org policy on top of a project's: denies add up, `require-hashes` is
     /// sticky, license allowlists intersect, and the project's index wins
-    /// (a wheelhouse may stand in for the mirror).
+    /// (a wheelhouse may stand in for the mirror) unless the org policy is
+    /// `locked`, when its index, conda mirror and trusted keys are the only
+    /// ones.
     fn merge(mut self, org: Policy) -> Policy {
         for d in org.deny {
             if !self.deny.contains(&d) {
                 self.deny.push(d);
             }
         }
-        self.index_url = self.index_url.or(org.index_url);
+        self.index_url = match org.locked {
+            true => org.index_url.or(self.index_url),
+            false => self.index_url.or(org.index_url),
+        };
         self.allow_licenses = match (self.allow_licenses, org.allow_licenses) {
             (None, org) => org,
             (mine, None) => mine,
@@ -756,9 +789,19 @@ impl Policy {
         self.telemetry_off |= org.telemetry_off;
         self.offline |= org.offline;
         self.require_signed_bundles |= org.require_signed_bundles;
-        for k in org.trusted_keys {
-            if !self.trusted_keys.contains(&k) {
-                self.trusted_keys.push(k);
+        if org.locked {
+            self.trusted_keys = org.trusted_keys;
+            self.artifact_hosts = org.artifact_hosts;
+        } else {
+            for k in org.trusted_keys {
+                if !self.trusted_keys.contains(&k) {
+                    self.trusted_keys.push(k);
+                }
+            }
+            for h in org.artifact_hosts {
+                if !self.artifact_hosts.contains(&h) {
+                    self.artifact_hosts.push(h);
+                }
             }
         }
         for c in org.blocked_channels {
@@ -768,7 +811,11 @@ impl Policy {
         }
         // The org's word on Anaconda's channels is final when it gives one.
         self.allow_anaconda_defaults = org.allow_anaconda_defaults.or(self.allow_anaconda_defaults);
-        self.conda_url = self.conda_url.or(org.conda_url);
+        self.conda_url = match org.locked {
+            true => org.conda_url.or(self.conda_url),
+            false => self.conda_url.or(org.conda_url),
+        };
+        self.locked |= org.locked;
         self
     }
 
@@ -776,6 +823,12 @@ impl Policy {
     /// Anaconda's commercial channels and `blocked-channels` are refused.
     pub fn check_channel(&self, channel: &str) -> Result<()> {
         let name = channel.trim_end_matches('/');
+        // A channel is a name or a plain URL: no `..`/`.` segments, query,
+        // fragment or escapes, which could resolve to somewhere else than
+        // the path says (curl normalizes `..` away).
+        if !plain_url(name) {
+            bail!("channel {channel:?} is not a plain channel name or URL");
+        }
         let short = name.rsplit('/').next().unwrap_or(name).to_lowercase();
         let anaconda = matches!(
             short.as_str(),
@@ -794,9 +847,216 @@ impl Policy {
         {
             bail!("channel {channel:?} is blocked by policy (blocked-channels)");
         }
+        // A locked mirror is where every channel lives; a URL elsewhere
+        // would fetch around it.
+        if let Some(mirror) = self.conda_url.as_deref().filter(|_| self.locked) {
+            if name.contains("://") && !under(name, mirror) {
+                bail!(
+                    "channel {channel:?} is outside the locked conda mirror {mirror}; name the channel instead"
+                );
+            }
+        }
         Ok(())
     }
 
+    /// Whether a native package may be fetched from `url`: under a locked
+    /// mirror, only from below it (a lock's records name their own URLs).
+    pub fn check_package_url(&self, url: &str) -> Result<()> {
+        // Only a locked mirror confines package URLs; elsewhere a channel's
+        // CDN may sign them with query strings and redirect as it likes.
+        let Some(mirror) = self.conda_url.as_deref().filter(|_| self.locked) else {
+            return Ok(());
+        };
+        if !plain_url(url) {
+            bail!("package URL {url:?} is not a plain URL");
+        }
+        if !under(url, mirror) {
+            bail!("package URL {url} is outside the locked conda mirror {mirror}");
+        }
+        Ok(())
+    }
+
+    /// Under a locked policy with an index, the only package sources a
+    /// project may declare: that index (by `[[tool.uv.index]]`, if at all)
+    /// and local paths. Another index, git or a URL would install from
+    /// elsewhere.
+    pub fn check_sources(&self, project: &Project, removed: &[String]) -> Result<()> {
+        let Some(index) = self.index_url.as_deref().filter(|_| self.locked) else {
+            return Ok(());
+        };
+        let file = project.root.join(PYPROJECT);
+        for i in project.uv_indexes() {
+            if !(is_remote(index) && same_url(&i.url, index)) {
+                bail!(
+                    "[[tool.uv.index]] {} in {} is not the locked policy index {index}",
+                    i.url,
+                    file.display()
+                );
+            }
+        }
+        for (name, sources) in project.uv_sources() {
+            if removed.iter().any(|r| normalize(r) == normalize(&name)) {
+                continue;
+            }
+            for s in sources {
+                let what = match &s.kind {
+                    SourceKind::Git { url, .. } => format!("git {url}"),
+                    SourceKind::Url { url, .. } => format!("URL {url}"),
+                    _ => continue,
+                };
+                bail!(
+                    "[tool.uv.sources] routes {name} to {what} in {}, which the locked policy index {index} does not allow",
+                    file.display()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Policy {
+    /// The lock a sync installs from, against `require-hashes` and a locked
+    /// index: every dependency a hashed registry artifact (`require-hashes`),
+    /// and nothing from another registry, git or a URL (either). `project`
+    /// tells the project's own members from editable checkouts elsewhere;
+    /// a tool environment has none.
+    pub fn check_lock(&self, project: Option<&Project>, lock: &crate::lock::Lock) -> Result<()> {
+        let locked = self.locked && self.index_url.is_some();
+        if !self.require_hashes && !locked {
+            return Ok(());
+        }
+        let root = project.map(Project::venv_root);
+        let tree = root.and_then(|r| fs::canonicalize(r).ok());
+        let mut bad = Vec::new();
+        for p in &lock.packages {
+            // The project and its workspace members are the code being
+            // locked, not dependencies; an editable checkout from elsewhere
+            // is a dependency.
+            let own = p.source_kind == "virtual"
+                || (p.source_kind == "editable"
+                    && match (root, &tree) {
+                        (Some(root), Some(tree)) => fs::canonicalize(root.join(&p.source))
+                            .map(|path| path.starts_with(tree))
+                            .unwrap_or(false),
+                        _ => false,
+                    });
+            if own {
+                continue;
+            }
+            let local = matches!(p.source_kind.as_str(), "path" | "directory" | "editable");
+            if p.source_kind != "registry" && (self.require_hashes || !local) {
+                bad.push(format!(
+                    "{} {} comes from a {} source",
+                    p.name, p.version, p.source_kind
+                ));
+            } else if p.source_kind != "registry" {
+                continue;
+            } else if self.require_hashes && !p.hashed {
+                bad.push(format!("{} {} has unhashed artifacts", p.name, p.version));
+            } else if let Some(index) = self.index_url.as_deref().filter(|i| is_remote(i)) {
+                if !same_url(&p.source, index) {
+                    bad.push(format!(
+                        "{} {} comes from {} instead of {index}",
+                        p.name, p.version, p.source
+                    ));
+                } else if locked {
+                    // The registry label is the lock's word; the artifacts
+                    // must actually be served by that index's host.
+                    let foreign = p
+                        .wheels
+                        .iter()
+                        .chain(p.sdist.iter())
+                        .find(|a| !self.artifact_allowed(&a.url, index));
+                    if let Some(a) = foreign {
+                        bad.push(format!(
+                            "{} {} has an artifact outside {index}: {}",
+                            p.name, p.version, a.url
+                        ));
+                    }
+                }
+            }
+        }
+        if bad.is_empty() {
+            Ok(())
+        } else {
+            let which = if self.require_hashes {
+                "require-hashes"
+            } else {
+                "locked index"
+            };
+            bail!("{which} policy violated:\n  {}", bad.join("\n  "))
+        }
+    }
+
+    /// Whether the policy pins every package source: a locked policy with
+    /// an index (a URL or a wheelhouse).
+    pub fn locked_index(&self) -> bool {
+        self.locked && self.index_url.is_some()
+    }
+
+    /// Whether a locked index may serve an artifact from `url`: the index's
+    /// own origin, PyPI's file host for pypi.org, or `artifact-hosts`.
+    fn artifact_allowed(&self, url: &str, index: &str) -> bool {
+        crate::index::artifact_allowed(url, index, &self.artifact_hosts)
+    }
+
+    /// Whether a package artifact may be downloaded from `url` (redirect
+    /// targets included): anything without a locked index; under one, the
+    /// allowed hosts; under a locked wheelhouse, nothing at all.
+    pub fn allows_download(&self, url: &str) -> bool {
+        if !self.locked_index() {
+            return true;
+        }
+        match self.index_url.as_deref().filter(|i| is_remote(i)) {
+            Some(index) => self.artifact_allowed(url, index),
+            None => false,
+        }
+    }
+
+    /// `allows_download` for native (conda) packages: under a locked
+    /// mirror, only from below it.
+    pub fn allows_native_download(&self, url: &str) -> bool {
+        self.check_package_url(url).is_ok()
+    }
+
+    /// Whether native downloads are confined at all: a locked policy with
+    /// a conda mirror. Otherwise curl keeps its own configuration
+    /// (proxies, client certificates) and follows redirects itself.
+    pub fn locked_mirror(&self) -> bool {
+        self.locked && self.conda_url.is_some()
+    }
+}
+
+/// An index URL that names a server, not a local wheelhouse (`file://`
+/// URLs and plain paths are directories of wheels).
+fn is_remote(index: &str) -> bool {
+    index.contains("://") && !index.starts_with("file://")
+}
+
+/// A name or URL whose path means what it says: no `.`/`..` segments,
+/// query, fragment, escapes or backslashes in the path. Userinfo (a
+/// mirror's credentials, often percent-encoded) is not the path.
+fn plain_url(s: &str) -> bool {
+    let after_scheme = s.split_once("://").map_or(s, |(_, rest)| rest);
+    let path = match after_scheme.split_once('/') {
+        Some((_authority, path)) if s.contains("://") => path,
+        _ if s.contains("://") => "",
+        _ => after_scheme,
+    };
+    !path.split('/').any(|seg| seg == "." || seg == "..") && !path.contains(['?', '#', '%', '\\'])
+}
+
+fn same_url(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
+/// Whether `url` is `base` or lives below it.
+fn under(url: &str, base: &str) -> bool {
+    let base = base.trim_end_matches('/');
+    same_url(url, base) || url.starts_with(&format!("{base}/"))
+}
+
+impl Policy {
     /// The base URL for a channel: a URL as is, a name under `conda-url`
     /// (or conda.anaconda.org).
     pub fn channel_url(&self, channel: &str) -> String {
@@ -813,32 +1073,62 @@ impl Policy {
     }
 }
 
-/// The org-wide policy file, if one is configured. `[policy]` table, same keys.
-pub fn org_policy() -> Result<Option<(PathBuf, Policy)>> {
-    let mut candidates = Vec::new();
-    if let Some(p) = std::env::var_os("VIVAR_POLICY") {
-        candidates.push(PathBuf::from(p));
-    } else {
-        if let Ok(dir) = crate::dirs::config() {
-            candidates.push(dir.join("policy.toml"));
-        }
-        if cfg!(unix) {
-            candidates.push(PathBuf::from("/etc/vivar/policy.toml"));
-        }
+/// The machine-wide policy file an administrator installs: read whatever
+/// the user's environment says, so `VIVAR_POLICY` can add to it but never
+/// replace it. `/etc/vivar/policy.toml`; `%ProgramData%\vivar\policy.toml`
+/// on Windows.
+pub fn system_policy_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        crate::dirs::program_data()
+            .join("vivar")
+            .join("policy.toml")
     }
-    for path in candidates {
-        if !path.is_file() {
-            continue;
-        }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/etc/vivar/policy.toml")
+    }
+}
+
+/// The org-wide policy, if one is configured: the user's file
+/// (`VIVAR_POLICY`, else the config directory's `policy.toml`) under the
+/// system file, with the path of the first that exists. `[policy]` table,
+/// same keys as a project's.
+pub fn org_policy() -> Result<Option<(PathBuf, Policy)>> {
+    let mut user = Vec::new();
+    if let Some(p) = std::env::var_os("VIVAR_POLICY") {
+        user.push(PathBuf::from(p));
+    } else if let Ok(dir) = crate::dirs::config() {
+        user.push(dir.join("policy.toml"));
+    }
+    org_policy_from(&user, &system_policy_path())
+}
+
+fn org_policy_from(user: &[PathBuf], system: &Path) -> Result<Option<(PathBuf, Policy)>> {
+    let read = |path: &Path| -> Result<Policy> {
         let text =
-            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let doc: DocumentMut = text
             .parse()
             .with_context(|| format!("parsing {}", path.display()))?;
         let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
-        return Ok(Some((path, Policy::from_table(doc.get("policy"), &base))));
+        Ok(Policy::from_table(doc.get("policy"), &base))
+    };
+    let mut found = None;
+    for path in user {
+        if path.is_file() {
+            found = Some((path.clone(), read(path)?));
+            break;
+        }
     }
-    Ok(None)
+    if system.is_file() {
+        let policy = read(system)?;
+        found = Some(match found {
+            Some((path, user)) => (path, user.merge(policy)),
+            None => (system.to_path_buf(), policy),
+        });
+    }
+    Ok(found)
 }
 
 /// `(dependencies, extras, groups)` as requirement strings.
@@ -1602,15 +1892,68 @@ impl Project {
     /// Checks every dependency declared in `pyproject.toml` against the deny list,
     /// so hand-editing the file can't bypass `vivar add`.
     pub fn check_declared(&self) -> Result<()> {
-        let mut reqs = self.declared_requirements();
+        self.check_declared_without(&[])
+    }
+
+    /// `check_declared` for what a `remove` of `removed` leaves: the command
+    /// that restores compliance must not be refused by what it removes.
+    pub fn check_declared_without(&self, removed: &[String]) -> Result<()> {
+        let gone = |r: &str| {
+            removed
+                .iter()
+                .any(|x| normalize(x) == normalize(requirement_name(r)))
+        };
+        let mut reqs: Vec<String> = self
+            .declared_requirements()
+            .into_iter()
+            .filter(|r| !gone(r))
+            .collect();
         // Native dependencies answer to the same deny list.
         reqs.extend(
             self.native_dependencies()
                 .iter()
                 .map(|s| s.split_whitespace().next().unwrap_or(s).to_owned()),
         );
-        self.check_requirements(&reqs)
-            .map_err(|e| anyhow!("{e} (declared in {})", self.root.join(PYPROJECT).display()))
+        // Build requirements are installed to build the project itself,
+        // by either backend: the same deny list, no direct references
+        // under a locked index.
+        reqs.extend(self.build_requires());
+        let policy = self.policy()?;
+        policy
+            .check_deny(&reqs)
+            .map_err(|e| anyhow!("{e} (declared in {})", self.root.join(PYPROJECT).display()))?;
+        // Sources and build requirements are declared per pyproject: the
+        // root's, and each member's (a member required by the root is built
+        // with its own).
+        let each = |p: &Project| -> Result<()> {
+            policy.check_sources(p, removed)?;
+            policy
+                .check_deny(&p.build_requires())
+                .map_err(|e| anyhow!("{e} (build-system in {})", p.root.join(PYPROJECT).display()))
+        };
+        each(self)?;
+        if let Some(ws) = &self.workspace {
+            each(ws)?;
+        }
+        for member in self.workspace.as_deref().unwrap_or(self).members()? {
+            each(&member)?;
+        }
+        Ok(())
+    }
+
+    /// `[build-system] requires`.
+    pub fn build_requires(&self) -> Vec<String> {
+        self.doc
+            .get("build-system")
+            .and_then(|b| b.get("requires"))
+            .and_then(Item::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// All requirement strings from `[project] dependencies`,
@@ -1766,6 +2109,267 @@ mod tests {
     fn project_with(dir: &Path, pyproject: &str) -> Project {
         fs::write(dir.join(PYPROJECT), pyproject).unwrap();
         Project::load(dir).unwrap()
+    }
+
+    #[test]
+    fn system_policy_is_read_under_the_users_and_locks_what_it_says() {
+        let tmp = TempDir::new("locked-policy");
+        let user = tmp.0.join("user.toml");
+        let system = tmp.0.join("system.toml");
+        fs::write(
+            &user,
+            "[policy]\ndeny = [\"left-pad\"]\nindex-url = \"https://user.example/simple\"\ntrusted-keys = [\"aa\"]\n",
+        )
+        .unwrap();
+        // No system file: the user's file alone.
+        let (path, policy) = org_policy_from(std::slice::from_ref(&user), &system)
+            .unwrap()
+            .unwrap();
+        assert_eq!(path, user);
+        assert!(!policy.locked);
+        assert_eq!(policy.trusted_keys, ["aa"]);
+        // An unlocked system file adds its restrictions; the user's index stays.
+        fs::write(
+            &system,
+            "[policy]\ndeny = [\"requests\"]\nindex-url = \"https://mirror.example/simple\"\ntrusted-keys = [\"bb\"]\n",
+        )
+        .unwrap();
+        let (path, policy) = org_policy_from(std::slice::from_ref(&user), &system)
+            .unwrap()
+            .unwrap();
+        assert_eq!(path, user);
+        assert_eq!(policy.deny, ["left-pad", "requests"]);
+        assert_eq!(
+            policy.index_url.as_deref(),
+            Some("https://user.example/simple")
+        );
+        assert_eq!(policy.trusted_keys, ["aa", "bb"]);
+        // Locked: the system's index and keys are the only ones, even for a
+        // project policy merged under it.
+        fs::write(
+            &system,
+            "[policy]\nlocked = true\ndeny = [\"requests\"]\nindex-url = \"https://mirror.example/simple\"\nconda-url = \"https://mirror.example/conda\"\ntrusted-keys = [\"bb\"]\n",
+        )
+        .unwrap();
+        let (_, org) = org_policy_from(std::slice::from_ref(&user), &system)
+            .unwrap()
+            .unwrap();
+        assert!(org.locked);
+        assert_eq!(
+            org.index_url.as_deref(),
+            Some("https://mirror.example/simple")
+        );
+        assert_eq!(org.trusted_keys, ["bb"]);
+        let project = Policy {
+            index_url: Some("./wheelhouse".into()),
+            conda_url: Some("https://proj.example".into()),
+            trusted_keys: vec!["cc".into()],
+            deny: vec!["six".into()],
+            ..Policy::default()
+        }
+        .merge(org);
+        assert!(project.locked);
+        assert_eq!(
+            project.index_url.as_deref(),
+            Some("https://mirror.example/simple")
+        );
+        assert_eq!(
+            project.conda_url.as_deref(),
+            Some("https://mirror.example/conda")
+        );
+        assert_eq!(project.trusted_keys, ["bb"]);
+        assert_eq!(project.deny, ["six", "left-pad", "requests"]);
+        // Declared sources answer to the locked index: another index, git
+        // or a URL is refused; a path is local and fine.
+        let locked_index = Policy {
+            locked: true,
+            index_url: Some("https://mirror.example/simple/".into()),
+            conda_url: Some("https://mirror.example/conda".into()),
+            ..Policy::default()
+        };
+        let proj = tmp.0.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let base = "[project]\nname = \"p\"\nversion = \"0\"\ndependencies = [\"six\"]\n";
+        let project = project_with(&proj, base);
+        locked_index.check_sources(&project, &[]).unwrap();
+        let project = project_with(
+            &proj,
+            &format!("{base}[[tool.uv.index]]\nname = \"m\"\nurl = \"https://mirror.example/simple\"\n[tool.uv.sources]\nsix = {{ index = \"m\" }}\nlocal = {{ path = \"./local\" }}\n"),
+        );
+        locked_index.check_sources(&project, &[]).unwrap();
+        for bad in [
+            "[[tool.uv.index]]\nurl = \"https://pypi.org/simple\"\n",
+            "[tool.uv.sources]\nsix = { git = \"https://github.com/benjaminp/six\" }\n",
+            "[tool.uv.sources]\nsix = { url = \"https://files.example/six.whl\" }\n",
+        ] {
+            let project = project_with(&proj, &format!("{base}{bad}"));
+            let err = locked_index
+                .check_sources(&project, &[])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("locked policy index"), "{err}");
+        }
+        assert!(Policy::default().check_sources(&project, &[]).is_ok());
+        // Channel URLs must live under the locked conda mirror.
+        locked_index.check_channel("conda-forge").unwrap();
+        locked_index
+            .check_channel("https://mirror.example/conda/conda-forge")
+            .unwrap();
+        let err = locked_index
+            .check_channel("https://conda.anaconda.org/conda-forge")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("locked conda mirror"), "{err}");
+        for sneaky in [
+            "https://mirror.example/conda/../unapproved",
+            "../unapproved",
+            "https://mirror.example/conda/./x",
+            "conda-forge?x=1",
+            "conda%2dforge",
+        ] {
+            let err = locked_index.check_channel(sneaky).unwrap_err().to_string();
+            assert!(err.contains("not a plain channel"), "{sneaky}: {err}");
+        }
+        // Escapes in a mirror's credentials are not escapes in its path.
+        let private = Policy {
+            locked: true,
+            conda_url: Some("https://user:p%40ss@mirror.example/conda".into()),
+            ..Policy::default()
+        };
+        private.check_channel("conda-forge").unwrap();
+        private
+            .check_channel("https://user:p%40ss@mirror.example/conda/conda-forge")
+            .unwrap();
+        private
+            .check_package_url(
+                "https://user:p%40ss@mirror.example/conda/conda-forge/noarch/six.conda",
+            )
+            .unwrap();
+        // The lock answers to the locked index: a registry elsewhere, git or a
+        // URL is refused; local paths and the project itself are fine.
+        let lock_text = |source: &str| {
+            format!(
+                "version = 1\n[[package]]\nname = \"p\"\nversion = \"0\"\nsource = {{ virtual = \".\" }}\n[[package]]\nname = \"six\"\nversion = \"1.17.0\"\nsource = {{ {source} }}\n"
+            )
+        };
+        let lock = |source: &str| crate::lock::Lock::parse(&lock_text(source)).unwrap();
+        locked_index
+            .check_lock(None, &lock("registry = \"https://mirror.example/simple\""))
+            .unwrap();
+        locked_index
+            .check_lock(None, &lock("directory = \"../six\""))
+            .unwrap();
+        for bad in [
+            "registry = \"https://pypi.org/simple\"",
+            "git = \"https://github.com/benjaminp/six?rev=abc#abc\"",
+            "url = \"https://files.example/six.whl\"",
+        ] {
+            let err = locked_index
+                .check_lock(None, &lock(bad))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("locked index policy violated"), "{bad}: {err}");
+        }
+        Policy::default()
+            .check_lock(None, &lock("registry = \"https://pypi.org/simple\""))
+            .unwrap();
+        // The registry label is not enough: the artifacts must come from it.
+        let text = format!(
+            "{}wheels = [{{ url = \"https://files.example/six.whl\", hash = \"sha256:{}\" }}]\n",
+            lock_text("registry = \"https://mirror.example/simple\""),
+            "0".repeat(64)
+        );
+        let err = locked_index
+            .check_lock(None, &crate::lock::Lock::parse(&text).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("artifact outside"), "{err}");
+        let text = format!(
+            "{}wheels = [{{ url = \"https://mirror.example/files/six.whl\", hash = \"sha256:{}\" }}]\n",
+            lock_text("registry = \"https://mirror.example/simple\""),
+            "0".repeat(64)
+        );
+        locked_index
+            .check_lock(None, &crate::lock::Lock::parse(&text).unwrap())
+            .unwrap();
+        // PyPI hands files out from files.pythonhosted.org; a mirror's CDN
+        // is named in `artifact-hosts`.
+        let pypi = Policy {
+            locked: true,
+            index_url: Some("https://pypi.org/simple".into()),
+            ..Policy::default()
+        };
+        let text = format!(
+            "{}wheels = [{{ url = \"https://files.pythonhosted.org/p/six.whl\", hash = \"sha256:{}\" }}]\n",
+            lock_text("registry = \"https://pypi.org/simple\""),
+            "0".repeat(64)
+        );
+        pypi.check_lock(None, &crate::lock::Lock::parse(&text).unwrap())
+            .unwrap();
+        let text = format!(
+            "{}wheels = [{{ url = \"https://cdn.example/six.whl\", hash = \"sha256:{}\" }}]\n",
+            lock_text("registry = \"https://mirror.example/simple\""),
+            "0".repeat(64)
+        );
+        assert!(locked_index
+            .check_lock(None, &crate::lock::Lock::parse(&text).unwrap())
+            .is_err());
+        let with_cdn = Policy {
+            artifact_hosts: vec!["cdn.example".into()],
+            ..locked_index.clone()
+        };
+        with_cdn
+            .check_lock(None, &crate::lock::Lock::parse(&text).unwrap())
+            .unwrap();
+        // A file:// index is a wheelhouse: the lock records its path, which
+        // is no foreign registry.
+        let wheelhouse = Policy {
+            locked: true,
+            index_url: Some("file:///srv/wheels".into()),
+            ..Policy::default()
+        };
+        wheelhouse
+            .check_lock(None, &lock("registry = \"/srv/wheels\""))
+            .unwrap();
+        assert!(wheelhouse
+            .check_lock(None, &lock("url = \"https://files.example/six.whl\""))
+            .is_err());
+        // A lock's package URLs answer to the mirror too.
+        locked_index
+            .check_package_url("https://mirror.example/conda/conda-forge/noarch/six-1.17.0.conda")
+            .unwrap();
+        for bad in [
+            "https://conda.anaconda.org/conda-forge/noarch/six-1.17.0.conda",
+            "https://mirror.example/conda/../x/six.conda",
+        ] {
+            assert!(locked_index.check_package_url(bad).is_err(), "{bad}");
+        }
+        Policy::default()
+            .check_package_url("https://conda.anaconda.org/conda-forge/noarch/six-1.17.0.conda")
+            .unwrap();
+        // Unlocked, a CDN's signed URL is fine.
+        Policy::default()
+            .check_package_url("https://cdn.example/six.conda?sig=abc&exp=1")
+            .unwrap();
+        assert!(locked_index.allows_download("https://mirror.example/files/a.whl"));
+        assert!(!locked_index.allows_download("https://files.example/a.whl"));
+        assert!(Policy::default().allows_download("https://files.example/a.whl"));
+        assert!(!wheelhouse.allows_download("https://mirror.example/files/a.whl"));
+        // Direct references name their own source, so a locked index refuses them.
+        locked_index.check_deny(&["six>=1", "numpy"]).unwrap();
+        let err = locked_index
+            .check_deny(&["six @ https://files.example/six.whl"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("direct reference"), "{err}");
+        Policy::default()
+            .check_deny(&["six @ https://files.example/six.whl"])
+            .unwrap();
+        // A missing user file (VIVAR_POLICY pointing nowhere) still yields the system's.
+        let (path, _) = org_policy_from(&[tmp.0.join("missing.toml")], &system)
+            .unwrap()
+            .unwrap();
+        assert_eq!(path, system);
     }
 
     #[test]

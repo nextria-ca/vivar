@@ -131,10 +131,19 @@ pub fn sign(checksums: &[u8], inventory: &[u8], key: &[u8; 32]) -> String {
     )
 }
 
+/// What policy says about bundle signers: its keys, and whether they are
+/// the only ones.
+#[derive(Debug, Clone, Default)]
+pub struct Trust {
+    pub keys: Vec<String>,
+    pub locked: bool,
+}
+
 /// Public keys this machine trusts, from every configured source. Keys from
 /// policy and the environment are validated; a bad one is an error, not a
-/// silently smaller trust set.
-pub fn trusted_keys(policy_keys: &[String]) -> Result<Vec<[u8; 32]>> {
+/// silently smaller trust set. Under a `locked` policy the policy's keys are
+/// the whole set: the environment and the machine's own key don't count.
+pub fn trusted_keys(policy_keys: &[String], locked: bool) -> Result<Vec<[u8; 32]>> {
     let mut keys = Vec::new();
     let mut push = |hex: &str, source: &str| -> Result<()> {
         let k = ed25519::unhex::<32>(hex)
@@ -144,6 +153,12 @@ pub fn trusted_keys(policy_keys: &[String]) -> Result<Vec<[u8; 32]>> {
         }
         Ok(())
     };
+    for k in policy_keys {
+        push(k, "policy trusted-keys")?;
+    }
+    if locked {
+        return Ok(keys);
+    }
     if let Ok(list) = std::env::var("VIVAR_TRUSTED_KEYS") {
         for k in list
             .split([',', ' ', '\n'])
@@ -151,9 +166,6 @@ pub fn trusted_keys(policy_keys: &[String]) -> Result<Vec<[u8; 32]>> {
         {
             push(k, "VIVAR_TRUSTED_KEYS")?;
         }
-    }
-    for k in policy_keys {
-        push(k, "policy trusted-keys")?;
     }
     if let Ok(own) = fs::read_to_string(public_key_path()?) {
         push(&own, "bundle.pub")?;
@@ -189,7 +201,7 @@ pub fn verify(dir: &Path, trusted: &[[u8; 32]]) -> Result<()> {
     };
     if trusted.is_empty() {
         bail!(
-            "no trusted keys: set VIVAR_TRUSTED_KEYS, add `trusted-keys` to policy, or copy the signer's bundle.pub to {}",
+            "no trusted keys: add `trusted-keys` to policy (the only source under a locked policy), set VIVAR_TRUSTED_KEYS, or copy the signer's bundle.pub to {}",
             public_key_path().map(|p| p.display().to_string()).unwrap_or_default()
         );
     }
@@ -243,13 +255,18 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
 
         std::env::set_var("VIVAR_TRUSTED_KEYS", format!("{},nothex", "cd".repeat(32)));
-        assert!(trusted_keys(&[]).is_err());
+        assert!(trusted_keys(&[], false).is_err());
         std::env::set_var(
             "VIVAR_TRUSTED_KEYS",
             format!("{} {}", "cd".repeat(32), "ef".repeat(32)),
         );
-        let t = trusted_keys(&["cd".repeat(32)]).unwrap();
+        let t = trusted_keys(&["cd".repeat(32)], false).unwrap();
         assert!(t.contains(&[0xcd; 32]) && t.contains(&[0xef; 32]) && t.contains(&public));
+        // A locked policy trusts its own keys and nothing from the
+        // environment or this machine's key.
+        let t = trusted_keys(&["cd".repeat(32)], true).unwrap();
+        assert_eq!(t, vec![[0xcd; 32]]);
+        assert!(trusted_keys(&[], true).unwrap().is_empty());
         std::env::remove_var("VIVAR_TRUSTED_KEYS");
 
         std::env::set_var("VIVAR_BUNDLE_KEY", "nothex");

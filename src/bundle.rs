@@ -1311,13 +1311,49 @@ fn archive(tree: &Tree, name: &str, output: Option<&Path>, opts: PackOptions) ->
             .arg(python_dir);
     }
 
-    let status = tar.status().context("failed to run `tar`")?;
-    let _ = fs::remove_dir_all(&staging);
-    if !status.success() {
-        if opts.zstd {
-            bail!("tar exited with status {} (is zstd installed? `vivar pack` without --zstd uses gzip)", status.code().unwrap_or(1));
+    // GNU tar reports "file changed as we read it" when a file's ctime
+    // moves while it is being read, which a hard link made by another
+    // environment installing the same wheel does (store files are shared
+    // inodes; their content is read-only). That is no change at all, so
+    // the archive is simply made again.
+    let mut attempts = 0;
+    let out = loop {
+        attempts += 1;
+        let out = tar.output().context("failed to run `tar`")?;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let only_links = !out.status.success()
+            && attempts < 4
+            && stderr.lines().filter(|l| !l.trim().is_empty()).all(|l| {
+                l.contains("file changed as we read it")
+                    || l.contains("Exiting with failure status")
+            });
+        if !only_links {
+            break out;
         }
-        bail!("tar exited with status {}", status.code().unwrap_or(1));
+        // The same warning covers a real change; the checksum list and the
+        // inventory already staged must still describe every file, or the
+        // bundle would be a lie.
+        let same = checksums(&tree.root, &tree.python_root, python_dir, &mm, opts)? == sums
+            && inventory(
+                &tree.root,
+                &tree.python_root,
+                python_dir,
+                &mm,
+                opts,
+                &manifest_bytes,
+            )? == inv;
+        if !same {
+            let _ = fs::remove_dir_all(&staging);
+            bail!("files in the environment changed while it was being packed; run `vivar pack` again");
+        }
+    };
+    let _ = fs::remove_dir_all(&staging);
+    if !out.status.success() {
+        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+        if opts.zstd {
+            bail!("tar exited with status {} (is zstd installed? `vivar pack` without --zstd uses gzip)", out.status.code().unwrap_or(1));
+        }
+        bail!("tar exited with status {}", out.status.code().unwrap_or(1));
     }
     Ok(output)
 }
@@ -1328,7 +1364,7 @@ pub fn unpack(
     archive: &Path,
     dest: &Path,
     require_signature: bool,
-    trusted_keys: &[String],
+    trust: &crate::sign::Trust,
     dedupe_with: Option<&Path>,
     not_before: Option<&str>,
 ) -> Result<PathBuf> {
@@ -1347,7 +1383,7 @@ pub fn unpack(
             archive.display()
         );
     }
-    check_signature(&dest, require_signature, trusted_keys)?;
+    check_signature(&dest, require_signature, trust)?;
     // A valid old bundle is still an old bundle: refuse one packed before
     // the date asked for (the stamp is under the signature).
     if let Some(floor) = not_before {
@@ -1411,8 +1447,9 @@ fn extract(archive: &Path, dest: &Path) -> Result<()> {
 }
 
 /// Verifies the signature when there is one or when one is required, against
-/// the keys this machine trusts (policy, `VIVAR_TRUSTED_KEYS`, its own).
-fn check_signature(dir: &Path, required: bool, trusted_keys: &[String]) -> Result<()> {
+/// the keys this machine trusts (policy, `VIVAR_TRUSTED_KEYS`, its own; only
+/// the policy's under a locked one).
+fn check_signature(dir: &Path, required: bool, trust: &crate::sign::Trust) -> Result<()> {
     let has_sig = dir.join(crate::sign::SIGNATURE).is_file();
     if !has_sig && !required {
         return Ok(());
@@ -1420,7 +1457,7 @@ fn check_signature(dir: &Path, required: bool, trusted_keys: &[String]) -> Resul
     if !has_sig {
         bail!("this bundle is not signed and policy (or --require-signature) demands it");
     }
-    let trusted = crate::sign::trusted_keys(trusted_keys)?;
+    let trusted = crate::sign::trusted_keys(&trust.keys, trust.locked)?;
     crate::sign::verify(dir, &trusted)?;
     println!("signature verified with a trusted key");
     Ok(())
@@ -1726,7 +1763,7 @@ pub fn apply_delta(
     delta: &Path,
     dir: &Path,
     require_signature: bool,
-    trusted_keys: &[String],
+    trust: &crate::sign::Trust,
 ) -> Result<()> {
     let dir = absolute(dir)?;
     if !dir.join(CHECKSUMS).is_file() {
@@ -1761,7 +1798,7 @@ pub fn apply_delta(
                 damaged.len()
             );
         }
-        check_signature(&tmp, require_signature, trusted_keys)?;
+        check_signature(&tmp, require_signature, trust)?;
         // Only members the base actually had can be removed, and only inside it.
         let base_members: std::collections::HashSet<String> =
             parse_checksums(&fs::read_to_string(dir.join(CHECKSUMS))?)

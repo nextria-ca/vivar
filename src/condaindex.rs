@@ -74,6 +74,8 @@ pub struct Channel {
     records: RefCell<BTreeMap<String, Vec<Record>>>,
     /// The whole `repodata.json`, for channels without shards.
     whole: RefCell<Option<BTreeMap<String, Vec<Record>>>>,
+    /// Policy that says where downloads (redirects included) may go.
+    policy: Option<crate::project::Policy>,
 }
 
 struct ShardIndex {
@@ -116,7 +118,14 @@ impl Channel {
             index: RefCell::new(None),
             records: RefCell::new(BTreeMap::new()),
             whole: RefCell::new(None),
+            policy: None,
         }
+    }
+
+    /// Downloads answer to `policy` (a locked mirror allows no other host).
+    pub fn guarded(mut self, policy: &crate::project::Policy) -> Channel {
+        self.policy = Some(policy.clone());
+        self
     }
 
     fn subdir_url(&self) -> String {
@@ -149,7 +158,13 @@ impl Channel {
         }
         fs::create_dir_all(&dir)?;
         let part = dir.join(format!("{name}.part-{}", std::process::id()));
-        match upgrade::fetch_to(url, &part) {
+        let fetched = match self.policy.as_ref().filter(|p| p.locked_mirror()) {
+            Some(policy) => {
+                upgrade::fetch_to_guarded(url, &part, &|u| policy.allows_native_download(u))
+            }
+            None => upgrade::fetch_to(url, &part),
+        };
+        match fetched {
             Ok(()) => {
                 fs::rename(&part, &path)?;
                 let _ = fs::write(&stamp, unix_now().to_string());

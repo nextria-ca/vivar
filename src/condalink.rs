@@ -73,7 +73,7 @@ fn pkgs_dir() -> Result<PathBuf> {
 }
 
 /// Downloads a package into the cache (hash-checked) and returns its path.
-pub fn fetch(record: &Record) -> Result<PathBuf> {
+pub fn fetch(record: &Record, allow: Option<&dyn Fn(&str) -> bool>) -> Result<PathBuf> {
     if record.filename.is_empty() || record.filename.contains(['/', '\\']) {
         bail!("{}: not a downloadable package", record.name);
     }
@@ -91,7 +91,11 @@ pub fn fetch(record: &Record) -> Result<PathBuf> {
     }
     eprintln!("downloading {}", record.filename);
     let part = dir.join(format!("{}.part-{}", record.filename, std::process::id()));
-    if let Err(e) = upgrade::fetch_to(&record.url, &part) {
+    let fetched = match allow {
+        Some(allow) => upgrade::fetch_to_guarded(&record.url, &part, allow),
+        None => upgrade::fetch_to(&record.url, &part),
+    };
+    if let Err(e) = fetched {
         let _ = fs::remove_file(&part);
         return Err(e);
     }

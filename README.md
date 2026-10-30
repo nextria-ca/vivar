@@ -11,7 +11,7 @@ draws on.
 
 **Usable today, pre-1.0.** Every planned phase is implemented (projects, policy, polish,
 the uv-free core, and native dependencies from conda-forge), tested on Linux, macOS and
-Windows in CI (127 tests), and reviewed. Releases are tagged `v*`, starting with v0.1.0 (v0.1.1 adds the verified installs, dated bundles and GPU fit checks);
+Windows in CI (131 tests), and reviewed. Releases are tagged `v*`, starting with v0.1.0 (v0.1.1 adds the verified installs, dated bundles and GPU fit checks; v0.1.2 the locked policy, per-GPU checks and store garbage collection);
 see Install.
 
 What works:
@@ -219,11 +219,11 @@ vivar diff a.tar.gz b.tar.gz    # what changed between two bundles
 vivar diff --patch a.tar.gz b.tar.gz        # a delta archive; `vivar unpack --apply delta.tar.gz <unpacked-a>` upgrades in place
 vivar unpack --dedupe-with ./other b.tar.gz # hard-link files identical to an already unpacked bundle
 vivar unpack --not-before 2026-10-30 b.tar.gz   # refuse an older bundle, however valid its signature
-vivar verify --min-vram 48      # also fail when the GPU has less memory; kernels for its architecture are checked too
+vivar verify --min-vram 48      # also fail when a GPU has less than that free; every GPU's kernels are checked too
 vivar key generate && vivar pack --sign     # sign bundles (Ed25519); `unpack --require-signature` or policy enforces it
 vivar export sbom --format spdx # CycloneDX (default) or SPDX bill of materials from the lock
 vivar doctor                    # what's installed, configured, broken
-vivar env list / vivar clean    # what vivar keeps on disk; drop script envs and caches
+vivar env list / vivar clean    # what vivar keeps on disk; drop script envs, caches and unlinked store entries (`--store`: the whole store)
 vivar completions zsh           # shell completion (bash, zsh, fish, powershell, elvish); installers set it up
 vivar man ~/.local/share/man/man1   # man pages, one per subcommand (packages and archives ship them)
 vivar upgrade                   # vivar itself (`--check` only reports)
@@ -313,9 +313,10 @@ private, or `VIVAR_BUNDLE_KEY`) and its public key (`bundle.pub`) in the config 
 inventory of everything else in the bundle (launchers, activate scripts, the manifest).
 Machines that unpack trust public keys from `trusted-keys = ["<hex>"]` in policy (the
 org policy file is the natural place), `VIVAR_TRUSTED_KEYS`, their own `bundle.pub`, or
-their own signing key. `unpack --require-signature`, or `require-signed-bundles = true`
-in policy, refuses bundles that aren't signed by a trusted key. The private key never
-leaves the machine that packs.
+their own signing key; under a `locked` policy, from that policy's `trusted-keys` only.
+`unpack --require-signature`, or `require-signed-bundles = true` in policy, refuses
+bundles that aren't signed by a trusted key. The private key never leaves the machine
+that packs.
 
 **Dedupe.** `unpack --dedupe-with <other-unpacked-bundle>` hard-links every file that is
 byte-identical (per both checksum lists) instead of storing it twice. Same filesystem
@@ -396,6 +397,11 @@ Run on this machine, it exits non-zero if anything is broken:
   linked against the CUDA runtime), the host must have a working NVIDIA driver
   and at least one GPU. Missing driver is an error; `--allow-missing-gpu`
   downgrades it to a warning for CPU-only CI.
+- **torch on every GPU**: a matmul and an elementwise kernel run on each CUDA
+  device and are checked against the CPU. A GPU the wheel carries no compiled
+  kernels for is an error; one it only has PTX for (a newer card, JIT-compiled
+  on first use) is a warning. `--min-vram <GB>` fails when a device has less
+  than that *free*, and reports installed and free memory for each.
 - **Scripts**: console scripts whose shebang points at an interpreter that no
   longer exists (a venv copied by hand instead of `vivar unpack`).
 
@@ -431,11 +437,24 @@ deny = []                         # packages vivar refuses to add, lock, sync, o
   registry, and from `index-url` when one is set. Git, URL and path sources are refused.
 
 An **org-wide policy** applies on top of every project: `VIVAR_POLICY=/path/policy.toml`,
-else `~/.config/vivar/policy.toml` (`%APPDATA%\vivar\policy.toml` on Windows), else
-`/etc/vivar/policy.toml`. Same keys under a `[policy]` table. Deny lists add up,
-`require-hashes` sticks, license allowlists intersect, and a project may still point
-`index-url` at a wheelhouse. Ship it inside the offline bundle or by configuration
-management; `vivar doctor` shows which file is in effect.
+else `~/.config/vivar/policy.toml` (`%APPDATA%\vivar\policy.toml` on Windows), and
+always the machine's `/etc/vivar/policy.toml` (`%ProgramData%\vivar\policy.toml`),
+which no environment variable replaces. Same keys under a `[policy]` table. Deny lists
+add up, `require-hashes` sticks, license allowlists intersect, and a project may still
+point `index-url` at a wheelhouse. `locked = true` in a policy an administrator
+installs makes its `index-url`, `conda-url`, `allow-anaconda-defaults` and
+`trusted-keys` the only ones: a project may not declare another `[[tool.uv.index]]`
+or route packages to git or a URL in `[tool.uv.sources]` (local paths are fine), direct
+references (`pkg @ https://...`) are refused wherever they are written (build
+requirements included), every lock is checked before anything is installed from it (its
+artifacts must come from the index's host, pypi.org's files host, or `artifact-hosts =
+["cdn.example"]`), resolution and installs go through vivar's own resolver rather than
+uv (so build requirements and every listing pass policy before anything is fetched),
+PyTorch is not routed to download.pytorch.org, a wheelhouse never falls back to
+downloads, channel URLs must live under the conda mirror, and the verifier ignores `VIVAR_TRUSTED_KEYS` and the machine's own
+key. The machine-wide file's location comes from the OS, not from `%ProgramData%`.
+Ship it inside the offline bundle or by configuration management; `vivar doctor`
+and `vivar policy` show which files are in effect.
 - Policy is read from the nearest `pyproject.toml` above the current directory.
 
 Existing `[tool.vivar]` sections are never overwritten by `vivar init`.
@@ -445,11 +464,15 @@ Existing `[tool.vivar]` sections are never overwritten by `vivar init`.
 Three direct dependencies (`clap` with minimal features, `toml_edit`, `anyhow`),
 a release build under 1 MB, and no runtime beyond the OS (`curl`, `tar`, `git` for
 git references) and, optionally, the `uv` binary it drives. The native installer
-unpacks each wheel once into `~/.cache/vivar/unpacked/<sha256>/` and hard-links its
-files into every environment (`VIVAR_LINK_MODE=copy` turns that off), so ten
-environments with torch cost one torch on disk; the linked files are read-only on Unix,
-since an edit in one environment would be an edit in all. `vivar init` creates no sample
-code, README, or git repo.
+unpacks each wheel once into `~/.cache/vivar/unpacked/<sha256 prefix>/` (16 hex digits,
+so paths stay short on Windows) and hard-links its files into every environment
+(`VIVAR_LINK_MODE=copy` turns that off), so ten environments with torch cost one torch
+on disk; the linked files are read-only on Unix, since an edit in one environment would
+be an edit in all. `vivar env list` shows the store and how much of it no environment
+links any more; `vivar clean` removes those entries (on Windows, where link counts
+aren't cheap to read, the whole store) along with downloaded wheels and build caches,
+and environments keep their files either way. `vivar init` creates no sample code,
+README, or git repo.
 
 ## Development
 

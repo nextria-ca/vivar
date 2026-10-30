@@ -179,7 +179,12 @@ fn platform_floor(tag: &str) -> u32 {
 }
 
 /// Downloads every locked registry package into `out`. Returns a summary line.
-pub fn export(root: &Path, target: &Target, out: &Path) -> Result<String> {
+pub fn export(
+    root: &Path,
+    target: &Target,
+    out: &Path,
+    policy: &crate::project::Policy,
+) -> Result<String> {
     let lock = Lock::read(root)?;
     fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
     let (mut wheels, mut sdists, mut skipped) = (0, Vec::new(), Vec::new());
@@ -213,7 +218,7 @@ pub fn export(root: &Path, target: &Target, out: &Path) -> Result<String> {
             jobs.push((artifact.url.clone(), dest, expected));
         }
     }
-    download_all(&jobs)?;
+    download_all(&jobs, policy)?;
     let mut summary = format!("{wheels} wheel(s) in {}", out.display());
     if !sdists.is_empty() {
         summary.push_str(&format!(
@@ -230,12 +235,23 @@ pub fn export(root: &Path, target: &Target, out: &Path) -> Result<String> {
 
 /// Fetches `(url, destination, expected sha256)` jobs eight at a time, each
 /// verified against its hash before it counts as done.
-fn download_all(jobs: &[(String, std::path::PathBuf, Option<String>)]) -> Result<()> {
+fn download_all(
+    jobs: &[(String, std::path::PathBuf, Option<String>)],
+    policy: &crate::project::Policy,
+) -> Result<()> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     if jobs.is_empty() {
         return Ok(());
     }
+    // Under a locked index every hop of every download answers to policy;
+    // a policy wheelhouse is looked in first, whatever URL the lock names.
+    let guarded = policy.locked_index();
+    let local_index = policy.index_url.as_deref().and_then(|u| {
+        crate::index::Index::new(Some(u))
+            .local_dir()
+            .map(Path::to_path_buf)
+    });
     let next = AtomicUsize::new(0);
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let workers = jobs.len().min(8);
@@ -246,7 +262,36 @@ fn download_all(jobs: &[(String, std::path::PathBuf, Option<String>)]) -> Result
                 let Some((url, dest, expected)) = jobs.get(i) else { break };
                 let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 println!("downloading {name}");
-                let result = upgrade::fetch_to(url, dest).and_then(|()| {
+                // A lock made from a wheelhouse names its files by file://
+                // URL, and a policy wheelhouse may hold a file the lock names
+                // by its original URL: those are copied (the hash check below
+                // holds either), and no guard has a say over a copy.
+                let in_policy_wheelhouse = local_index.as_ref().map(|d| d.join(&name)).filter(|p| {
+                    p.is_file()
+                        && expected
+                            .as_ref()
+                            .is_none_or(|h| sha256::file(p).ok().as_ref() == Some(h))
+                });
+                // A locked wheelhouse is the only source: its copy or nothing,
+                // whatever directory the lock's URL points at.
+                let source = match (guarded && local_index.is_some(), in_policy_wheelhouse) {
+                    (true, Some(local)) => Ok(Some(local)),
+                    (true, None) => Err(anyhow!(
+                        "{name} is not in the wheelhouse {}, the only source under the locked policy",
+                        local_index.as_ref().map(|d| d.display().to_string()).unwrap_or_default()
+                    )),
+                    (false, local) => Ok(crate::index::local_path(url).or(local)),
+                };
+                let fetched = source.and_then(|source| match source {
+                    Some(local) => fs::copy(&local, dest)
+                        .map(|_| ())
+                        .with_context(|| format!("copying {}", local.display())),
+                    None if guarded => {
+                        upgrade::fetch_to_guarded(url, dest, &|u| policy.allows_download(u))
+                    }
+                    None => upgrade::fetch_to(url, dest),
+                });
+                let result = fetched.and_then(|()| {
                     if let Some(h) = expected {
                         let actual = sha256::file(dest)?;
                         if &actual != h {

@@ -233,6 +233,119 @@ fn deny_list_is_enforced_everywhere() {
     fails_with(dir, &["lock"], "deny list");
     fails_with(dir, &["sync"], "deny list");
     fails_with(dir, &["run", "python", "-c", "pass"], "deny list");
+
+    // A locked org policy with an index: the project may not route packages
+    // anywhere else, by index, git or URL.
+    let locked = dir.join("locked.toml");
+    fs::write(
+        &locked,
+        "[policy]\nlocked = true\nindex-url = \"https://pypi.org/simple\"\n",
+    )
+    .unwrap();
+    let run = |pyproject: &str, args: &[&str]| {
+        fs::write(&path, pyproject).unwrap();
+        Command::new(env!("CARGO_BIN_EXE_vivar"))
+            .current_dir(dir)
+            .env("VIVAR_POLICY", &locked)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let elsewhere = format!(
+        "{pyproject}\n[[tool.uv.index]]\nname = \"other\"\nurl = \"https://mirror.example/simple\"\n"
+    );
+    let out = run(&elsewhere, &["lock"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not the locked policy index"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let git = format!(
+        "{pyproject}\n[tool.uv.sources]\nsix = {{ git = \"https://github.com/benjaminp/six\" }}\n"
+    );
+    let out = run(&git, &["lock"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("locked policy index"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let same = format!(
+        "{pyproject}\n[[tool.uv.index]]\nname = \"pypi\"\nurl = \"https://pypi.org/simple/\"\n"
+    );
+    let out = run(&same, &["lock"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Direct references are refused wherever a requirement is written, and
+    // `remove` answers to the declared sources like a lock does.
+    let out = run(&same, &["add", "six @ https://files.example/six.whl"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("direct reference"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run(
+        &same,
+        &[
+            "tool",
+            "install",
+            "pycodestyle @ https://files.example/p.whl",
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("direct reference"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // `remove` is judged on what stays: removing another package while six
+    // still routes to git is refused, removing six itself restores compliance.
+    let two = git.replace(
+        "dependencies = []",
+        "dependencies = [\"six\", \"pycodestyle\"]",
+    );
+    assert_ne!(two, git);
+    let out = run(&two, &["remove", "pycodestyle"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("locked policy index"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run(&two, &["remove", "six"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = read(&path);
+    assert!(
+        !text.contains("git =") && text.contains("pycodestyle"),
+        "{text}"
+    );
+    // A lock from elsewhere is refused before anything is installed.
+    let lockfile = dir.join("uv.lock");
+    let lock = read(&lockfile);
+    let foreign = format!(
+        "{lock}\n[[package]]\nname = \"six\"\nversion = \"1.17.0\"\nsource = {{ registry = \"https://mirror.example/simple\" }}\nwheels = [{{ url = \"https://mirror.example/six.whl\", hash = \"sha256:{}\" }}]\n",
+        "0".repeat(64)
+    );
+    fs::write(&lockfile, foreign).unwrap();
+    let out = run(&same, &["sync"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("locked index policy violated"), "{stderr}");
+    assert!(
+        stderr.contains("instead of https://pypi.org/simple"),
+        "{stderr}"
+    );
+    fs::write(&lockfile, lock).unwrap();
+    fs::write(&path, &pyproject).unwrap();
 }
 
 #[test]
@@ -812,6 +925,81 @@ fn tasks_and_inline_scripts_run_in_the_right_env() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(!cache.join("scripts").exists());
+}
+
+#[test]
+fn clean_collects_store_entries_no_environment_links() {
+    let tmp = TempDir::new("store-gc");
+    let dir = &tmp.0;
+    init(dir);
+    ok(dir, &["add", "six"]);
+    let cache = dir.join("cache");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_vivar"))
+            .current_dir(dir)
+            .env("VIVAR_BACKEND", "native")
+            .env("VIVAR_CACHE_DIR", &cache)
+            .env("UV_CACHE_DIR", dir.join("uv-cache"))
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let okr = |args: &[&str]| {
+        let out = run(args);
+        assert!(
+            out.status.success(),
+            "vivar {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    };
+    fs::remove_dir_all(dir.join(".venv")).unwrap();
+    okr(&["sync"]);
+    let store = cache.join("unpacked");
+    let entries: Vec<PathBuf> = fs::read_dir(&store)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    // Keys are 16 hex digits, so paths through the store stay short on Windows.
+    assert_eq!(entries[0].file_name().unwrap().len(), 16);
+    let listed = stdout_of(&okr(&["env", "list"]));
+    assert!(listed.contains("store     1 wheel(s) in"), "{listed}");
+    assert!(!listed.contains("unused"), "{listed}");
+
+    // While the environment links the wheel, `clean` keeps it (Unix; Windows
+    // can't tell and drops the store, which the environment doesn't need).
+    let out = stdout_of(&okr(&["clean"]));
+    assert!(!cache.join("wheels").exists());
+    if cfg!(unix) {
+        assert!(!out.contains("from the store"), "{out}");
+        assert!(entries[0].is_dir());
+    } else {
+        assert!(
+            out.contains("removed 1 unpacked wheel(s) from the store"),
+            "{out}"
+        );
+    }
+    okr(&["run", "python", "-c", "import six"]);
+
+    // Once nothing links it, the entry goes.
+    if cfg!(unix) {
+        fs::remove_dir_all(dir.join(".venv")).unwrap();
+        let listed = stdout_of(&okr(&["env", "list"]));
+        assert!(listed.contains("1 unused"), "{listed}");
+        let out = stdout_of(&okr(&["clean"]));
+        assert!(
+            out.contains("removed 1 unpacked wheel(s) from the store"),
+            "{out}"
+        );
+        assert!(!entries[0].exists());
+    }
+    // `--store` removes everything regardless; the environment keeps its files.
+    okr(&["sync"]);
+    okr(&["clean", "--store"]);
+    assert!(fs::read_dir(&store).map(|rd| rd.count()).unwrap_or(0) == 0);
+    okr(&["run", "python", "-c", "import six"]);
 }
 
 #[test]
@@ -2091,6 +2279,48 @@ fn delta_bundles_dedupe_and_signing() {
         }
         let _ = fs::remove_dir_all(tmp.0.join("trusted"));
     }
+    // Under a locked policy only the policy's keys count: VIVAR_TRUSTED_KEYS
+    // and the machine's own key are ignored, so the key must be in the file.
+    let locked = tmp.0.join("locked.toml");
+    for (keys, ok_expected) in [
+        ("", false),
+        (&format!("trusted-keys = [\"{public}\"]\n"), true),
+    ] {
+        fs::write(&locked, format!("[policy]\nlocked = true\n{keys}")).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
+            .current_dir(&tmp.0)
+            .env("VIVAR_POLICY", &locked)
+            .env("VIVAR_TRUSTED_KEYS", &public)
+            .args([
+                "unpack",
+                "--require-signature",
+                a.to_str().unwrap(),
+                tmp.0.join("locked-dir").to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.success(),
+            ok_expected,
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if !ok_expected {
+            assert!(String::from_utf8_lossy(&out.stderr).contains("no trusted keys"));
+        }
+        let _ = fs::remove_dir_all(tmp.0.join("locked-dir"));
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
+        .current_dir(dir)
+        .env("VIVAR_POLICY", &locked)
+        .args(["policy", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        stdout_of(&out).contains("\"locked\":true"),
+        "{}",
+        stdout_of(&out)
+    );
     // An unsigned bundle fails when a signature is required (here via org policy).
     let unsigned = tmp.0.join("u.tar.gz");
     ok(dir, &["pack", "-o", unsigned.to_str().unwrap()]);

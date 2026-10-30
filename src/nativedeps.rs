@@ -283,7 +283,12 @@ pub fn lock(project: &Project, policy: &Policy, upgrade: bool) -> Result<Vec<Str
     for subdir in &subdirs {
         let pairs: Vec<Both> = urls
             .iter()
-            .map(|u| Both(Channel::new(u, subdir), Channel::new(u, "noarch")))
+            .map(|u| {
+                Both(
+                    Channel::new(u, subdir).guarded(policy),
+                    Channel::new(u, "noarch").guarded(policy),
+                )
+            })
             .collect();
         let providers: Vec<&dyn Provider> = pairs.iter().map(|p| p as &dyn Provider).collect();
         let channels = Channels(providers);
@@ -449,9 +454,11 @@ pub fn sync(project: &Project, policy: &Policy) -> Result<(usize, usize)> {
     for url in &lock.channels {
         policy.check_channel(url)?;
     }
-    // Policy may have changed since the lock was written.
+    // Policy may have changed since the lock was written; and the records'
+    // own URLs, not only the channel list, must point at the mirror.
     for r in &wanted {
         policy.check_deny(&[&r.name])?;
+        policy.check_package_url(&r.url)?;
     }
     let prefix = root.join(".venv");
     // A plain venv in the way is replaced: the prefix brings its own Python.
@@ -502,7 +509,9 @@ pub fn sync(project: &Project, policy: &Policy) -> Result<(usize, usize)> {
         if present.iter().any(|l| same(l, r)) {
             continue;
         }
-        let archive = condalink::fetch(r)?;
+        let allow = |u: &str| policy.allows_native_download(u);
+        let guard: Option<&dyn Fn(&str) -> bool> = policy.locked_mirror().then_some(&allow);
+        let archive = condalink::fetch(r, guard)?;
         condalink::link(r, &archive, &layout)?;
         linked += 1;
     }

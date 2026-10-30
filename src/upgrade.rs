@@ -130,16 +130,39 @@ fn upgrade(current: &Path, version: Option<&str>, from: Option<&str>, tmp: &Path
 
 /// GETs a URL through `gh api` (logged in, api.github.com only) or `curl` (+ `GITHUB_TOKEN`).
 pub fn fetch(url: &str, accept: Option<&str>) -> Result<Vec<u8>> {
-    Ok(fetcher(url, accept, None)?.stdout)
+    fetcher(url, accept, None, None)
 }
 
 /// GETs a URL straight to a file (large downloads).
 pub fn fetch_to(url: &str, path: &Path) -> Result<()> {
-    fetcher(url, None, Some(path))?;
-    Ok(())
+    fetcher(url, None, Some(path), None).map(|_| ())
 }
 
-fn fetcher(url: &str, accept: Option<&str>, output: Option<&Path>) -> Result<std::process::Output> {
+/// `fetch` for a download policy restricts: `allow` is asked about the URL
+/// and about every redirect before it is followed, so nothing is fetched
+/// from a host it refuses.
+pub fn fetch_guarded(
+    url: &str,
+    accept: Option<&str>,
+    allow: &dyn Fn(&str) -> bool,
+) -> Result<Vec<u8>> {
+    fetcher(url, accept, None, Some(allow))
+}
+
+/// `fetch_to` under the same guard.
+pub fn fetch_to_guarded(url: &str, path: &Path, allow: &dyn Fn(&str) -> bool) -> Result<()> {
+    fetcher(url, None, Some(path), Some(allow)).map(|_| ())
+}
+
+fn fetcher(
+    url: &str,
+    accept: Option<&str>,
+    output: Option<&Path>,
+    allow: Option<&dyn Fn(&str) -> bool>,
+) -> Result<Vec<u8>> {
+    if let Some(allow) = allow {
+        return fetch_hops(url, accept, output, allow);
+    }
     let gh_ok = Command::new("gh")
         .args(["auth", "status"])
         .output()
@@ -157,23 +180,7 @@ fn fetcher(url: &str, accept: Option<&str>, output: Option<&Path>) -> Result<std
             cmd.arg("--output").arg(path);
         }
     } else {
-        cmd = Command::new("curl");
-        cmd.args(["-LsSf", url]);
-        if let Some(ca) = ca_bundle() {
-            cmd.arg("--cacert").arg(ca);
-        }
-        if let Some(path) = output {
-            cmd.arg("-o").arg(path);
-        }
-        if let Some(accept) = accept {
-            cmd.args(["-H", &format!("Accept: {accept}")]);
-        }
-        // The token is for the private repo only: never send it to package hosts.
-        if let Ok(token) = env::var("GITHUB_TOKEN") {
-            if is_github(url) {
-                cmd.args(["-H", &format!("Authorization: Bearer {token}")]);
-            }
-        }
+        cmd = curl(url, accept, output, true);
     }
     let out = cmd
         .output()
@@ -187,7 +194,141 @@ fn fetcher(url: &str, accept: Option<&str>, output: Option<&Path>) -> Result<std
         };
         bail!("fetching {url} failed: {err}{hint}");
     }
-    Ok(out)
+    Ok(out.stdout)
+}
+
+/// A curl command for `url`; `follow` lets curl take redirects itself.
+fn curl(url: &str, accept: Option<&str>, output: Option<&Path>, follow: bool) -> Command {
+    let mut cmd = Command::new("curl");
+    if follow {
+        cmd.args(["-LsSf", url]);
+    } else {
+        // `-q` first: no .curlrc may turn redirects (or anything else)
+        // back on behind the policy check; `--globoff`: the URL checked is
+        // the URL requested, with no `{..}` expansion on the way.
+        // `--netrc-optional`: a mirror's ~/.netrc entry still applies (per
+        // host, so a redirect elsewhere gets that host's own, or none).
+        cmd.args(["-q", "-sS", "--globoff", "--netrc-optional", url]);
+    }
+    if let Some(ca) = ca_bundle() {
+        cmd.arg("--cacert").arg(ca);
+    }
+    if let Some(path) = output {
+        cmd.arg("-o").arg(path);
+    }
+    if let Some(accept) = accept {
+        cmd.args(["-H", &format!("Accept: {accept}")]);
+    }
+    // The token is for the private repo only: never send it to package hosts.
+    if let Ok(token) = env::var("GITHUB_TOKEN") {
+        if is_github(url) {
+            cmd.args(["-H", &format!("Authorization: Bearer {token}")]);
+        }
+    }
+    cmd
+}
+
+/// Downloads hop by hop: curl takes no redirect itself; each `Location`
+/// is checked with `allow` first, and the body lands where it is wanted.
+fn fetch_hops(
+    url: &str,
+    accept: Option<&str>,
+    output: Option<&Path>,
+    allow: &dyn Fn(&str) -> bool,
+) -> Result<Vec<u8>> {
+    let mut url = url.to_owned();
+    // Credentials the request was given (userinfo in the URL) follow it to
+    // that origin only, however many hops later; none are ever added that
+    // it did not have.
+    let origin = url.clone();
+    let userinfo = url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+        .and_then(|a| a.rsplit_once('@'))
+        .map(|(u, _)| u.to_owned());
+    for _ in 0..10 {
+        if !allow(&url) {
+            bail!("{url} is outside the hosts policy allows downloads from");
+        }
+        // The body goes to a file either way: the trailer (status and
+        // redirect target) is all that comes back on stdout.
+        let body_file = match output {
+            Some(path) => path.to_path_buf(),
+            None => private_temp_file()?,
+        };
+        let mut cmd = curl(&url, accept, Some(&body_file), false);
+        cmd.args(["-w", "%{http_code}\n%{redirect_url}"]);
+        let out = cmd.output().context("running curl (install curl)")?;
+        let trailer = String::from_utf8_lossy(&out.stdout);
+        let mut lines = trailer.lines();
+        let code: u16 = lines.next().unwrap_or("").trim().parse().unwrap_or(0);
+        let redirect = lines.next().unwrap_or("").trim().to_owned();
+        if !out.status.success() {
+            let _ = fs::remove_file(&body_file);
+            bail!(
+                "fetching {url} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        if (300..400).contains(&code) && !redirect.is_empty() {
+            if output.is_none() {
+                let _ = fs::remove_file(&body_file);
+            }
+            // Credentials stay with their origin: a same-origin redirect
+            // keeps them (the Location carries none), any other loses them.
+            url = match (&userinfo, crate::index::same_origin(&redirect, &origin)) {
+                (Some(creds), true)
+                    if !redirect.split_once("://").is_some_and(|(_, r)| {
+                        r.split(['/', '?', '#'])
+                            .next()
+                            .is_some_and(|a| a.contains('@'))
+                    }) =>
+                {
+                    match redirect.split_once("://") {
+                        Some((scheme, rest)) => format!("{scheme}://{creds}@{rest}"),
+                        None => redirect,
+                    }
+                }
+                _ => redirect,
+            };
+            continue;
+        }
+        if code >= 400 {
+            let _ = fs::remove_file(&body_file);
+            bail!("fetching {url} failed: HTTP {code}");
+        }
+        return match output {
+            Some(_) => Ok(Vec::new()),
+            None => {
+                let body = fs::read(&body_file);
+                let _ = fs::remove_file(&body_file);
+                Ok(body?)
+            }
+        };
+    }
+    bail!("fetching {url}: too many redirects")
+}
+
+/// An empty temporary file only this user can read (an authenticated
+/// download lands in it), created before curl is handed the path.
+fn private_temp_file() -> Result<PathBuf> {
+    let path = env::temp_dir().join(format!("vivar-fetch-{}-{}", std::process::id(), seq()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(&path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    Ok(path)
+}
+
+fn seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether a URL points at GitHub itself (API, web, release assets).
@@ -195,7 +336,8 @@ fn is_github(url: &str) -> bool {
     let host = url
         .split("://")
         .nth(1)
-        .and_then(|rest| rest.split('/').next())
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+        .map(|a| a.rsplit('@').next().unwrap_or(a))
         .unwrap_or("");
     host == "api.github.com"
         || host == "github.com"

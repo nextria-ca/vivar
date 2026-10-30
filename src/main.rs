@@ -295,6 +295,10 @@ they are never put on a command line. --dry-run shows what would be sent."
         /// Also remove installed tool environments
         #[arg(long)]
         tools: bool,
+        /// Remove the whole unpacked-wheel store, not only the wheels no
+        /// environment links any more (environments keep their files)
+        #[arg(long)]
+        store: bool,
     },
     /// Print a shell completion script (bash, zsh, fish, powershell, elvish)
     Completions { shell: clap_complete::Shell },
@@ -609,6 +613,9 @@ fn main() -> Result<()> {
             cuda,
         } => {
             let project = require(project, &cwd)?;
+            // What is already declared is resolved along with the addition:
+            // it answers to policy first, before anything is fetched or built.
+            project.check_declared()?;
             project.check_requirements(&packages)?;
             if native {
                 let names: Vec<String> = packages
@@ -631,7 +638,7 @@ fn main() -> Result<()> {
             }
             venv::ensure(project.venv_root(), &project.name())?;
             transact(&project, &*backend, &cwd, group.as_deref(), || {
-                route_pytorch(&project, &packages, cuda.as_deref())?;
+                route_pytorch(&project, &policy, &packages, cuda.as_deref())?;
                 backend.add(&cwd, &packages, group.as_deref(), editable)?;
                 venv::mark_synced(project.venv_root());
                 after_install(&project, &policy)
@@ -670,9 +677,14 @@ fn main() -> Result<()> {
                 })?;
                 return Ok(());
             }
+            // What stays declared is re-resolved and installed: it answers
+            // to policy like any lock or sync (what goes may be the very
+            // thing policy objects to).
+            project.check_declared_without(&packages)?;
             venv::ensure(project.venv_root(), &project.name())?;
             transact(&project, &*backend, &cwd, None, || {
-                backend.remove(&cwd, &packages)
+                backend.remove(&cwd, &packages)?;
+                after_install(&project, &policy)
             })?;
             venv::mark_synced(project.venv_root());
         }
@@ -751,7 +763,7 @@ fn main() -> Result<()> {
                         .cloned()
                         .collect();
                     if !family.is_empty() {
-                        route_pytorch(&project, &family, imported.cuda.as_deref())?;
+                        route_pytorch(&project, &policy, &family, imported.cuda.as_deref())?;
                     }
                     let list = std::env::temp_dir()
                         .join(format!("vivar-import-{}.txt", std::process::id()));
@@ -903,6 +915,7 @@ fn main() -> Result<()> {
                 }
             };
             let (groups, extras) = selection(&project, profile.as_deref(), &extra)?;
+            check_lock(&project, &policy)?;
             backend.sync_with(&cwd, &groups, &extras)?;
             venv::mark_profile(project.venv_root(), profile.as_deref());
             venv::mark_synced(project.venv_root());
@@ -1073,7 +1086,9 @@ fn main() -> Result<()> {
             }
         }
         Command::Build => {
-            require(project, &cwd)?;
+            // Build requirements answer to policy before uv or the native
+            // builder installs them.
+            require(project, &cwd)?.check_declared()?;
             backend.build(&cwd)?;
         }
         Command::Publish {
@@ -1159,7 +1174,9 @@ fn main() -> Result<()> {
                     .unwrap_or_else(|| "3.12".to_owned());
                 let target = wheelhouse::Target::new(target.as_deref(), &python)?;
                 let out = output.unwrap_or_else(|| cwd.join("wheelhouse"));
-                let summary = wheelhouse::export(project.venv_root(), &target, &out)?;
+                // The lock is what gets exported: it answers to policy first.
+                check_hashes(&project, &policy)?;
+                let summary = wheelhouse::export(project.venv_root(), &target, &out, &policy)?;
                 println!("{summary}");
                 println!(
                     "on the target machine set [tool.vivar.policy] index-url = {:?}",
@@ -1226,7 +1243,7 @@ fn main() -> Result<()> {
         Command::Env { command } => match command {
             EnvCommand::List => envs::list(&cwd)?,
         },
-        Command::Clean { tools } => envs::clean(tools)?,
+        Command::Clean { tools, store } => envs::clean(tools, store)?,
         Command::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "vivar", &mut std::io::stdout());
         }
@@ -1285,6 +1302,7 @@ fn main() -> Result<()> {
                 None => {
                     venv::ensure(project.venv_root(), &project.name())?;
                     let (groups, extras) = selection(&project, profile.as_deref(), &[])?;
+                    check_lock(&project, &policy)?;
                     backend.sync_with(&cwd, &groups, &extras)?;
                     venv::mark_synced(project.venv_root());
                     venv::mark_profile(project.venv_root(), profile.as_deref());
@@ -1314,11 +1332,15 @@ fn main() -> Result<()> {
             not_before,
         } => {
             let require_signature = require_signature || policy.require_signed_bundles;
+            let trust = sign::Trust {
+                keys: policy.trusted_keys.clone(),
+                locked: policy.locked,
+            };
             if apply {
                 let dir = dest.ok_or_else(|| {
                     anyhow::anyhow!("--apply needs the unpacked bundle directory")
                 })?;
-                bundle::apply_delta(&archive, &dir, require_signature, &policy.trusted_keys)?;
+                bundle::apply_delta(&archive, &dir, require_signature, &trust)?;
                 return Ok(());
             }
             let dest = dest.unwrap_or_else(|| {
@@ -1333,7 +1355,7 @@ fn main() -> Result<()> {
                 &archive,
                 &dest,
                 require_signature,
-                &policy.trusted_keys,
+                &trust,
                 dedupe_with.as_deref(),
                 not_before.as_deref(),
             )?;
@@ -1502,6 +1524,8 @@ fn run_check(
         check_hashes(project, policy).map(|()| {
             if policy.require_hashes {
                 "all artifacts hashed and from the index".to_owned()
+            } else if policy.locked && policy.index_url.is_some() {
+                "all artifacts from the locked index".to_owned()
             } else {
                 "not required by policy".to_owned()
             }
@@ -1784,7 +1808,22 @@ const PYTORCH_FAMILY: &[&str] = &["torch", "torchvision", "torchaudio"];
 
 /// `vivar add torch`: pick the PyTorch build for this machine's GPU unless told
 /// otherwise (`--cuda 12.4`, `cpu`, `rocm6.2`, or `none` to leave PyPI alone).
-fn route_pytorch(project: &Project, packages: &[String], cuda: Option<&str>) -> Result<()> {
+fn route_pytorch(
+    project: &Project,
+    policy: &project::Policy,
+    packages: &[String],
+    cuda: Option<&str>,
+) -> Result<()> {
+    // A locked index is where torch comes from too: no routing to
+    // download.pytorch.org, asked for or automatic.
+    if policy.locked_index() {
+        if let Some(variant) = cuda.filter(|c| *c != "none" && *c != "auto") {
+            bail!(
+                "--cuda {variant} would route PyTorch to download.pytorch.org, which the locked policy index does not allow"
+            );
+        }
+        return Ok(());
+    }
     let family: Vec<String> = packages
         .iter()
         .filter(|p| {
@@ -1820,6 +1859,7 @@ fn route_pytorch(project: &Project, packages: &[String], cuda: Option<&str>) -> 
 /// `vivar policy`: the merged policy, then each layer that contributed.
 fn print_policy(project: Option<&Project>, policy: &project::Policy, json: bool) -> Result<()> {
     let org = project::org_policy()?;
+    let system = project::system_policy_path();
     if json {
         let list = |v: &[String]| {
             let items: Vec<String> = v.iter().map(|s| json::quote(s)).collect();
@@ -1827,7 +1867,7 @@ fn print_policy(project: Option<&Project>, policy: &project::Policy, json: bool)
         };
         let path_json = |p: &std::path::Path| json::quote(&p.display().to_string());
         println!(
-            "{{\"deny\":{},\"index-url\":{},\"allow-licenses\":{},\"license-exceptions\":{},\"require-hashes\":{},\"require-wheels\":{},\"telemetry\":{},\"network\":{},\"require-signed-bundles\":{},\"trusted-keys\":{},\"sources\":{{\"project\":{},\"workspace\":{},\"org\":{}}}}}",
+            "{{\"deny\":{},\"index-url\":{},\"allow-licenses\":{},\"license-exceptions\":{},\"require-hashes\":{},\"require-wheels\":{},\"telemetry\":{},\"network\":{},\"require-signed-bundles\":{},\"trusted-keys\":{},\"locked\":{},\"sources\":{{\"project\":{},\"workspace\":{},\"org\":{},\"system\":{}}}}}",
             list(&policy.deny),
             policy.index_url.as_deref().map_or("null".to_owned(), json::quote),
             policy.allow_licenses.as_deref().map_or("null".to_owned(), list),
@@ -1838,11 +1878,15 @@ fn print_policy(project: Option<&Project>, policy: &project::Policy, json: bool)
             if policy.offline { "\"offline\"" } else { "\"online\"" },
             policy.require_signed_bundles,
             list(&policy.trusted_keys),
+            policy.locked,
             project.map_or("null".to_owned(), |p| path_json(&p.root.join(project::PYPROJECT))),
             project
                 .and_then(|p| p.workspace.as_deref())
                 .map_or("null".to_owned(), |w| path_json(&w.root.join(project::PYPROJECT))),
             org.as_ref().map_or("null".to_owned(), |(p, _)| path_json(p)),
+            Some(system.as_path())
+                .filter(|p| p.is_file() && org.as_ref().is_some_and(|(o, _)| o != *p))
+                .map_or("null".to_owned(), path_json),
         );
         return Ok(());
     }
@@ -1895,6 +1939,9 @@ fn print_policy(project: Option<&Project>, policy: &project::Policy, json: bool)
     if !policy.trusted_keys.is_empty() {
         println!("  trusted-keys:       {}", policy.trusted_keys.join(", "));
     }
+    if policy.locked {
+        println!("  locked:             yes (index, conda mirror and trusted keys come from the locked policy only)");
+    }
     println!("from");
     match project {
         Some(p) => {
@@ -1905,12 +1952,15 @@ fn print_policy(project: Option<&Project>, policy: &project::Policy, json: bool)
         }
         None => println!("  project:   (not inside a project)"),
     }
-    match org {
+    match &org {
         Some((path, _)) => println!("  org:       {}", path.display()),
         None => println!(
             "  org:       (no policy file; VIVAR_POLICY or {})",
             dirs::config()?.join("policy.toml").display()
         ),
+    }
+    if system.is_file() && org.as_ref().is_some_and(|(p, _)| *p != system) {
+        println!("  system:    {}", system.display());
     }
     Ok(())
 }
@@ -1962,45 +2012,21 @@ fn after_install(project: &Project, policy: &project::Policy) -> Result<()> {
     )
 }
 
+/// `check_hashes` on the lock a sync is about to install from, before any
+/// artifact is fetched; nothing to check when there is no lock yet.
+fn check_lock(project: &Project, policy: &project::Policy) -> Result<()> {
+    if !project.venv_root().join(lock::LOCKFILE).is_file() {
+        return Ok(());
+    }
+    check_hashes(project, policy)
+}
+
 fn check_hashes(project: &Project, policy: &project::Policy) -> Result<()> {
-    if !policy.require_hashes {
+    if !policy.require_hashes && !policy.locked_index() {
         return Ok(());
     }
     let lock = lock::Lock::read(project.venv_root())?;
-    let tree = std::fs::canonicalize(project.venv_root()).unwrap_or_default();
-    let mut bad = Vec::new();
-    for p in &lock.packages {
-        // The project and its workspace members are the code being locked, not
-        // dependencies; an editable checkout from elsewhere is a dependency.
-        let own = p.source_kind == "virtual"
-            || (p.source_kind == "editable"
-                && std::fs::canonicalize(project.venv_root().join(&p.source))
-                    .map(|path| path.starts_with(&tree))
-                    .unwrap_or(false));
-        if own {
-            continue;
-        }
-        if p.source_kind != "registry" {
-            bad.push(format!(
-                "{} {} comes from a {} source",
-                p.name, p.version, p.source_kind
-            ));
-        } else if !p.hashed {
-            bad.push(format!("{} {} has unhashed artifacts", p.name, p.version));
-        } else if let Some(index) = policy.index_url.as_deref().filter(|i| i.contains("://")) {
-            if p.source.trim_end_matches('/') != index.trim_end_matches('/') {
-                bad.push(format!(
-                    "{} {} comes from {} instead of {index}",
-                    p.name, p.version, p.source
-                ));
-            }
-        }
-    }
-    if bad.is_empty() {
-        Ok(())
-    } else {
-        bail!("require-hashes policy violated:\n  {}", bad.join("\n  "))
-    }
+    policy.check_lock(Some(project), &lock)
 }
 
 /// Splits a task string into arguments, honouring single and double quotes.
@@ -2038,9 +2064,12 @@ fn backend_for(policy: &project::Policy, project: Option<&Project>) -> Box<dyn B
     let forced = std::env::var("VIVAR_BACKEND")
         .map(|v| v == "native")
         .unwrap_or(false);
-    // A native (conda) prefix is vivar's own: uv does not know it.
+    // A native (conda) prefix is vivar's own: uv does not know it. A locked
+    // index is enforced by the native resolver and installer (every listing,
+    // build requirement and artifact passes policy before it is fetched);
+    // uv's own resolution cannot be held to that, so it is not used.
     let native_deps = project.is_some_and(nativedeps::declared);
-    if !forced && !native_deps && backend::uv_available() {
+    if !forced && !native_deps && !policy.locked_index() && backend::uv_available() {
         Box::new(UvBackend::new(policy))
     } else {
         Box::new(NativeBackend::new(policy))

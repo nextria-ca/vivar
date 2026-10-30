@@ -102,20 +102,27 @@ pub fn run(cwd: &Path) -> Result<i32> {
         }
     }
 
-    match project::org_policy()? {
+    let org = project::org_policy()?;
+    let system = project::system_policy_path();
+    if system.is_file() && org.as_ref().is_some_and(|(p, _)| *p != system) {
+        line(true, format!("system policy {}", system.display()));
+    }
+    match org {
         Some((path, policy)) => line(
             true,
             format!(
-                "org policy {} (deny {}, licenses {}, require-hashes {})",
+                "org policy {} (deny {}, licenses {}, require-hashes {}{})",
                 path.display(),
                 policy.deny.len(),
                 policy.allow_licenses.as_ref().map_or(0, Vec::len),
-                policy.require_hashes
+                policy.require_hashes,
+                if policy.locked { ", locked" } else { "" }
             ),
         ),
         None => println!(
-            "info no org policy file (VIVAR_POLICY or {})",
-            dirs::config()?.join("policy.toml").display()
+            "info no org policy file (VIVAR_POLICY, {} or {})",
+            dirs::config()?.join("policy.toml").display(),
+            project::system_policy_path().display()
         ),
     }
 

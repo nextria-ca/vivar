@@ -58,6 +58,10 @@ pub struct Index {
     listings: std::cell::RefCell<BTreeMap<String, Vec<File>>>,
     /// Names whose listing (and newest metadata) are being fetched ahead.
     prefetched: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    /// Under a locked policy: artifacts are taken from the index's own
+    /// host, PyPI's file host for pypi.org, and these hosts; a listing's
+    /// other files are dropped before anything is resolved or fetched.
+    locked_hosts: Option<Vec<String>>,
 }
 
 /// Where this index's listings are cached on disk.
@@ -215,6 +219,29 @@ fn metadata_cache_path(file: &File) -> Result<std::path::PathBuf> {
 impl Index {
     /// `index_url` from policy: a mirror URL, or a wheelhouse directory that
     /// is then the only source (never PyPI behind it); PyPI when unset.
+    /// The wheelhouse directory this index reads, if it is a local one.
+    pub fn local_dir(&self) -> Option<&std::path::Path> {
+        self.local.as_deref()
+    }
+
+    /// Restricts listings to artifacts a locked policy allows (see
+    /// `artifact_allowed`).
+    pub fn locked_to(mut self, hosts: &[String]) -> Index {
+        self.locked_hosts = Some(hosts.to_vec());
+        self
+    }
+
+    /// A download from this index: under a locked policy, only from the
+    /// allowed hosts, redirects included.
+    fn fetch(&self, url: &str, accept: Option<&str>) -> Result<Vec<u8>> {
+        match &self.locked_hosts {
+            Some(hosts) => {
+                upgrade::fetch_guarded(url, accept, &|u| artifact_allowed(u, &self.base, hosts))
+            }
+            None => upgrade::fetch(url, accept),
+        }
+    }
+
     pub fn new(index_url: Option<&str>) -> Index {
         match index_url {
             Some(u) if u.starts_with("file://") => {
@@ -226,6 +253,7 @@ impl Index {
                     local: Some(std::path::PathBuf::from(dir)),
                     listings: Default::default(),
                     prefetched: Default::default(),
+                    locked_hosts: None,
                 }
             }
             Some(u) if u.contains("://") => Index {
@@ -233,18 +261,21 @@ impl Index {
                 local: None,
                 listings: Default::default(),
                 prefetched: Default::default(),
+                locked_hosts: None,
             },
             Some(dir) => Index {
                 base: dir.to_owned(),
                 local: Some(std::path::PathBuf::from(dir)),
                 listings: Default::default(),
                 prefetched: Default::default(),
+                locked_hosts: None,
             },
             None => Index {
                 base: PYPI.to_owned(),
                 local: None,
                 listings: Default::default(),
                 prefetched: Default::default(),
+                locked_hosts: None,
             },
         }
     }
@@ -259,7 +290,9 @@ impl Index {
     /// name already asked for, or a wheelhouse, is skipped; failures are left
     /// for the real lookup to report.
     pub fn prefetch(&self, names: &[String], series: &str) {
-        if self.local.is_some() || listing_ttl() == 0 {
+        // Prefetch workers read listings unfiltered; a locked index does
+        // without the head start rather than touch a host it must not.
+        if self.local.is_some() || listing_ttl() == 0 || self.locked_hosts.is_some() {
             return;
         }
         let fresh: Vec<String> = {
@@ -341,7 +374,7 @@ impl Index {
         if let Some(cached) = self.listings.borrow().get(&name) {
             return Ok(cached.clone());
         }
-        let files = match &self.local {
+        let mut files = match &self.local {
             Some(dir) => local_files(dir, &name)?,
             None => {
                 // Links resolve against the page without credentials: what the
@@ -355,6 +388,9 @@ impl Index {
                 }
             }
         };
+        if let (Some(hosts), None) = (&self.locked_hosts, &self.local) {
+            files.retain(|f| artifact_allowed(&f.url, &self.base, hosts));
+        }
         self.listings.borrow_mut().insert(name, files.clone());
         Ok(files)
     }
@@ -389,7 +425,7 @@ impl Index {
                 return Ok(body.clone());
             }
         }
-        match upgrade::fetch(
+        match self.fetch(
             &self.authed(page),
             Some("application/vnd.pypi.simple.v1+json, text/html;q=0.1"),
         ) {
@@ -454,13 +490,12 @@ impl Index {
                 metadata_from_wheel(&fs::read(&path)?)
                     .with_context(|| format!("reading METADATA from {}", path.display()))?
             } else if file.has_metadata {
-                String::from_utf8_lossy(&upgrade::fetch(
-                    &self.authed(&format!("{}.metadata", file.url)),
-                    None,
-                )?)
+                String::from_utf8_lossy(
+                    &self.fetch(&self.authed(&format!("{}.metadata", file.url)), None)?,
+                )
                 .into_owned()
             } else {
-                let data = upgrade::fetch(&self.authed(&file.url), None).with_context(|| {
+                let data = self.fetch(&self.authed(&file.url), None).with_context(|| {
                     format!("downloading {} to read its metadata", file.filename)
                 })?;
                 if let Some(h) = &file.sha256 {
@@ -487,7 +522,9 @@ impl Index {
 pub fn same_origin(a: &str, b: &str) -> bool {
     fn origin(u: &str) -> Option<String> {
         let (scheme, rest) = u.split_once("://")?;
-        let host = rest.split('/').next()?;
+        // The authority ends at the path, query or fragment, whichever
+        // comes first: `host?@other` is a query, not a userinfo.
+        let host = rest.split(['/', '?', '#']).next()?;
         let host = host.rsplit('@').next()?; // never compare userinfo
         Some(format!(
             "{}://{}",
@@ -496,6 +533,26 @@ pub fn same_origin(a: &str, b: &str) -> bool {
         ))
     }
     matches!((origin(a), origin(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// Whether a locked index at `index` may hand out an artifact from `url`:
+/// the index's own origin, PyPI's file host for pypi.org, or one of `hosts`.
+pub fn artifact_allowed(url: &str, index: &str, hosts: &[String]) -> bool {
+    if same_origin(url, index) {
+        return true;
+    }
+    let (Some(url_host), Some(index_host)) = (host_of(url), host_of(index)) else {
+        return false;
+    };
+    (index_host == "pypi.org" && url_host == "files.pythonhosted.org") || hosts.contains(&url_host)
+}
+
+/// The lowercased host of a URL (no userinfo, no port games: the authority
+/// up to the first `/`, `?` or `#`).
+pub fn host_of(url: &str) -> Option<String> {
+    url.split_once("://")
+        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+        .map(|a| a.rsplit('@').next().unwrap_or(a).to_lowercase())
 }
 
 /// A `file://` URL for a wheelhouse member: absolute, percent-encoded, and
@@ -743,6 +800,53 @@ pub fn parse_metadata(text: &str) -> Metadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locked_indexes_allow_their_own_hosts_only() {
+        let hosts = vec!["cdn.example".to_owned()];
+        let index = "https://mirror.example/simple";
+        assert!(artifact_allowed(
+            "https://mirror.example/files/a.whl",
+            index,
+            &hosts
+        ));
+        assert!(artifact_allowed("https://CDN.example/a.whl", index, &hosts));
+        assert!(!artifact_allowed(
+            "https://files.example/a.whl",
+            index,
+            &hosts
+        ));
+        assert!(!artifact_allowed(
+            "https://files.pythonhosted.org/a.whl",
+            index,
+            &hosts
+        ));
+        assert!(artifact_allowed(
+            "https://files.pythonhosted.org/a.whl",
+            "https://pypi.org/simple",
+            &[]
+        ));
+        assert!(!artifact_allowed("file:///tmp/a.whl", index, &hosts));
+        // The authority ends at `/`, `?` or `#`: query text is not a host.
+        assert!(!artifact_allowed(
+            "https://outside.example?@mirror.example/a.whl",
+            index,
+            &hosts
+        ));
+        assert!(!artifact_allowed(
+            "https://outside.example#@mirror.example/a.whl",
+            index,
+            &hosts
+        ));
+        assert!(!same_origin(
+            "https://outside.example?@mirror.example/x",
+            index
+        ));
+        assert_eq!(
+            host_of("https://u:p@Mirror.example:8443/a?b#c").as_deref(),
+            Some("mirror.example:8443")
+        );
+    }
 
     #[test]
     fn parses_json_and_html_listings() {

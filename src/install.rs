@@ -263,6 +263,11 @@ fn write_file(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     Ok(())
 }
 
+/// The unpacked-wheel store's directory under the cache, and the length of
+/// its per-wheel keys.
+pub const STORE: &str = "unpacked";
+pub const STORE_KEY_LEN: usize = 16;
+
 /// The unpacked-wheel store: one directory per wheel, by hash, that
 /// environments hard-link from.
 struct Store {
@@ -278,10 +283,13 @@ impl Store {
         }
         let mut h = sha256::Sha256::new();
         h.update(data);
+        // The first 16 hex digits of the wheel's SHA-256: unique for any
+        // store that fits on a disk, and short enough that Windows paths
+        // through site-packages stay under MAX_PATH.
         let dir = dirs::cache()
             .ok()?
-            .join("unpacked")
-            .join(sha256::hex(&h.finish()));
+            .join(STORE)
+            .join(&sha256::hex(&h.finish())[..STORE_KEY_LEN]);
         fs::create_dir_all(&dir).ok()?;
         Some(Store { dir })
     }

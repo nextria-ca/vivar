@@ -197,35 +197,59 @@ def cuda_runtime_version(dists):
     return None
 
 
+def gpu_label(dev, devices):
+    """"GPU 1 (name)" when there are several, "this GPU" otherwise."""
+    if devices and len(devices) > 1:
+        return f"GPU {dev.get('index')} ({dev.get('name')})"
+    return "this GPU"
+
+
 def gpu_fit(info):
-    """Whether the torch wheel has kernels for this GPU (sm_XY binaries of the
-    same major and no newer minor, or PTX it can JIT-compile), and whether
-    the card has the memory asked for."""
+    """Whether the torch wheel has kernels for each GPU (sm_XY binaries of the
+    same major and no newer minor; PTX it can JIT-compile is a warning, not a
+    fit), whether a real kernel ran on it, and whether the card has the
+    memory asked for, free, not only installed."""
     out = []
-    cap = info.get("capability") or ""
     archs = info.get("archs") or []
-    if cap.startswith("sm_") and archs:
-        major, minor = int(cap[3]), int(cap[4:])
-        def fits(arch):
-            kind, _, num = arch.partition("_")
-            if not num.isdigit():
-                return False
-            a_major, a_minor = int(num[0]), int(num[1:])
-            if kind == "sm":
-                return a_major == major and a_minor <= minor
-            return kind == "compute" and (a_major, a_minor) <= (major, minor)
-        if not any(fits(a) for a in archs):
-            out.append(("ERR", "torch", f"no CUDA kernels for this GPU ({cap}); the wheel was built for {', '.join(archs)}"))
-        else:
-            out.append(("ok", "torch", f"kernels present for {cap}"))
-    vram = info.get("vram_gb")
-    if vram is not None:
-        free = info.get("free_gb")
-        detail = f"{vram} GB of GPU memory" + (f", {free} GB free" if free is not None else "")
-        if MIN_VRAM_GB is not None and vram < MIN_VRAM_GB:
-            out.append(("ERR", "torch", f"{detail}; at least {MIN_VRAM_GB:g} GB required (--min-vram)"))
-        else:
-            out.append(("ok", "torch", detail))
+    devices = info.get("devices") or []
+    for dev in devices:
+        name = gpu_label(dev, devices)
+        if dev.get("matmul_ok") is None and dev.get("error"):
+            # Nothing below ran: the device itself could not be queried.
+            out.append(("ERR", "torch", f"could not probe {name}: {dev['error']}"))
+            continue
+        cap = dev.get("capability") or ""
+        if cap.startswith("sm_") and archs:
+            # The minor is the last digit: sm_90 is 9.0, sm_120 is 12.0.
+            major, minor = int(cap[3:-1]), int(cap[-1])
+            def parse(arch):
+                kind, _, num = arch.partition("_")
+                return (kind, int(num[:-1]), int(num[-1])) if num.isdigit() and len(num) >= 2 else (kind, -1, -1)
+            binaries = [a for a in archs if parse(a)[0] == "sm" and parse(a)[1] == major and parse(a)[2] <= minor]
+            ptx = [a for a in archs if parse(a)[0] == "compute" and (parse(a)[1], parse(a)[2]) <= (major, minor)]
+            if binaries:
+                out.append(("ok", "torch", f"kernels present for {name} ({cap})"))
+            elif ptx:
+                out.append(("WARN", "torch", f"no compiled kernels for {name} ({cap}); torch will JIT-compile PTX "
+                                             f"({', '.join(ptx)}) on first use, which is slow and needs a driver that accepts it"))
+            else:
+                out.append(("ERR", "torch", f"no CUDA kernels for {name} ({cap}); the wheel was built for {', '.join(archs)}"))
+        kernel = dev.get("kernel_ok")
+        if kernel is False:
+            out.append(("ERR", "torch", f"a CUDA kernel gave the wrong result on {name}: {dev.get('error', 'mismatch')}"))
+        elif kernel is None:
+            out.append(("ERR", "torch", f"could not run a CUDA kernel on {name}: {dev.get('error', 'the probe stopped early')}"))
+        vram = dev.get("vram_gb")
+        if vram is not None:
+            free = dev.get("free_gb")
+            detail = f"{name}: {vram:.1f} GB of memory" + (f", {free:.1f} GB free" if free is not None else "")
+            if MIN_VRAM_GB is not None and free is None:
+                out.append(("ERR", "torch", f"{detail}; free memory could not be read, so {MIN_VRAM_GB:g} GB free cannot be confirmed (--min-vram)"))
+            elif MIN_VRAM_GB is not None and free < MIN_VRAM_GB:
+                why = "installed" if vram < MIN_VRAM_GB else "free (the rest is in use)"
+                out.append(("ERR", "torch", f"{detail}; at least {MIN_VRAM_GB:g} GB {why} required (--min-vram)"))
+            else:
+                out.append(("ok", "torch", detail))
     return out
 
 
@@ -252,18 +276,41 @@ try:
     out["cuda_available"] = torch.cuda.is_available()
     if out["cuda_available"]:
         out["device"] = torch.cuda.get_device_name(0)
-        cap = torch.cuda.get_device_capability(0)
-        out["capability"] = f"sm_{cap[0]}{cap[1]}"
         out["archs"] = list(torch.cuda.get_arch_list())
-        props = torch.cuda.get_device_properties(0)
-        out["vram_gb"] = round(props.total_memory / 2**30, 1)
-        try:
-            free, _ = torch.cuda.mem_get_info()
-            out["free_gb"] = round(free / 2**30, 1)
-        except Exception:  # noqa: BLE001
-            out["free_gb"] = None
-        a = torch.randn(256, 256, device="cuda")
-        out["matmul_ok"] = bool(torch.allclose(a @ torch.eye(256, device="cuda"), a, atol=1e-4))
+        out["devices"] = []
+        for i in range(torch.cuda.device_count()):
+            # Memory figures are kept unrounded: the --min-vram comparison
+            # is exact, and only the report rounds.
+            dev = {"index": i, "name": None, "capability": None, "vram_gb": None, "free_gb": None,
+                   "matmul_ok": None, "kernel_ok": None}
+            out["devices"].append(dev)
+            try:
+                dev["name"] = torch.cuda.get_device_name(i)
+                cap = torch.cuda.get_device_capability(i)
+                dev["capability"] = f"sm_{cap[0]}{cap[1]}"
+                dev["vram_gb"] = torch.cuda.get_device_properties(i).total_memory / 2**30
+                try:
+                    free, _ = torch.cuda.mem_get_info(i)
+                    dev["free_gb"] = free / 2**30
+                except Exception:  # noqa: BLE001
+                    pass
+                # cuBLAS (matmul) and a plain elementwise kernel: the second
+                # is what fails when the wheel carries no code for this GPU.
+                a = torch.randn(256, 256, device=f"cuda:{i}")
+                dev["matmul_ok"] = bool(torch.allclose(a @ torch.eye(256, device=f"cuda:{i}"), a, atol=1e-4))
+                # Element by element against the CPU: a kernel that writes
+                # zeros, or garbage that cancels in a sum, is caught.
+                x = torch.linspace(0, 6.28, 4096)
+                want = x.sin() * x.cos() + 1.5
+                xg = x.to(f"cuda:{i}")
+                got = (xg.sin() * xg.cos() + 1.5).cpu()
+                dev["kernel_ok"] = bool(torch.allclose(got, want, atol=1e-4))
+                if not dev["kernel_ok"]:
+                    worst = int((got - want).abs().argmax())
+                    dev["error"] = f"element {worst}: got {got[worst].item()}, expected {want[worst].item()}"
+            except Exception as e:  # noqa: BLE001
+                dev["error"] = f"{type(e).__name__}: {e}"
+        out["matmul_ok"] = bool(out["devices"]) and all(d.get("matmul_ok") for d in out["devices"])
     elif out["mps"]:
         a = torch.randn(64, 64, device="mps")
         out["matmul_ok"] = bool(torch.allclose((a @ torch.eye(64, device="mps")).cpu(), a.cpu(), atol=1e-4))
@@ -289,11 +336,15 @@ print(json.dumps(out))
             if info.get("matmul_ok"):
                 results.append(("ok", "torch", f"CUDA {info['cuda_built']} works on {info.get('device')}"
                                                f" (cuDNN {info.get('cudnn')}, NCCL {info.get('nccl') or 'n/a'})"))
-                # A tensor that moves is not enough: the wheel must carry
-                # kernels for this GPU's architecture, and the GPU enough memory.
-                results.extend(gpu_fit(info))
             else:
-                results.append(("ERR", "torch", f"CUDA matmul failed on {info.get('device')}: {info.get('error', 'wrong result')}"))
+                results.extend(("ERR", "torch", f"CUDA matmul failed on {gpu_label(d, info.get('devices'))}: "
+                                                f"{d.get('error') or 'wrong result'}")
+                               for d in info.get("devices") or [] if not d.get("matmul_ok"))
+                if not info.get("devices"):
+                    results.append(("ERR", "torch", f"no CUDA device could be probed: {info.get('error', 'unknown')}"))
+            # A tensor that moves is not enough: the wheel must carry kernels
+            # for each GPU's architecture, and the GPU enough memory.
+            results.extend(gpu_fit(info))
         else:
             level = "WARN" if ALLOW_MISSING_GPU else "ERR"
             results.append((level, "torch", f"built for CUDA {info['cuda_built']} but torch.cuda.is_available() is False"

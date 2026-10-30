@@ -449,8 +449,15 @@ pub fn remove_source(root: &Path, name: &str) -> Result<()> {
 
 /// `to` relative to the directory `from`, with forward slashes (`../x/y`).
 pub fn relative_path(from: &Path, to: &Path) -> String {
-    let from = std::path::absolute(from).unwrap_or_else(|_| from.to_path_buf());
-    let to = std::path::absolute(to).unwrap_or_else(|_| to.to_path_buf());
+    // Both sides resolved the same way, or a symlinked temp dir (macOS's
+    // `/var` → `/private/var`) makes two spellings of one tree look unrelated.
+    let settle = |p: &Path| {
+        fs::canonicalize(p)
+            .or_else(|_| std::path::absolute(p))
+            .unwrap_or_else(|_| p.to_path_buf())
+    };
+    let from = settle(from);
+    let to = settle(to);
     let mut base = from.clone();
     let mut up = 0;
     loop {
@@ -2050,6 +2057,19 @@ lint = ["ruff"]
         );
         assert_eq!(relative_path(Path::new("/a/b"), Path::new("/a/x")), "../x");
         assert_eq!(relative_path(Path::new("/a/b"), Path::new("/a/b")), ".");
+        #[cfg(unix)]
+        {
+            // One tree spelled two ways through a symlink is still one tree.
+            let real = tmp.0.join("real");
+            fs::create_dir_all(real.join("wheels")).unwrap();
+            fs::write(real.join("wheels").join("x.whl"), b"").unwrap();
+            let link = tmp.0.join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert_eq!(
+                relative_path(&real, &link.join("wheels").join("x.whl")),
+                "wheels/x.whl"
+            );
+        }
     }
 
     #[test]

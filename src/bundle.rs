@@ -679,10 +679,14 @@ fn static_checks(dir: &Path, from_archive: bool) -> Result<StaticReport> {
     }
 
     // 5. Launchers point into this venv (as packed, or as relocated).
-    let venv_paths = [
+    let mut venv_paths = vec![
         field("venv"),
         dir.join(".venv").to_string_lossy().into_owned(),
     ];
+    // The same directory may be spelled through a symlink (`/var` on macOS).
+    if let Ok(real) = fs::canonicalize(dir.join(".venv")) {
+        venv_paths.push(real.to_string_lossy().into_owned());
+    }
     if let Ok(entries) = fs::read_dir(&bin) {
         let mut entries: Vec<_> = entries.flatten().map(|e| e.path()).collect();
         entries.sort();
@@ -713,7 +717,12 @@ fn static_checks(dir: &Path, from_archive: bool) -> Result<StaticReport> {
                     && (interp.starts_with('/') || interp.contains(":\\"));
                 let own = venv_paths
                     .iter()
-                    .any(|v| !v.is_empty() && interp.starts_with(v.as_str()));
+                    .any(|v| !v.is_empty() && interp.starts_with(v.as_str()))
+                    || Path::new(interp)
+                        .parent()
+                        .and_then(|d| fs::canonicalize(d).ok())
+                        .zip(fs::canonicalize(dir.join(".venv")).ok())
+                        .is_some_and(|(i, v)| i.starts_with(v));
                 if is_python && !own {
                     err(
                         &name,

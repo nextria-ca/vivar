@@ -89,7 +89,10 @@ mod tests {
 
     /// Runs `gpu_fit` on a probe result and returns the `(level, detail)` lines.
     fn fit(python: &str, probe: &str, min_vram: Option<&str>) -> Vec<(String, String)> {
-        let functions = SCRIPT.split("\n\nmain()").next().unwrap();
+        // A CRLF checkout (Windows) must not hide the `main()` marker, or
+        // the whole report would run instead of the one function.
+        let script = SCRIPT.replace("\r\n", "\n");
+        let functions = script.split("\n\nmain()").next().unwrap();
         let program = format!(
             "{functions}\nimport json\nfor level, _, detail in gpu_fit(json.loads({probe:?})):\n    print(level + '\\t' + detail)\n"
         );

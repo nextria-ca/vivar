@@ -14,9 +14,14 @@ pub struct Dist {
 
 /// Reads `*.dist-info/METADATA` in the environment's site-packages.
 pub fn inventory(venv: &Path) -> Result<Vec<Dist>> {
-    let site = crate::venv::site_packages(venv)?;
+    inventory_site(&crate::venv::site_packages(venv)?)
+}
+
+/// `inventory` for a site-packages directory named outright (a bundle laid
+/// out for another platform has it where that platform keeps it).
+pub fn inventory_site(site: &Path) -> Result<Vec<Dist>> {
     let mut dists = Vec::new();
-    for entry in fs::read_dir(&site)?.flatten() {
+    for entry in fs::read_dir(site)?.flatten() {
         let path = entry.path();
         let Some(dir) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -169,10 +174,15 @@ pub fn violations<'a>(dists: &'a [Dist], allow: &[String], exceptions: &[String]
 }
 
 pub fn check(venv: &Path, allow: Option<&[String]>, exceptions: &[String]) -> Result<()> {
+    check_site(&crate::venv::site_packages(venv)?, allow, exceptions)
+}
+
+/// `check` for a site-packages directory named outright.
+pub fn check_site(site: &Path, allow: Option<&[String]>, exceptions: &[String]) -> Result<()> {
     let Some(allow) = allow else {
         return Ok(());
     };
-    let dists = inventory(venv)?;
+    let dists = inventory_site(site)?;
     let bad = violations(&dists, allow, exceptions);
     if bad.is_empty() {
         return Ok(());

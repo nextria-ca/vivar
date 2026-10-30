@@ -1585,7 +1585,7 @@ impl Backend for NativeBackend {
         let registry: Vec<&Package> = wanted
             .iter()
             .copied()
-            .filter(|p| p.source_kind == "registry")
+            .filter(|p| matches!(p.source_kind.as_str(), "registry" | "url" | "git"))
             .collect();
         let (installed, _) = self.with_source(None, |source| {
             apply(project.venv_root(), &registry, &layout, &t, source)

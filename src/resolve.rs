@@ -189,10 +189,16 @@ impl Lockable {
         // A release seen from several sides may list different dependencies
         // (another platform's wheel): an edge one side lacks is scoped to the
         // sides that have it.
+        // An `extra == 'x'` clause stays at the top level, where the lock
+        // writer looks for it.
         let scope = |r: &Requirement, side: &str| -> Requirement {
             let mut r = r.clone();
             r.marker = Some(match &r.marker {
-                Some(m) => format!("({m}) and ({side})"),
+                Some(m) => match split_extra(m) {
+                    (Some(e), Some(rest)) => format!("extra == '{e}' and ({rest}) and ({side})"),
+                    (Some(e), None) => format!("extra == '{e}' and ({side})"),
+                    (None, _) => format!("({m}) and ({side})"),
+                },
                 None => side.to_owned(),
             });
             r
@@ -428,22 +434,6 @@ fn balanced(s: &str) -> bool {
         }
     }
     depth == 0
-}
-
-/// Whether a marker holds on at least one of the platforms vivar targets,
-/// sampled at the first patch of each minor from 3.8 to 3.14.
-fn marker_holds_somewhere(marker: &str) -> bool {
-    for os in ["linux", "macos", "windows"] {
-        for arch in ["x86_64", "aarch64"] {
-            for minor in 8..=14 {
-                let env = MarkerEnv::for_target(os, arch, [3, minor, 0]);
-                if eval_marker(marker, &env).unwrap_or(true) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
 }
 
 /// Splits on `sep` outside parentheses and quotes.
@@ -1057,10 +1047,15 @@ impl<'a> Resolver<'a> {
         let all = self.all_envs();
         let all_reqs = roots.all_reqs();
         // A root's own requirement on a member is fixed on both ends: nothing
-        // to backtrack over, so it is checked before anything is searched.
+        // to backtrack over, so it is checked before anything is searched,
+        // where it applies at all.
         for (from, r) in &all_reqs {
             if let Some(v) = locals.get(&r.name) {
-                if !r.specifier.matches_allowing_pre(v) {
+                let applies = self
+                    .where_holds(r.marker.as_deref(), &Extras::new(), &all)
+                    .map(|e| !e.is_empty())
+                    .unwrap_or(true);
+                if applies && !r.specifier.matches_allowing_pre(v) {
                     bail!(
                         "{from} requires {} {}, but the workspace member is at version {v}",
                         r.name,
@@ -1391,7 +1386,9 @@ impl<'a> Resolver<'a> {
             .filter(|d| d.url.is_none() && !self.routes.iter().any(|(n, _)| *n == d.name))
             .map(|d| d.name.clone())
             .collect();
-        if !ahead.is_empty() {
+        // Only when the main index is the one these names would come from: with
+        // other indexes ahead of it, a private name must never reach it early.
+        if !ahead.is_empty() && self.defaults.is_empty() {
             let series = self.envs[0].0.python_version.clone();
             self.index.prefetch(&ahead, &series);
         }
@@ -1647,14 +1644,18 @@ pub fn write_lock(roots: &Roots, lock: &Lockable) -> String {
                         .join(" or ")
                 };
                 let marker = match &r.marker {
-                    Some(m) if *m == side => side,
+                    Some(m) if *m == side => side.clone(),
                     Some(m) => format!("({m}) and ({side})"),
-                    None => side,
+                    None => side.clone(),
                 };
-                // An edge whose own marker and the variant's side never meet
-                // is not written: `plan` would never follow it anyway.
-                if !marker_holds_somewhere(&marker) {
-                    return None;
+                // An edge is left out only when its own marker is exactly the
+                // negation of the variant's side; anything less certain stays.
+                if let Some(m) = &r.marker {
+                    let opposite = negate_marker(m).ok().as_deref() == Some(side.as_str())
+                        || negate_marker(&side).ok().as_deref() == Some(m.as_str());
+                    if opposite {
+                        return None;
+                    }
                 }
                 let mut t = InlineTable::new();
                 t.insert("name", r.name.as_str().into());

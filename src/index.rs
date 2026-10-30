@@ -76,6 +76,23 @@ fn listing_ttl() -> u64 {
         .unwrap_or(600)
 }
 
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A temporary name no other writer in this process shares.
+fn tmp_name(stem: &str) -> String {
+    format!(
+        "{stem}.{}-{}.tmp",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// Prefetch work shared by every call: one bounded pool for the process.
+type PrefetchJob = (String, String, String, Option<crate::wheelhouse::Target>);
+static PREFETCH_QUEUE: std::sync::Mutex<Vec<PrefetchJob>> = std::sync::Mutex::new(Vec::new());
+static PREFETCH_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const PREFETCH_PARALLELISM: usize = 8;
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -99,7 +116,7 @@ fn fetch_listing_to_cache(base: &str, authed_page: &str, name: &str) -> Result<S
     };
     if listing_ttl() > 0 {
         let _ = fs::create_dir_all(&cache);
-        let tmp = cache.join(format!("{name}.listing.{}.tmp", std::process::id()));
+        let tmp = cache.join(tmp_name(&format!("{name}.listing")));
         if fs::write(&tmp, format!("{}\n{text}", unix_now())).is_ok() {
             let _ = fs::rename(&tmp, &path);
         }
@@ -170,7 +187,9 @@ fn prefetch_one(
     if let Ok(body) = upgrade::fetch(&url, None) {
         let text = String::from_utf8_lossy(&body);
         if text.starts_with("Metadata-Version:") {
-            let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+            let tmp = path.with_file_name(tmp_name(
+                &path.file_name().unwrap_or_default().to_string_lossy(),
+            ));
             if fs::write(&tmp, text.as_bytes()).is_ok() {
                 let _ = fs::rename(&tmp, &path);
             }
@@ -263,15 +282,31 @@ impl Index {
             })
             .collect();
         let target = crate::wheelhouse::Target::new(None, series).ok();
-        let jobs = std::sync::Arc::new(std::sync::Mutex::new(jobs));
-        for _ in 0..8 {
-            let jobs = std::sync::Arc::clone(&jobs);
-            let base = base.clone();
-            let target = target.clone();
+        let queued = jobs.len();
+        if let Ok(mut q) = PREFETCH_QUEUE.lock() {
+            for (name, page) in jobs {
+                q.push((base.clone(), name, page, target.clone()));
+            }
+        }
+        // Workers are shared across calls: at most eight in the process, each
+        // draining the queue until it is empty.
+        use std::sync::atomic::Ordering;
+        for _ in 0..queued {
+            let active = PREFETCH_WORKERS.load(Ordering::SeqCst);
+            if active >= PREFETCH_PARALLELISM
+                || PREFETCH_WORKERS
+                    .compare_exchange(active, active + 1, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+            {
+                break;
+            }
             std::thread::spawn(move || {
-                while let Some((name, page)) = jobs.lock().ok().and_then(|mut j| j.pop()) {
+                while let Some((base, name, page, target)) =
+                    PREFETCH_QUEUE.lock().ok().and_then(|mut q| q.pop())
+                {
                     prefetch_one(&base, &name, &page, target.as_ref());
                 }
+                PREFETCH_WORKERS.fetch_sub(1, Ordering::SeqCst);
             });
         }
     }
@@ -349,7 +384,7 @@ impl Index {
                     // Written whole, then renamed: a full disk or a concurrent
                     // refresh never leaves a half entry behind a valid stamp.
                     let _ = fs::create_dir_all(&cache);
-                    let tmp = cache.join(format!("{name}.listing.{}.tmp", std::process::id()));
+                    let tmp = cache.join(tmp_name(&format!("{name}.listing")));
                     if fs::write(&tmp, format!("{now}\n{text}")).is_ok() {
                         let _ = fs::rename(&tmp, &path);
                     }

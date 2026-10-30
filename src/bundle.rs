@@ -613,17 +613,19 @@ fn build_for_target(
     }
     #[cfg(unix)]
     if !windows {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::symlink;
         symlink(format!("{fake_home}/python{mm}"), bin.join("python"))?;
         symlink("python", bin.join("python3"))?;
         symlink("python", bin.join(format!("python{mm}")))?;
         if os == "linux" {
             symlink("lib", venv_dir.join("lib64"))?;
         }
-        // uv's --target writes console scripts under site-packages/bin with a
-        // host shebang; they belong in the venv's bin, pointing at its python.
+    }
+    {
         // Wheel data that belongs beside site-packages, not inside it. RECORD
         // files follow, so metadata lookups and uninstalls still find it.
+        // site-packages sits two levels below the venv on Windows, three elsewhere.
+        let up = if windows { "../../" } else { "../../../" };
         let mut moved = Vec::new();
         for dir in ["share", "include", "etc"] {
             let from = site.join(dir);
@@ -645,19 +647,24 @@ fn build_for_target(
                 };
                 let rewritten: String = text
                     .lines()
-                    .map(|line| {
-                        // site-packages is three levels below the venv root.
-                        match moved.iter().find(|d| line.starts_with(&format!("{d}/"))) {
-                            Some(_) => format!("../../../{line}\n"),
+                    .map(
+                        |line| match moved.iter().find(|d| line.starts_with(&format!("{d}/"))) {
+                            Some(_) => format!("{up}{line}\n"),
                             None => format!("{line}\n"),
-                        }
-                    })
+                        },
+                    )
                     .collect();
                 if rewritten != text {
                     fs::write(&record, rewritten)?;
                 }
             }
         }
+    }
+    #[cfg(unix)]
+    if !windows {
+        use std::os::unix::fs::PermissionsExt;
+        // uv's --target writes console scripts under site-packages/bin with a
+        // host shebang; they belong in the venv's bin, pointing at its python.
         if let Ok(entries) = fs::read_dir(site.join("bin")) {
             for entry in entries.flatten() {
                 let dest = bin.join(entry.file_name());
@@ -701,8 +708,8 @@ fn build_for_target(
     crate::venv::write_activate_scripts(&bin, &fake_venv, name, bin_name, windows)?;
     crate::venv::mark_profile(stage, profile);
     // The same license policy a local sync enforces, on what was actually staged.
-    crate::licenses::check(
-        &venv_dir,
+    crate::licenses::check_site(
+        &site,
         policy.allow_licenses.as_deref(),
         &policy.license_exceptions,
     )?;

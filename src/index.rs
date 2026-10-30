@@ -289,24 +289,39 @@ impl Index {
             }
         }
         // Workers are shared across calls: at most eight in the process, each
-        // draining the queue until it is empty.
+        // draining the queue until it is empty. A worker retires under the
+        // queue lock, so a job pushed under that lock is either seen by it or
+        // counted against a spawn here; a lost compare-exchange is retried.
         use std::sync::atomic::Ordering;
-        for _ in 0..queued {
+        let mut spawned = 0;
+        while spawned < queued {
             let active = PREFETCH_WORKERS.load(Ordering::SeqCst);
-            if active >= PREFETCH_PARALLELISM
-                || PREFETCH_WORKERS
-                    .compare_exchange(active, active + 1, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_err()
-            {
+            if active >= PREFETCH_PARALLELISM {
                 break;
             }
-            std::thread::spawn(move || {
-                while let Some((base, name, page, target)) =
-                    PREFETCH_QUEUE.lock().ok().and_then(|mut q| q.pop())
-                {
-                    prefetch_one(&base, &name, &page, target.as_ref());
-                }
-                PREFETCH_WORKERS.fetch_sub(1, Ordering::SeqCst);
+            if PREFETCH_WORKERS
+                .compare_exchange(active, active + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                continue;
+            }
+            spawned += 1;
+            std::thread::spawn(move || loop {
+                let job = match PREFETCH_QUEUE.lock() {
+                    Ok(mut q) => match q.pop() {
+                        Some(j) => j,
+                        None => {
+                            PREFETCH_WORKERS.fetch_sub(1, Ordering::SeqCst);
+                            return;
+                        }
+                    },
+                    Err(_) => {
+                        PREFETCH_WORKERS.fetch_sub(1, Ordering::SeqCst);
+                        return;
+                    }
+                };
+                let (base, name, page, target) = job;
+                prefetch_one(&base, &name, &page, target.as_ref());
             });
         }
     }

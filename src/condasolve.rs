@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Solving conda match specs against a channel: newest first, one build per
 //! package, chronological backtracking. Virtual packages describe the
 //! machine; `constrains` entries bound packages that happen to be present.
@@ -56,6 +55,9 @@ pub struct Solver<'a> {
     prefer: BTreeMap<String, (String, String)>,
     upgrade_all: bool,
     cache: BTreeMap<String, Vec<Record>>,
+    /// The first dead end met: the explanation when nothing else works out
+    /// either (a missing virtual package, a name no channel has).
+    first_dead_end: Option<String>,
 }
 
 impl<'a> Solver<'a> {
@@ -66,6 +68,7 @@ impl<'a> Solver<'a> {
             prefer: BTreeMap::new(),
             upgrade_all: false,
             cache: BTreeMap::new(),
+            first_dead_end: None,
         }
     }
 
@@ -176,10 +179,14 @@ impl<'a> Solver<'a> {
             }
             let candidates = self.acceptable(&state, &spec.name)?;
             if candidates.is_empty() {
-                // Nothing of that name at all: no other choice would help.
-                if frames.is_empty() || self.all_candidates(&spec.name)?.is_empty() {
-                    bail!("{}", self.explain(&state, &spec.name, &from, &spec)?);
+                // Another build of whatever asked may not need this (a
+                // noarch package with per-platform builds); the first dead
+                // end is what gets reported if nothing works out.
+                let why = self.explain(&state, &spec.name, &from, &spec)?;
+                if frames.is_empty() {
+                    bail!("{why}");
                 }
+                self.first_dead_end.get_or_insert(why);
                 state = self.backtrack(&mut frames, &spec.name, &from, &spec)?;
                 continue;
             }
@@ -221,6 +228,9 @@ impl<'a> Solver<'a> {
     ) -> Result<State> {
         loop {
             let Some(frame) = frames.last_mut() else {
+                if let Some(why) = self.first_dead_end.take() {
+                    bail!("{why}");
+                }
                 bail!("no build of {culprit} satisfies every requirement; {from} needs `{spec}`");
             };
             if frame.next >= frame.candidates.len() {
@@ -363,6 +373,11 @@ mod tests {
             ),
             rec("old", "1.0", "0", 0, &["python 3.12.*"]),
             rec("needs-cuda", "1.0", "0", 0, &["__cuda >=12"]),
+            // Per-platform builds of one noarch package: the newest wants
+            // Windows, the next fits here.
+            rec("ca-certificates", "2026.10", "h4c7d964_0", 1, &["__win"]),
+            rec("ca-certificates", "2026.10", "hbd8a1cb_0", 0, &["__unix"]),
+            rec("certs-user", "1.0", "0", 0, &["ca-certificates"]),
         ]);
         // Newest python, highest build number; numpy 2.1 wants an old libz
         // that python refuses, so numpy steps back to 2.0.
@@ -383,6 +398,18 @@ mod tests {
                 "old=1.0=0",
                 "python=3.12.7=h1_0"
             ]
+        );
+        let virtuals = vec![virtual_record("__unix", "0", "0", "linux-64")];
+        let roots = vec![MatchSpec::parse("certs-user").unwrap()];
+        let certs: Vec<String> = Solver::new(&provider, virtuals)
+            .solve(&roots)
+            .unwrap()
+            .iter()
+            .map(|r| format!("{}={}", r.name, r.build))
+            .collect();
+        assert!(
+            certs.contains(&"ca-certificates=hbd8a1cb_0".to_owned()),
+            "{certs:?}"
         );
         let err = solve(&provider, &["needs-cuda"]).unwrap_err().to_string();
         assert!(

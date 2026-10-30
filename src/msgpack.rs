@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! A MessagePack reader, for conda's sharded repodata (CEP 16): every
 //! format in the spec, extensions skipped.
 

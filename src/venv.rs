@@ -119,6 +119,11 @@ pub fn ensure(root: &Path, prompt: &str) -> Result<()> {
     if venv.join("pyvenv.cfg").exists() {
         return Ok(());
     }
+    // A project with native dependencies gets its Python from the native
+    // sync, which builds the prefix itself.
+    if crate::project::Project::load(root).is_ok_and(|p| crate::nativedeps::declared(&p)) {
+        return Ok(());
+    }
     let pin = fs::read_to_string(root.join(".python-version"))
         .ok()
         .map(|s| s.trim().to_owned())

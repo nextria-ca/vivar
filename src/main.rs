@@ -2,6 +2,7 @@ mod audit;
 mod backend;
 mod bundle;
 mod condaindex;
+mod condalink;
 mod condasolve;
 mod condaspec;
 mod dirs;
@@ -20,6 +21,7 @@ mod lock;
 mod man;
 mod msgpack;
 mod native;
+mod nativedeps;
 mod pep;
 mod project;
 mod publish;
@@ -103,6 +105,10 @@ for whatever this machine's driver supports."
         /// Install a local project directory editable
         #[arg(short, long)]
         editable: bool,
+        /// Native (conda-forge) packages: `gdal`, `cuda-toolkit 12.*`; the environment
+        /// becomes a conda prefix with its own Python, PyPI packages install into it
+        #[arg(long)]
+        native: bool,
         /// PyTorch build for torch/torchvision/torchaudio: a CUDA version (12.4),
         /// `cpu`, `rocm6.2`, `auto` (match this machine's GPU; the default) or `none` (PyPI as is)
         #[arg(long)]
@@ -164,6 +170,9 @@ environment. Exit status is non-zero on any failure; --json prints the findings.
     Remove {
         #[arg(required = true)]
         packages: Vec<String>,
+        /// Native (conda-forge) packages declared with `add --native`
+        #[arg(long)]
+        native: bool,
     },
     /// Resolve dependencies and write the lockfile
     Lock,
@@ -528,7 +537,7 @@ fn main() -> Result<()> {
         Some(p) => p.policy()?,
         None => project::org_policy()?.map(|(_, p)| p).unwrap_or_default(),
     };
-    let backend = backend_for(&policy);
+    let backend = backend_for(&policy, project.as_ref());
 
     match cli.command {
         Command::Init {
@@ -588,10 +597,30 @@ fn main() -> Result<()> {
             packages,
             group,
             editable,
+            native,
             cuda,
         } => {
             let project = require(project, &cwd)?;
             project.check_requirements(&packages)?;
+            if native {
+                let names: Vec<String> = packages
+                    .iter()
+                    .map(|p| p.split_whitespace().next().unwrap_or(p).to_owned())
+                    .collect();
+                project.check_requirements(&names)?;
+                for c in project.channels() {
+                    policy.check_channel(&c)?;
+                }
+                transact(&project, &*backend, &cwd, None, || {
+                    project::add_native(&project.root, &packages)?;
+                    let backend = NativeBackend::new(&policy);
+                    backend.lock(&cwd)?;
+                    backend.sync(&cwd)?;
+                    venv::mark_synced(project.venv_root());
+                    after_install(&project, &policy)
+                })?;
+                return Ok(());
+            }
             venv::ensure(project.venv_root(), &project.name())?;
             transact(&project, &*backend, &cwd, group.as_deref(), || {
                 route_pytorch(&project, &packages, cuda.as_deref())?;
@@ -600,8 +629,22 @@ fn main() -> Result<()> {
                 after_install(&project, &policy)
             })?;
         }
-        Command::Remove { packages } => {
+        Command::Remove { packages, native } => {
             let project = require(project, &cwd)?;
+            if native {
+                let missing = project::remove_native(&project.root, &packages)?;
+                if !missing.is_empty() {
+                    bail!(
+                        "not declared as native dependencies: {}",
+                        missing.join(", ")
+                    );
+                }
+                let backend = NativeBackend::new(&policy);
+                backend.lock(&cwd)?;
+                backend.sync(&cwd)?;
+                venv::mark_synced(project.venv_root());
+                return Ok(());
+            }
             venv::ensure(project.venv_root(), &project.name())?;
             transact(&project, &*backend, &cwd, None, || {
                 backend.remove(&cwd, &packages)
@@ -631,7 +674,7 @@ fn main() -> Result<()> {
                 }
             };
             let policy = project.policy()?;
-            let backend = backend_for(&policy);
+            let backend = backend_for(&policy, Some(&project));
             let all: Vec<String> = imported
                 .requirements
                 .iter()
@@ -1961,11 +2004,13 @@ fn split_command(task: &str) -> Vec<String> {
 
 /// uv when it is on PATH (resolution needs it), vivar's own installer
 /// otherwise; `VIVAR_BACKEND=native` forces the latter.
-fn backend_for(policy: &project::Policy) -> Box<dyn Backend> {
+fn backend_for(policy: &project::Policy, project: Option<&Project>) -> Box<dyn Backend> {
     let forced = std::env::var("VIVAR_BACKEND")
         .map(|v| v == "native")
         .unwrap_or(false);
-    if !forced && backend::uv_available() {
+    // A native (conda) prefix is vivar's own: uv does not know it.
+    let native_deps = project.is_some_and(nativedeps::declared);
+    if !forced && !native_deps && backend::uv_available() {
         Box::new(UvBackend::new(policy))
     } else {
         Box::new(NativeBackend::new(policy))

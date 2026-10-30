@@ -4,14 +4,15 @@ Fast, license-safe Python environment manager. One tool for Python versions,
 virtual environments, dependencies, locking, and running, with **policy built in**
 (package deny list, internal mirror, and a hard default of license-safe sources).
 
-See [DESIGN.md](DESIGN.md) for the why and the roadmap, and
-[python_env_managers.md](python_env_managers.md) for the survey of existing tools it draws on.
+See [python_env_managers.md](python_env_managers.md) for the survey of existing tools it
+draws on.
 
 ## Status
 
-**Usable today, pre-1.0.** Phases 0, 3 and 4 of the [design](DESIGN.md) are implemented,
-tested on Linux, macOS and Windows in CI (112 tests), and reviewed. No release has been
-tagged yet; see Install for how to get it in the meantime.
+**Usable today, pre-1.0.** Every planned phase is implemented (projects, policy, polish,
+the uv-free core, and native dependencies from conda-forge), tested on Linux, macOS and
+Windows in CI (127 tests), and reviewed. No release has been tagged yet; see Install for
+how to get it in the meantime.
 
 What works:
 
@@ -30,6 +31,12 @@ What works:
   downloads, shell completions, `doctor`.
 - **Coming from elsewhere**: `import` for requirements.txt, conda environments, Pipfiles
   and poetry projects; `check` for CI; SBOM export; delta and signed bundles.
+- **Native dependencies**: `add --native gdal "cuda-toolkit 12.*"` solves conda-forge
+  packages (and the Python itself) into `vivar-native.lock`, links them into `.venv` as a
+  conda prefix that still works as a venv, and installs the PyPI packages into it. No
+  conda, no rattler: vivar reads the sharded repodata, decompresses zstd, solves and
+  links on its own. Anaconda's commercial channels are refused unless policy says
+  otherwise.
 
 How it is built: everything is vivar's own code, with no runtime dependencies beyond
 the OS. That includes the wheel installer, the index client, the dependency resolver,
@@ -49,8 +56,7 @@ lock), git (`rev`, `tag` or `branch`, with `subdirectory`), a URL, a local wheel
 (`cpu` / `cu124` / `rocm6.2`) over dependency groups or extras, forks and workspaces
 combine in one lock, and `vivar add ./dist/x.whl` or `vivar add -e ../lib` writes the
 `path` source the way uv does. Nothing in the day-to-day flow needs uv, and CI runs the
-whole suite on both backends. Not yet: native (conda-forge) dependencies, and
-model-weight management (out of scope by decision).
+whole suite on both backends. Out of scope by decision: model-weight management.
 
 ## Install
 
@@ -198,6 +204,8 @@ vivar profile add cu124 torch torchvision   # a machine variant; `profile add cp
 vivar sync --profile auto       # install the profile that fits this machine's GPU
 vivar sync --extra viz          # also install an extra of the project (profiles can be extras too)
 vivar add ./dist/x.whl ../lib   # local wheels, archives and project dirs become `path` sources (-e: editable)
+vivar add --native gdal "cuda-toolkit 12.*"   # conda-forge packages; .venv becomes a conda prefix with its own Python
+vivar remove --native gdal
 vivar pack --target linux-x86_64 --python 3.12   # a bundle for another machine, built here
 vivar pack --zstd --use-host-cuda               # faster compression; leave CUDA libs to the target
 vivar kernel install            # register .venv as a Jupyter kernel (needs ipykernel)
@@ -324,6 +332,39 @@ network, only `tar` and the same OS and CPU architecture (`unpack` refuses a
 mismatch). It uses `tar.gz` rather than `.zip` because zip drops the symlinks
 and executable bits a venv relies on.
 
+## Native dependencies (conda-forge)
+
+```sh
+vivar add --native gdal ffmpeg "cuda-toolkit 12.*"
+vivar add rasterio                 # PyPI packages go into the same environment
+vivar run python -c "from osgeo import gdal"
+```
+
+`[tool.vivar] native-dependencies` holds the conda match specs; `vivar lock` solves them
+(plus `python` at the project's pinned series) against the channels in
+`[tool.vivar] channels` (conda-forge by default) for every platform in
+`[tool.vivar] platforms` (this machine by default) and writes `vivar-native.lock` beside
+`uv.lock`. `vivar sync` then links the packages into `.venv`, which becomes a conda prefix
+with its own Python: `conda-meta/` records every package, `pyvenv.cfg` and the activate
+scripts make it a venv as far as `run`, IDEs and the PyPI installer are concerned, and
+Python packages the native solve brings (numpy from conda-forge, say) satisfy the PyPI
+requirements without a second copy. A project with native dependencies always uses
+vivar's own resolver and installer; `pack` and `unpack` carry the prefix whole and rewrite
+its embedded paths (text and binary) on the other machine; `licenses`, `check` and
+`export sbom` cover the native packages too (`pkg:conda/…` purls).
+
+Channels are named (`conda-forge`) or given as URLs; `conda-url` in policy points names at
+an internal mirror (Artifactory, Nexus, prefix.dev). Anaconda's `defaults`/`main` and
+`repo.anaconda.com` are refused unless policy sets `allow-anaconda-defaults = true`;
+`blocked-channels` adds more. The deny list and the license allowlist apply to native
+packages as they do to PyPI ones. Repodata comes in shards (one per package, cached
+under `~/.cache/vivar/conda`, `VIVAR_CONDA_TTL` for the index), with the whole
+`repodata.json` as the fallback for mirrors without shards. `CONDA_OVERRIDE_GLIBC`,
+`CONDA_OVERRIDE_CUDA` and friends set the virtual packages for another machine.
+
+Not yet: `pack --target` of a native environment (pack it where it is synced), and
+`.tar.bz2`-only packages (every current conda-forge build ships as `.conda`).
+
 ## Verifying an environment works on this machine
 
 ```sh
@@ -427,6 +468,8 @@ Layout:
 - `src/backend.rs`: the `Backend` trait and the phase 0 `UvBackend`.
 - `src/native.rs`, `src/resolve.rs`, `src/install.rs`, `src/index.rs`, `src/pep.rs`, `src/zip.rs`: the uv-free backend.
 - `src/publish.rs`: `publish`, the legacy upload API through curl.
+- `src/nativedeps.rs`, `src/condaindex.rs`, `src/condasolve.rs`, `src/condalink.rs`, `src/condaspec.rs`,
+  `src/zstd.rs`, `src/msgpack.rs`, `src/tar.rs`: native dependencies from conda channels.
 - `src/bundle.rs`: `pack`/`unpack` portable bundles (shells out to `tar`).
 - `src/verify.rs` + `src/verify.py`: `verify`, a Python driver run by the env's own interpreter.
 - `tests/cli.rs`: end-to-end tests against the built binary.

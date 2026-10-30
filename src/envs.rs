@@ -97,6 +97,15 @@ pub fn clean(tools: bool) -> Result<()> {
             );
         }
     }
+    let conda = dirs::cache()?.join("conda");
+    if conda.exists() {
+        let size = size_of(&conda);
+        fs::remove_dir_all(&conda)?;
+        println!(
+            "removed the conda package and repodata cache ({})",
+            mb(size)
+        );
+    }
     if let Ok(status) = std::process::Command::new("uv")
         .args(["cache", "clean", "--quiet"])
         .status()

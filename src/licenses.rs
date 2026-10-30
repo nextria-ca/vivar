@@ -12,9 +12,27 @@ pub struct Dist {
     pub license: String,
 }
 
-/// Reads `*.dist-info/METADATA` in the environment's site-packages.
+/// Reads `*.dist-info/METADATA` in the environment's site-packages, and the
+/// native packages a conda prefix records (those without a dist-info).
 pub fn inventory(venv: &Path) -> Result<Vec<Dist>> {
-    inventory_site(&crate::venv::site_packages(venv)?)
+    let mut dists = inventory_site(&crate::venv::site_packages(venv)?)?;
+    if crate::nativedeps::is_prefix(venv) {
+        let known: std::collections::BTreeSet<String> = dists
+            .iter()
+            .map(|d| crate::project::normalize(&d.name))
+            .collect();
+        for l in crate::condalink::installed(venv)? {
+            if !known.contains(&crate::project::normalize(&l.name)) {
+                dists.push(Dist {
+                    name: l.name,
+                    version: l.version,
+                    license: l.license.unwrap_or_default(),
+                });
+            }
+        }
+        dists.sort_by_key(|d| d.name.to_lowercase());
+    }
+    Ok(dists)
 }
 
 /// `inventory` for a site-packages directory named outright (a bundle laid

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! conda channels: the sharded repodata (CEP 16) every modern channel and
 //! mirror serves, cached per package shard, with the whole `repodata.json`
 //! as the fallback; and this machine's virtual packages (`__glibc`,

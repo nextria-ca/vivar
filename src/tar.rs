@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! A tar reader (ustar, pax extended headers, GNU long names) over bytes
 //! held in memory, for the archives inside `.conda` packages.
 

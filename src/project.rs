@@ -345,6 +345,73 @@ pub fn add_path_source(root: &Path, name: &str, rel: &str, editable: bool) -> Re
     fs::write(&path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
 }
 
+/// Declares native (conda) dependencies: `name` or `name <spec>` each, into
+/// `[tool.vivar] native-dependencies`, replacing earlier entries by name.
+pub fn add_native(root: &Path, specs: &[String]) -> Result<()> {
+    let path = root.join(PYPROJECT);
+    let mut doc: DocumentMut = fs::read_to_string(&path)?.parse()?;
+    let tool = top_table(&mut doc, "tool")?;
+    let vivar = child_table(tool, "vivar")?;
+    let table = child_table(vivar, "native-dependencies")?;
+    for spec in specs {
+        let (name, version) = spec
+            .trim()
+            .split_once(char::is_whitespace)
+            .map(|(n, v)| (n, v.trim()))
+            .unwrap_or((spec.trim(), "*"));
+        // `name=1.2` and `name==1.2` forms spell the version after the name.
+        let (name, version) = match name.split_once('=') {
+            Some((n, v)) if version == "*" && !v.is_empty() => (n, v.trim_start_matches('=')),
+            _ => (name, version),
+        };
+        let name = name.to_lowercase();
+        let version = if version.is_empty() { "*" } else { version };
+        let valid = !name.is_empty()
+            && !name.starts_with('_')
+            && crate::condaspec::MatchSpec::parse(&format!("{name} {version}")).is_ok();
+        if !valid {
+            bail!(
+                "{spec:?} is not a conda package spec (name, or name followed by a version spec)"
+            );
+        }
+        table[&name] = value(version);
+    }
+    fs::write(&path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Drops native dependencies by name. Returns the names that were not declared.
+pub fn remove_native(root: &Path, names: &[String]) -> Result<Vec<String>> {
+    let path = root.join(PYPROJECT);
+    let mut doc: DocumentMut = fs::read_to_string(&path)?.parse()?;
+    let mut missing = Vec::new();
+    let table = doc
+        .get_mut("tool")
+        .and_then(Item::as_table_like_mut)
+        .and_then(|t| t.get_mut("vivar"))
+        .and_then(Item::as_table_like_mut)
+        .and_then(|v| v.get_mut("native-dependencies"))
+        .and_then(Item::as_table_like_mut);
+    match table {
+        Some(table) => {
+            for n in names {
+                let key = table
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(n))
+                    .map(|(k, _)| k.to_owned());
+                match key {
+                    Some(k) => {
+                        table.remove(&k);
+                    }
+                    None => missing.push(n.clone()),
+                }
+            }
+        }
+        None => missing.extend(names.iter().cloned()),
+    }
+    fs::write(&path, doc.to_string()).with_context(|| format!("writing {}", path.display()))?;
+    Ok(missing)
+}
+
 /// Drops the `[tool.uv.sources]` entry for `name`, if any.
 pub fn remove_source(root: &Path, name: &str) -> Result<()> {
     let path = root.join(PYPROJECT);
@@ -536,6 +603,15 @@ pub struct Policy {
     pub require_signed_bundles: bool,
     /// Hex Ed25519 public keys whose bundle signatures `unpack` accepts.
     pub trusted_keys: Vec<String>,
+    /// conda channels (names or URLs) that native dependencies may not come
+    /// from. Anaconda's `defaults` (and `repo.anaconda.com`) are always
+    /// blocked unless `allow-anaconda-defaults` says otherwise.
+    pub blocked_channels: Vec<String>,
+    /// Lifts the block on Anaconda's commercial channels (a license is needed).
+    pub allow_anaconda_defaults: Option<bool>,
+    /// Where channels named by name live: an internal mirror, else
+    /// `https://conda.anaconda.org`.
+    pub conda_url: Option<String>,
 }
 
 impl Policy {
@@ -637,6 +713,14 @@ impl Policy {
                 .and_then(Item::as_bool)
                 .unwrap_or(false),
             trusted_keys: list("trusted-keys"),
+            blocked_channels: list("blocked-channels"),
+            allow_anaconda_defaults: table
+                .and_then(|p| p.get("allow-anaconda-defaults"))
+                .and_then(Item::as_bool),
+            conda_url: table
+                .and_then(|p| p.get("conda-url"))
+                .and_then(Item::as_str)
+                .map(|s| s.trim_end_matches('/').to_owned()),
         }
     }
 
@@ -670,7 +754,55 @@ impl Policy {
                 self.trusted_keys.push(k);
             }
         }
+        for c in org.blocked_channels {
+            if !self.blocked_channels.contains(&c) {
+                self.blocked_channels.push(c);
+            }
+        }
+        // The org's word on Anaconda's channels is final when it gives one.
+        self.allow_anaconda_defaults = org.allow_anaconda_defaults.or(self.allow_anaconda_defaults);
+        self.conda_url = self.conda_url.or(org.conda_url);
         self
+    }
+
+    /// Whether native dependencies may come from `channel` (a name or URL):
+    /// Anaconda's commercial channels and `blocked-channels` are refused.
+    pub fn check_channel(&self, channel: &str) -> Result<()> {
+        let name = channel.trim_end_matches('/');
+        let short = name.rsplit('/').next().unwrap_or(name).to_lowercase();
+        let anaconda = matches!(
+            short.as_str(),
+            "defaults" | "main" | "anaconda" | "r" | "msys2" | "pro"
+        ) || name.contains("repo.anaconda.com")
+            || name.contains("repo.continuum.io");
+        if anaconda && !self.allow_anaconda_defaults.unwrap_or(false) {
+            bail!(
+                "channel {channel:?} is Anaconda's commercial repository, which needs a paid license at Nextria's size; use conda-forge, or set `allow-anaconda-defaults = true` in policy knowingly"
+            );
+        }
+        if self
+            .blocked_channels
+            .iter()
+            .any(|b| b.eq_ignore_ascii_case(name) || b.eq_ignore_ascii_case(&short))
+        {
+            bail!("channel {channel:?} is blocked by policy (blocked-channels)");
+        }
+        Ok(())
+    }
+
+    /// The base URL for a channel: a URL as is, a name under `conda-url`
+    /// (or conda.anaconda.org).
+    pub fn channel_url(&self, channel: &str) -> String {
+        if channel.contains("://") {
+            return channel.trim_end_matches('/').to_owned();
+        }
+        format!(
+            "{}/{}",
+            self.conda_url
+                .as_deref()
+                .unwrap_or("https://conda.anaconda.org"),
+            channel.trim_matches('/')
+        )
     }
 }
 
@@ -1299,6 +1431,69 @@ impl Project {
         }
     }
 
+    /// `[tool.vivar] native-dependencies`: conda match specs by package
+    /// name (`{ gdal = "*", cuda-toolkit = "12.*" }`), as written.
+    pub fn native_dependencies(&self) -> Vec<String> {
+        let table = self
+            .doc
+            .get("tool")
+            .and_then(|t| t.get("vivar"))
+            .and_then(|v| v.get("native-dependencies"))
+            .and_then(Item::as_table_like);
+        let Some(table) = table else {
+            return Vec::new();
+        };
+        table
+            .iter()
+            .map(|(name, v)| {
+                let spec = v.as_str().unwrap_or("*").trim();
+                if spec.is_empty() || spec == "*" {
+                    name.to_lowercase()
+                } else {
+                    format!("{} {spec}", name.to_lowercase())
+                }
+            })
+            .collect()
+    }
+
+    /// `[tool.vivar] channels`, conda-forge when unset.
+    pub fn channels(&self) -> Vec<String> {
+        let list: Vec<String> = self
+            .doc
+            .get("tool")
+            .and_then(|t| t.get("vivar"))
+            .and_then(|v| v.get("channels"))
+            .and_then(Item::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if list.is_empty() {
+            vec!["conda-forge".to_owned()]
+        } else {
+            list
+        }
+    }
+
+    /// `[tool.vivar] platforms` the native lock covers, this machine when unset.
+    pub fn platforms(&self) -> Vec<String> {
+        self.doc
+            .get("tool")
+            .and_then(|t| t.get("vivar"))
+            .and_then(|v| v.get("platforms"))
+            .and_then(Item::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// `[tool.vivar] profiles`: dependency groups that are machine variants.
     pub fn profiles(&self) -> Vec<String> {
         self.doc
@@ -1843,6 +2038,73 @@ lint = ["ruff"]
         );
         assert_eq!(relative_path(Path::new("/a/b"), Path::new("/a/x")), "../x");
         assert_eq!(relative_path(Path::new("/a/b"), Path::new("/a/b")), ".");
+    }
+
+    #[test]
+    fn native_dependencies_and_channel_policy() {
+        let tmp = TempDir::new("nativedeps");
+        fs::write(
+            tmp.0.join(PYPROJECT),
+            "[project]\nname = \"t\"\ndependencies = []\n\n[tool.vivar.policy]\ndeny = []\nblocked-channels = [\"bioconda\"]\n",
+        )
+        .unwrap();
+        add_native(
+            &tmp.0,
+            &[
+                "GDAL".into(),
+                "cuda-toolkit 12.*".into(),
+                "numpy=1.26".into(),
+            ],
+        )
+        .unwrap();
+        let text = fs::read_to_string(tmp.0.join(PYPROJECT)).unwrap();
+        assert!(text.contains("[tool.vivar.native-dependencies]"), "{text}");
+        assert!(
+            text.contains("gdal = \"*\"")
+                && text.contains("cuda-toolkit = \"12.*\"")
+                && text.contains("numpy = \"1.26\""),
+            "{text}"
+        );
+        let project = Project::load(&tmp.0).unwrap();
+        assert_eq!(
+            project.native_dependencies(),
+            vec!["gdal", "cuda-toolkit 12.*", "numpy 1.26"]
+        );
+        assert_eq!(project.channels(), vec!["conda-forge"]);
+        assert!(project.platforms().is_empty());
+        assert!(add_native(&tmp.0, &["a b c d".into()]).is_err());
+        assert!(add_native(&tmp.0, &["__glibc".into()]).is_err());
+        let missing = remove_native(&tmp.0, &["gdal".into(), "nothing".into()]).unwrap();
+        assert_eq!(missing, vec!["nothing"]);
+        assert!(!Project::load(&tmp.0)
+            .unwrap()
+            .native_dependencies()
+            .iter()
+            .any(|d| d == "gdal"));
+
+        let policy = project.policy().unwrap();
+        assert!(policy.check_channel("conda-forge").is_ok());
+        assert!(policy
+            .check_channel("https://prefix.dev/conda-forge")
+            .is_ok());
+        assert!(policy.check_channel("defaults").is_err());
+        assert!(policy
+            .check_channel("https://repo.anaconda.com/pkgs/main")
+            .is_err());
+        assert!(policy.check_channel("bioconda").is_err());
+        assert_eq!(
+            policy.channel_url("conda-forge"),
+            "https://conda.anaconda.org/conda-forge"
+        );
+        let mut mirrored = policy.clone();
+        mirrored.conda_url = Some("https://artifactory.example/conda".into());
+        mirrored.allow_anaconda_defaults = Some(true);
+        assert_eq!(
+            mirrored.channel_url("conda-forge"),
+            "https://artifactory.example/conda/conda-forge"
+        );
+        assert!(mirrored.check_channel("defaults").is_ok());
+        assert_eq!(mirrored.channel_url("https://x/y/"), "https://x/y");
     }
 
     #[test]

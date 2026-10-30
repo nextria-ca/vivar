@@ -382,6 +382,15 @@ fn console_scripts(entry_points: &str) -> Vec<(String, String, String)> {
 
 /// The files that make `name` runnable: a shebang script on Unix, a `.cmd`
 /// shim plus the script on Windows.
+pub fn console_script_files(
+    layout: &Layout,
+    name: &str,
+    module: &str,
+    attr: &str,
+) -> Vec<(PathBuf, Vec<u8>)> {
+    script_files(layout, name, module, attr)
+}
+
 fn script_files(layout: &Layout, name: &str, module: &str, attr: &str) -> Vec<(PathBuf, Vec<u8>)> {
     let func = attr.split('.').next().unwrap_or(attr);
     let body = format!(

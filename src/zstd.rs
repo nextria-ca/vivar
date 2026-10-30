@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Zstandard decompression (RFC 8878), written out in full: frames, raw,
 //! RLE and compressed blocks, Huffman literals (one or four streams, FSE
 //! compressed weights), FSE sequences with the predefined tables, repeat
@@ -6,7 +5,7 @@
 //! are zstd streams; without this, native dependencies would need a zstd
 //! binary on every machine.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 const MAGIC: u32 = 0xFD2F_B528;
 
@@ -85,7 +84,9 @@ fn frame(data: &[u8], mut pos: usize, out: &mut Vec<u8>) -> Result<usize> {
     }
     let start = out.len();
     let mut ctx = FrameContext::default();
+    let mut block_no = 0usize;
     loop {
+        block_no += 1;
         let header = byte(data, pos)? as u32
             | (byte(data, pos + 1)? as u32) << 8
             | (byte(data, pos + 2)? as u32) << 16;
@@ -110,7 +111,12 @@ fn frame(data: &[u8], mut pos: usize, out: &mut Vec<u8>) -> Result<usize> {
                 let block = data
                     .get(pos..pos + size)
                     .ok_or_else(|| anyhow!("truncated zstd block"))?;
-                compressed_block(block, out, &mut ctx)?;
+                compressed_block(block, out, &mut ctx).with_context(|| {
+                    format!(
+                        "zstd block {block_no} at byte {pos} ({size} bytes, {} out so far)",
+                        out.len() - start
+                    )
+                })?;
                 pos += size;
             }
             _ => bail!("reserved zstd block type"),
@@ -417,7 +423,8 @@ impl Huffman {
         if sum == 0 {
             bail!("corrupt Huffman tree");
         }
-        let max_bits = 32 - (sum - 1).leading_zeros() as usize; // next power of two's log
+        // The last symbol brings the sum to the next power of two above it.
+        let max_bits = 32 - sum.leading_zeros() as usize;
         let total = 1u32 << max_bits;
         let left = total - sum;
         if left == 0 || !left.is_power_of_two() {
@@ -564,12 +571,12 @@ const ML_PREDEF: [i16; 53] = [
 ];
 
 const LL_BASE: [u32; 36] = [
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 64, 128,
-    256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072,
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48, 64,
+    128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
 ];
 const LL_BITS: [u8; 36] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 5, 6, 7, 8, 9, 10,
-    11, 12, 13, 14, 15,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11,
+    12, 13, 14, 15, 16,
 ];
 const ML_BASE: [u32; 53] = [
     3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
@@ -607,7 +614,13 @@ fn sequence_table(
             Ok(1)
         }
         2 => {
-            let (t, used) = FseTable::parse(data, max_log, predefined.len() - 1)?;
+            // Compressed tables may name every code, past the predefined
+            // table's reach (offset codes go up to 31).
+            let max_symbol = match predefined.len() {
+                29 => 31,
+                n => n - 1,
+            };
+            let (t, used) = FseTable::parse(data, max_log, max_symbol)?;
             *previous = Some(t);
             Ok(used)
         }
@@ -771,6 +784,25 @@ mod tests {
         assert_eq!(decompress(&with_skip).unwrap(), out);
     }
 
+    /// `VIVAR_ZSTD_FILE=<path> cargo test -- --ignored zstd::tests::decodes_a_file`:
+    /// decodes a real stream and compares it with the reference decoder.
+    #[test]
+    #[ignore = "needs VIVAR_ZSTD_FILE"]
+    fn decodes_a_file() {
+        let Ok(path) = std::env::var("VIVAR_ZSTD_FILE") else {
+            return;
+        };
+        let data = std::fs::read(&path).unwrap();
+        let expected = std::process::Command::new("zstd")
+            .args(["-d", "-c", "-q", &path])
+            .output()
+            .unwrap()
+            .stdout;
+        let out = decompress(&data).unwrap();
+        assert_eq!(out.len(), expected.len());
+        assert!(out == expected);
+    }
+
     #[test]
     fn round_trips_through_the_reference_encoder_when_present() {
         let Ok(probe) = std::process::Command::new("zstd").arg("--version").output() else {
@@ -803,9 +835,22 @@ mod tests {
             }
         }
         let noise: Vec<u8> = (0..300_000).map(|_| rand() as u8).collect();
+        // Long literal runs between matches: noise with repeated chunks in it.
+        let mut mixed = Vec::new();
+        while mixed.len() < 500_000 {
+            let run = 40 + rand() as usize % 3000;
+            mixed.extend((0..run).map(|_| rand() as u8));
+            let back = 1 + rand() as usize % mixed.len().min(70_000);
+            let len = 4 + rand() as usize % 200;
+            let start = mixed.len() - back;
+            for k in 0..len {
+                mixed.push(mixed[start + k]);
+            }
+        }
         for (name, data) in [
             ("text", text.as_bytes()),
             ("noise", &noise[..]),
+            ("mixed", &mixed[..]),
             ("tiny", b"x"),
         ] {
             for level in ["-1", "-5", "-19", "--ultra", "--long"] {

@@ -42,8 +42,20 @@ fn excluded(rel: &Path, python_dir: &str, mm: &str, opts: PackOptions) -> bool {
                 return true;
             }
         }
-        return parts.len() == 2 && matches!(parts[1], "CACHEDIR.TAG" | ".gitignore" | ".lock");
+        if parts.len() == 2 && matches!(parts[1], "CACHEDIR.TAG" | ".gitignore" | ".lock") {
+            return true;
+        }
+        if !python_dir.is_empty() {
+            return false;
+        }
     }
+    // A native prefix carries its Python inside `.venv`: the same baggage
+    // is left out of it, except site-packages, which holds the project's packages.
+    let python_dir = if python_dir.is_empty() {
+        ".venv"
+    } else {
+        python_dir
+    };
     if parts.first() == Some(&python_dir) {
         let unix = format!("python{mm}");
         let stdlib = parts.len() > 3 && parts[1] == "lib" && parts[2] == unix;
@@ -55,7 +67,8 @@ fn excluded(rel: &Path, python_dir: &str, mm: &str, opts: PackOptions) -> bool {
         } else {
             ""
         };
-        if matches!(dir, "test" | "site-packages" | "ensurepip" | "idlelib") {
+        let keep_site = python_dir == ".venv" && dir == "site-packages";
+        if matches!(dir, "test" | "site-packages" | "ensurepip" | "idlelib") && !keep_site {
             return true;
         }
         if parts.len() > 3 && matches!(parts[1], "lib" | "tcl") && parts[3] == "demos" {
@@ -72,12 +85,27 @@ fn excluded(rel: &Path, python_dir: &str, mm: &str, opts: PackOptions) -> bool {
 }
 
 /// Files `unpack` relocates by rewriting: never hashed. The venv's bin is
-/// `bin` or `Scripts` by the bundle's platform, not this machine's.
-fn relocated(rel: &Path) -> bool {
+/// `bin` or `Scripts` by the bundle's platform, not this machine's; a native
+/// prefix also rewrites every file that holds its path (`native`).
+fn relocated(rel: &Path, native: &std::collections::BTreeSet<String>) -> bool {
     let parts: Vec<&str> = rel.iter().filter_map(|c| c.to_str()).collect();
     parts.first() == Some(&".venv")
         && (parts.get(1) == Some(&"pyvenv.cfg")
-            || (matches!(parts.get(1), Some(&"bin") | Some(&"Scripts")) && parts.len() == 3))
+            || (matches!(parts.get(1), Some(&"bin") | Some(&"Scripts")) && parts.len() == 3)
+            || native.contains(&rel.to_string_lossy().replace('\\', "/")))
+}
+
+/// The members of `.venv` a native prefix rewrites when it moves.
+fn native_relocated(root: &Path) -> std::collections::BTreeSet<String> {
+    let venv = root.join(".venv");
+    if !crate::nativedeps::is_prefix(&venv) {
+        return Default::default();
+    }
+    crate::condalink::installed(&venv)
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|l| l.placeholders.iter().map(|(p, _, _)| format!(".venv/{p}")))
+        .collect()
 }
 
 fn walk(base: &Path, rel: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -105,20 +133,28 @@ fn checksums(
 ) -> Result<String> {
     let mut files = Vec::new();
     walk(root, Path::new(".venv"), &mut files)?;
-    for file in ["pyproject.toml", "uv.lock", ".python-version"] {
+    for file in [
+        "pyproject.toml",
+        "uv.lock",
+        ".python-version",
+        crate::nativedeps::LOCKFILE,
+    ] {
         if root.join(file).is_file() {
             files.push(PathBuf::from(file));
         }
     }
     let python_parent = python_root.parent().unwrap_or(python_root);
-    walk(python_parent, Path::new(python_dir), &mut files)?;
+    if !python_dir.is_empty() {
+        walk(python_parent, Path::new(python_dir), &mut files)?;
+    }
 
+    let native = native_relocated(root);
     let mut out = String::new();
     for rel in files {
-        if excluded(&rel, python_dir, mm, opts) || relocated(&rel) {
+        if excluded(&rel, python_dir, mm, opts) || relocated(&rel, &native) {
             continue;
         }
-        let base = if rel.starts_with(python_dir) {
+        let base = if !python_dir.is_empty() && rel.starts_with(python_dir) {
             python_parent
         } else {
             root
@@ -161,6 +197,9 @@ fn inventory(
             }
         }
     }
+    for member in native_relocated(root) {
+        files.push((member.clone(), root.join(&member)));
+    }
     for (member, path) in files {
         let digest = crate::sha256::file(&path).with_context(|| format!("hashing {member}"))?;
         lines.push(format!("{digest}  {member}"));
@@ -173,10 +212,11 @@ fn inventory(
     ));
     // Symlinks: the target string is what matters.
     let python_parent = python_root.parent().unwrap_or(python_root);
-    for (base, start) in [
-        (root, Path::new(".venv")),
-        (python_parent, Path::new(python_dir)),
-    ] {
+    let mut trees = vec![(root, Path::new(".venv"))];
+    if !python_dir.is_empty() {
+        trees.push((python_parent, Path::new(python_dir)));
+    }
+    for (base, start) in trees {
         let mut links = Vec::new();
         symlinks(base, start, &mut links)?;
         links.sort();
@@ -283,6 +323,7 @@ pub fn verify_checksums(dir: &Path) -> Result<Vec<String>> {
     if !python_dir.is_empty() && dir.join(python_dir).is_dir() {
         walk(dir, Path::new(python_dir), &mut files)?;
     }
+    let native = native_relocated(dir);
     for rel in files {
         let member = rel.to_string_lossy().replace('\\', "/");
         // A slim bundle legitimately lacks libpython; anything else unlisted is foreign.
@@ -293,7 +334,7 @@ pub fn verify_checksums(dir: &Path) -> Result<Vec<String>> {
         };
         if !listed.contains(&member)
             && !excluded(&rel, python_dir, &mm, lenient)
-            && !relocated(&rel)
+            && !relocated(&rel, &native)
         {
             bad.push(format!("{member} (not in the bundle)"));
         }
@@ -834,6 +875,19 @@ pub fn pack(root: &Path, name: &str, output: Option<&Path>, opts: PackOptions) -
     let venv = root.join(".venv");
     let home = PathBuf::from(pyvenv_cfg(&venv, "home")?);
     let version = pyvenv_cfg(&venv, "version_info")?;
+    if crate::nativedeps::is_prefix(&venv) {
+        // The prefix carries its own Python; nothing else travels.
+        let tree = Tree {
+            root: root.to_path_buf(),
+            python_root: venv.clone(),
+            python_dir: String::new(),
+            version,
+            venv: venv.to_string_lossy().into_owned(),
+            home: home.to_string_lossy().into_owned(),
+            platform: platform(),
+        };
+        return archive(&tree, name, output, opts);
+    }
     let python_root = python_root(&home)?;
     let python_dir = python_root
         .file_name()
@@ -1071,7 +1125,12 @@ fn build_for_target(
     )?;
 
     // 4. The project files, so the bundle is a project too.
-    for file in ["pyproject.toml", "uv.lock", ".python-version"] {
+    for file in [
+        "pyproject.toml",
+        "uv.lock",
+        ".python-version",
+        crate::nativedeps::LOCKFILE,
+    ] {
         if root.join(file).is_file() {
             fs::copy(root.join(file), stage.join(file))?;
         }
@@ -1108,6 +1167,9 @@ fn archive(tree: &Tree, name: &str, output: Option<&Path>, opts: PackOptions) ->
     manifest["created-by"] = value(concat!("vivar ", env!("CARGO_PKG_VERSION")));
     if opts.host_cuda {
         manifest["host-cuda"] = value(true);
+    }
+    if python_dir.is_empty() {
+        manifest["native"] = value(true);
     }
 
     let staging = std::env::temp_dir().join(format!("vivar-pack-{}", std::process::id()));
@@ -1160,16 +1222,25 @@ fn archive(tree: &Tree, name: &str, output: Option<&Path>, opts: PackOptions) ->
     for pattern in junk {
         tar.arg(format!("--exclude={pattern}"));
     }
+    // A native prefix is its own Python root, with site-packages kept.
+    let py_root = if python_dir.is_empty() {
+        ".venv"
+    } else {
+        python_dir
+    };
     for stdlib in [format!("lib/python{mm}"), "Lib".to_owned()] {
         // test suite (~25 MB), pip/ensurepip (a uv venv never uses them), IDLE
         for dir in ["test", "site-packages", "ensurepip", "idlelib"] {
-            tar.arg(format!("--exclude={python_dir}/{stdlib}/{dir}"));
+            if python_dir.is_empty() && dir == "site-packages" {
+                continue;
+            }
+            tar.arg(format!("--exclude={py_root}/{stdlib}/{dir}"));
         }
     }
     for demos in ["lib/*/demos", "tcl/*/demos"] {
-        tar.arg(format!("--exclude={python_dir}/{demos}"));
+        tar.arg(format!("--exclude={py_root}/{demos}"));
     }
-    if opts.slim {
+    if opts.slim && !python_dir.is_empty() {
         // The interpreter is statically linked; libpython only serves embedders.
         tar.arg(format!("--exclude={python_dir}/lib/libpython*"));
     }
@@ -1178,7 +1249,7 @@ fn archive(tree: &Tree, name: &str, output: Option<&Path>, opts: PackOptions) ->
             tar.arg(format!("--exclude=site-packages/nvidia/*/{sub}"));
         }
     }
-    tar.arg(format!("--exclude={python_dir}/share/man"))
+    tar.arg(format!("--exclude={py_root}/share/man"))
         .arg("-C")
         .arg(&staging)
         .arg(MANIFEST)
@@ -1188,14 +1259,21 @@ fn archive(tree: &Tree, name: &str, output: Option<&Path>, opts: PackOptions) ->
         tar.arg(crate::sign::SIGNATURE);
     }
     tar.arg("-C").arg(&tree.root).arg(".venv");
-    for file in ["pyproject.toml", "uv.lock", ".python-version"] {
+    for file in [
+        "pyproject.toml",
+        "uv.lock",
+        ".python-version",
+        crate::nativedeps::LOCKFILE,
+    ] {
         if tree.root.join(file).is_file() {
             tar.arg(file);
         }
     }
-    tar.arg("-C")
-        .arg(tree.python_root.parent().unwrap_or(&tree.python_root))
-        .arg(python_dir);
+    if !python_dir.is_empty() {
+        tar.arg("-C")
+            .arg(tree.python_root.parent().unwrap_or(&tree.python_root))
+            .arg(python_dir);
+    }
 
     let status = tar.status().context("failed to run `tar`")?;
     let _ = fs::remove_dir_all(&staging);
@@ -1333,13 +1411,26 @@ fn relocate(dest: &Path) -> Result<()> {
     let old_home = field("python-home")?;
     let python_dir = field("python-dir")?;
     let new_venv = dest.join(".venv");
-    let new_root = dest.join(&python_dir);
+    let native = python_dir.is_empty();
+    let new_root = if native {
+        new_venv.clone()
+    } else {
+        dest.join(&python_dir)
+    };
     let new_home = if cfg!(windows) {
         new_root.clone()
     } else {
         new_root.join("bin")
     };
     let bin = new_venv.join(VENV_BIN);
+    // 0. A native prefix: every file that holds the old path, binaries kept
+    // to length, before the text passes below.
+    if native {
+        let changed = crate::condalink::relocate(&new_venv, &old_venv.replace('\\', "/"))?;
+        if changed > 0 {
+            println!("relocated {changed} native file(s)");
+        }
+    }
 
     // 1. `python`, `python3`, … symlinks pointed at the old Python install (Unix).
     for entry in fs::read_dir(&bin)? {
@@ -1374,8 +1465,9 @@ fn relocate(dest: &Path) -> Result<()> {
         rewrite(path, &replacements)?;
     }
 
-    // 3. Windows launchers embed the interpreter path in a PE resource.
-    if cfg!(windows) {
+    // 3. Windows launchers embed the interpreter path in a PE resource. A
+    // native prefix uses CPython's own venv launchers, which read pyvenv.cfg.
+    if cfg!(windows) && !native {
         patch_launchers(&bin, &old_venv, &old_home, &python_dir)?;
     }
     Ok(())

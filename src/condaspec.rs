@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! conda's version ordering and match specs (`name >=1.2,<2 *_cp312`), as
 //! conda-forge's `depends` and `constrains` spell them, plus the package
 //! record read from repodata.

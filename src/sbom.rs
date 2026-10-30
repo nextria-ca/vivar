@@ -34,10 +34,31 @@ pub fn generate(project: &Project, format: Format) -> Result<String> {
         .iter()
         .filter(|p| p.source_kind != "virtual" && p.name != name)
         .collect();
+    // Native packages, locked for this machine, as conda purls.
+    let native: Vec<crate::condaspec::Record> = crate::nativedeps::NativeLock::read(root)?
+        .map(|l| {
+            l.for_subdir(&crate::condaindex::host_subdir())
+                .into_iter()
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let conda_purl = |r: &crate::condaspec::Record| {
+        let channel = r
+            .url
+            .rsplitn(3, '/')
+            .nth(2)
+            .and_then(|c| c.rsplit('/').next())
+            .unwrap_or("conda-forge");
+        format!(
+            "pkg:conda/{}@{}?build={}&channel={}&subdir={}",
+            r.name, r.version, r.build, channel, r.subdir
+        )
+    };
 
     Ok(match format {
         Format::CycloneDx => {
-            let components: Vec<String> = packages
+            let mut components: Vec<String> = packages
                 .iter()
                 .map(|p| {
                     let purl = format!("pkg:pypi/{}@{}", p.name, p.version);
@@ -54,6 +75,21 @@ pub fn generate(project: &Project, format: Format) -> Result<String> {
                     )
                 })
                 .collect();
+            for r in &native {
+                let purl = conda_purl(r);
+                let license = r
+                    .license
+                    .as_deref()
+                    .filter(|l| !l.is_empty())
+                    .map(|l| format!(",\"licenses\":[{{\"expression\":{}}}]", quote(l)))
+                    .unwrap_or_default();
+                components.push(format!(
+                    "{{\"type\":\"library\",\"bom-ref\":{purl_q},\"name\":{},\"version\":{},\"purl\":{purl_q}{license}}}",
+                    quote(&r.name),
+                    quote(&r.version),
+                    purl_q = quote(&purl)
+                ));
+            }
             format!(
                 "{{\"bomFormat\":\"CycloneDX\",\"specVersion\":\"1.5\",\"version\":1,\"metadata\":{{\"timestamp\":{},\"tools\":[{{\"name\":\"vivar\",\"version\":{}}}],\"component\":{{\"type\":\"application\",\"name\":{}}}}},\"components\":[{}]}}\n",
                 quote(&now),

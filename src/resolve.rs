@@ -32,6 +32,9 @@ pub struct Roots {
     /// Where `[tool.uv.sources]` sends the roots' requirements, for the
     /// lock's `requires-dist` metadata.
     pub sources: Vec<RootSource>,
+    /// Python packages the native (conda) environment provides, by PyPI
+    /// name with their versions: satisfied without an index.
+    pub provided: BTreeMap<String, String>,
 }
 
 /// A root requirement's declared source: an index, git (no commit yet), a
@@ -129,6 +132,11 @@ impl Roots {
         }
         for m in &self.members {
             out.extend(m.roots.local_names());
+        }
+        for (name, version) in &self.provided {
+            if let Ok(v) = Version::parse(version) {
+                out.insert(name.clone(), v);
+            }
         }
         out
     }
@@ -2163,6 +2171,11 @@ pub fn write_lock(roots: &Roots, lock: &Lockable) -> String {
         let mut plain = Array::new();
         let mut by_extra: BTreeMap<String, Array> = BTreeMap::new();
         for d in &p.dependencies {
+            // An edge into a package the native environment provides has no
+            // lock package to point at: left out, as the root's are.
+            if roots.provided.contains_key(&d.req.name) {
+                continue;
+            }
             let pins: Vec<Pin> = d.pin.iter().cloned().collect();
             let (extra, req) = match d.req.marker.as_deref().map(split_extra) {
                 Some((Some(extra), rest)) => {

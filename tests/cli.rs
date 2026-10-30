@@ -3709,3 +3709,125 @@ json.dump(seen, open(out, 'w'))
         stdout_of(&out)
     );
 }
+
+#[test]
+#[ignore = "slow: downloads a Python and a few packages from conda-forge; run with --include-ignored (CI does)"]
+fn native_dependencies_from_conda_forge() {
+    let tmp = TempDir::new("conda");
+    let dir = &tmp.0;
+    ok(dir, &["init", "demo", "--python", "3.12", "--no-sync"]);
+    // A native dependency: the solve brings python itself, the prefix is
+    // linked into .venv, and `run` works on it.
+    ok(dir, &["add", "--native", "tzdata"]);
+    let pyproject = read(&dir.join("pyproject.toml"));
+    assert!(
+        pyproject.contains("[tool.vivar.native-dependencies]")
+            && pyproject.contains("tzdata = \"*\""),
+        "{pyproject}"
+    );
+    let lock = read(&dir.join("vivar-native.lock"));
+    assert!(
+        lock.contains("name = \"python\"") && lock.contains("name = \"tzdata\""),
+        "{lock}"
+    );
+    assert!(dir.join(".venv").join("conda-meta").is_dir());
+    ok(
+        dir,
+        &[
+            "run",
+            "python",
+            "-c",
+            "import os, sys, zoneinfo; assert 'conda-meta' in os.listdir(sys.prefix), sys.prefix",
+        ],
+    );
+    // PyPI packages install into the prefix's Python.
+    ok(dir, &["add", "pycodestyle"]);
+    ok(dir, &["run", "python", "-c", "import pycodestyle"]);
+    // A Python package from conda-forge satisfies the PyPI requirement on
+    // it: no second copy, no package entry in uv.lock.
+    ok(dir, &["add", "--native", "six"]);
+    ok(dir, &["add", "six"]);
+    ok(
+        dir,
+        &[
+            "run",
+            "python",
+            "-c",
+            "import six, sys; assert six.__file__.startswith(sys.prefix), six.__file__",
+        ],
+    );
+    let lock = read(&dir.join("uv.lock"));
+    assert!(
+        !lock.contains("[[package]]\nname = \"six\"") && lock.contains("{ name = \"six\" }"),
+        "{lock}"
+    );
+    // Native packages show up in the license inventory, the SBOM and `check`.
+    let listing = stdout_of(&ok(dir, &["licenses"]));
+    assert!(
+        listing.contains("tzdata") && listing.contains("pycodestyle"),
+        "{listing}"
+    );
+    let sbom = stdout_of(&ok(
+        dir,
+        &["export", "sbom", "--format", "cyclonedx", "--output", "-"],
+    ));
+    assert!(
+        sbom.contains("pkg:conda/tzdata@") && sbom.contains("pkg:pypi/pycodestyle@"),
+        "{sbom}"
+    );
+    ok(dir, &["check", "--no-audit"]);
+    let doctor = stdout_of(&ok(dir, &["doctor"]));
+    assert!(
+        doctor.contains("native dependencies: 2 declared"),
+        "{doctor}"
+    );
+    // Dropping the native six leaves the PyPI requirement to PyPI.
+    ok(dir, &["remove", "--native", "six"]);
+    assert!(
+        read(&dir.join("uv.lock")).contains("[[package]]\nname = \"six\""),
+        "{}",
+        read(&dir.join("uv.lock"))
+    );
+    ok(dir, &["run", "python", "-c", "import six"]);
+    assert!(!read(&dir.join("vivar-native.lock")).contains("name = \"six\""));
+    // Anaconda's commercial channels are refused.
+    let text = read(&dir.join("pyproject.toml")) + "\n[tool.vivar]\nchannels = [\"defaults\"]\n";
+    let with_defaults = text.replace(
+        "[tool.vivar.native-dependencies]",
+        "[tool.vivar]\nchannels = [\"defaults\"]\n\n[tool.vivar.native-dependencies]",
+    );
+    let with_defaults = with_defaults
+        .trim_end_matches("\n[tool.vivar]\nchannels = [\"defaults\"]\n")
+        .to_owned()
+        + "\n";
+    fs::write(dir.join("pyproject.toml"), &with_defaults).unwrap();
+    fails_with(dir, &["lock"], "commercial");
+    let restored = with_defaults.replace("[tool.vivar]\nchannels = [\"defaults\"]\n\n", "");
+    fs::write(dir.join("pyproject.toml"), restored).unwrap();
+    ok(dir, &["lock"]);
+    // A packed prefix is carried whole and rewritten for its new home.
+    if cfg!(unix) {
+        let archive = tmp.0.join("native.tar.gz");
+        ok(dir, &["pack", "-o", archive.to_str().unwrap()]);
+        let dest = tmp.0.join("native-dest");
+        ok(
+            &tmp.0,
+            &["unpack", archive.to_str().unwrap(), dest.to_str().unwrap()],
+        );
+        ok(
+            &dest,
+            &[
+                "run",
+                "python",
+                "-c",
+                "import ssl, pycodestyle, six, zoneinfo",
+            ],
+        );
+        let out = stdout_of(&ok(&dest, &["verify"]));
+        assert!(out.contains("integrity: all bundled files match"), "{out}");
+        assert!(
+            !dest.join("vivar-native.lock").exists()
+                || read(&dest.join("vivar-native.lock")).contains("tzdata")
+        );
+    }
+}

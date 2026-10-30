@@ -49,6 +49,7 @@ else:
 pub struct NativeBackend {
     index_url: Option<String>,
     no_build: bool,
+    policy: Policy,
 }
 
 impl NativeBackend {
@@ -56,7 +57,21 @@ impl NativeBackend {
         NativeBackend {
             index_url: policy.index_url.clone(),
             no_build: policy.require_wheels,
+            policy: policy.clone(),
         }
+    }
+
+    /// Solves the native dependencies first, when there are any, so the
+    /// Python resolve knows what the environment provides.
+    fn native_lock(&self, project: &Project, upgrade: bool) -> Result<()> {
+        if !crate::nativedeps::declared(project) {
+            return Ok(());
+        }
+        let changes = crate::nativedeps::lock(project, &self.policy, upgrade)?;
+        for c in &changes {
+            println!("native: {c}");
+        }
+        Ok(())
     }
 
     fn index(&self) -> Index {
@@ -94,6 +109,8 @@ impl NativeBackend {
             }
         }
         let mut roots = roots_of(project)?;
+        // What the native environment provides needs no index.
+        roots.provided = crate::nativedeps::provided(project);
         // Members: roots of their own, and their Python requirements narrow
         // the lock's. Their sources and indexes join the root's (root first).
         let mut rp_clauses: Vec<String> = roots
@@ -505,6 +522,7 @@ fn roots_of(project: &Project) -> Result<Roots> {
         editable: project.is_package(),
         members: Vec::new(),
         sources: Vec::new(),
+        provided: BTreeMap::new(),
     })
 }
 
@@ -811,8 +829,18 @@ fn apply(
 ) -> Result<(usize, usize)> {
     let present = install::installed(&layout.site)?;
     let want_names: BTreeSet<&str> = wanted.iter().map(|p| p.name.as_str()).collect();
+    // Python packages the native prefix provides are its own, not ours.
+    let native_owned = crate::condalink::owned_dist_infos(&layout.prefix);
     let mut removed = 0;
     for dist in &present {
+        let owned = dist
+            .dist_info
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| native_owned.contains(n));
+        if owned {
+            continue;
+        }
         let keep = wanted.iter().any(|p| same_install(p, dist, lock_root));
         if !keep && (want_names.contains(dist.name.as_str()) || !dist.name.is_empty()) {
             install::uninstall(dist)?;
@@ -1924,6 +1952,7 @@ impl Backend for NativeBackend {
             project::add_path_source(&project.root, name, rel, *editable)?;
         }
         let project = Project::require(dir)?;
+        self.native_lock(&project, false)?;
         self.relock(&project, &[], false, false)?;
         let groups: Vec<&str> = group.into_iter().collect();
         self.sync_groups(dir, &groups)
@@ -1948,12 +1977,14 @@ impl Backend for NativeBackend {
             project::remove_source(&project.root, p)?;
         }
         let project = Project::require(dir)?;
+        self.native_lock(&project, false)?;
         self.relock(&project, &[], false, false)?;
         self.sync(dir)
     }
 
     fn lock(&self, dir: &Path) -> Result<()> {
         let project = Project::require(dir)?;
+        self.native_lock(&project, false)?;
         self.relock(&project, &[], false, false)?;
         Ok(())
     }
@@ -1968,7 +1999,13 @@ impl Backend for NativeBackend {
         // Like `uv sync`: no lockfile, or one that no longer covers what the
         // project declares, is resolved first.
         if !root.join(crate::lock::LOCKFILE).is_file() || self.lock_check(dir).is_err() {
+            self.native_lock(&project, false)?;
             self.relock(&project, &[], false, false)?;
+        }
+        // The native prefix comes first: the Python packages go into its Python.
+        if crate::nativedeps::declared(&project) {
+            let (linked, unlinked) = crate::nativedeps::sync(&project, &self.policy)?;
+            println!("native prefix: {linked} package(s) linked, {unlinked} unlinked");
         }
         let mut all: Vec<&str> = vec!["dev"];
         all.extend(groups.iter().copied().filter(|g| *g != "dev"));
@@ -1977,6 +2014,9 @@ impl Backend for NativeBackend {
 
     fn upgrade(&self, dir: &Path, packages: &[String], dry_run: bool) -> Result<()> {
         let project = Project::require(dir)?;
+        if !dry_run && packages.is_empty() {
+            self.native_lock(&project, true)?;
+        }
         let (old, new) = self.relock(&project, packages, packages.is_empty(), dry_run)?;
         let changes = changes_between(&old, &new);
         for c in &changes {
@@ -2081,8 +2121,15 @@ impl Backend for NativeBackend {
         // that applies on this machine (one that applies nowhere is rightly
         // absent; one that applies elsewhere is present).
         let project = crate::project::Project::require(dir)?;
+        if crate::nativedeps::declared(&project) && !crate::nativedeps::lock_is_current(&project) {
+            bail!(
+                "{} does not cover the declared native dependencies (run `vivar lock`)",
+                crate::nativedeps::LOCKFILE
+            );
+        }
         let lock = Lock::read(project.venv_root())?;
-        let locked: BTreeSet<String> = lock.packages.iter().map(|p| p.name.clone()).collect();
+        let mut locked: BTreeSet<String> = lock.packages.iter().map(|p| p.name.clone()).collect();
+        locked.extend(crate::nativedeps::provided(&project).into_keys());
         // A check never provisions Python: with no known interpreter, marked
         // requirements are given the benefit of the doubt.
         let here = known_python(&project).map(MarkerEnv::current);
@@ -2143,6 +2190,9 @@ impl Backend for NativeBackend {
         target: &Path,
     ) -> Result<()> {
         let project = crate::project::Project::require(dir)?;
+        if crate::nativedeps::declared(&project) {
+            bail!("a project with native dependencies is packed where it is synced; `pack --target` cannot lay out a conda prefix for another machine yet");
+        }
         let lock = Lock::read(project.venv_root())?;
         let (os, arch) = triple_parts(triple)?;
         let mut it = python.split('.').map(|p| p.parse::<u32>().unwrap_or(0));

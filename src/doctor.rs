@@ -161,6 +161,31 @@ pub fn run(cwd: &Path) -> Result<i32> {
                 Ok(()) => line(true, "declared dependencies pass the deny list".to_owned()),
                 Err(e) => line(false, e.to_string()),
             }
+            if crate::nativedeps::declared(&project) {
+                let subdir = crate::condaindex::host_subdir();
+                let locked = crate::nativedeps::NativeLock::read(project.venv_root())
+                    .ok()
+                    .flatten()
+                    .map(|l| l.for_subdir(&subdir).len())
+                    .unwrap_or(0);
+                let channels: Vec<String> = project.channels();
+                let blocked = channels.iter().find(|c| policy.check_channel(c).is_err());
+                line(
+                    blocked.is_none(),
+                    match blocked {
+                        Some(c) => format!("native dependencies from {c}: refused by policy"),
+                        None => format!(
+                            "native dependencies: {} declared, {locked} locked for {subdir} from {}",
+                            project.native_dependencies().len(),
+                            channels.join(", ")
+                        ),
+                    },
+                );
+                line(
+                    crate::nativedeps::is_prefix(&venv_dir),
+                    ".venv is a native (conda) prefix".to_owned(),
+                );
+            }
         }
     }
     Ok(if problems == 0 { 0 } else { 1 })

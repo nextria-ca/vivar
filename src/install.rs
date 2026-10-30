@@ -1,8 +1,11 @@
 //! Installing and removing wheels by hand (PEP 427 / PEP 376): no uv, no pip,
 //! no Python process. Used for native `sync`, tool and script environments
-//! and cross-target bundles.
+//! and cross-target bundles. A wheel's files are unpacked once into
+//! `~/.cache/vivar/unpacked/<sha256>/` and hard-linked into every
+//! environment that wants them (copied where linking is impossible, or with
+//! `VIVAR_LINK_MODE=copy`), so ten environments with torch cost one torch.
 
-use crate::{sha256, zip};
+use crate::{dirs, sha256, zip};
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -110,6 +113,7 @@ pub fn install_wheel_from(
     let data = fs::read(wheel).with_context(|| format!("reading {}", wheel.display()))?;
     let entries =
         zip::entries(&data).with_context(|| format!("{} is not a wheel", wheel.display()))?;
+    let store = Store::for_wheel(&data);
     let dist_info = entries
         .iter()
         .find_map(|e| {
@@ -179,14 +183,12 @@ pub fn install_wheel_from(
             bytes = rewritten;
         }
         fs::create_dir_all(target.parent().context("target has no parent")?)?;
-        fs::write(&target, &bytes).with_context(|| format!("writing {}", target.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = if is_script { 0o755 } else { entry.mode & 0o777 };
-            if mode != 0 {
-                fs::set_permissions(&target, fs::Permissions::from_mode(mode))?;
-            }
+        let mode = if is_script { 0o755 } else { entry.mode & 0o777 };
+        // Scripts are rewritten for this environment, so they are its own;
+        // everything else is the wheel's and comes out of the shared store.
+        match (&store, is_script) {
+            (Some(store), false) => store.place(&entry.name, &bytes, mode, &target)?,
+            _ => write_file(&target, &bytes, mode)?,
         }
         record.push((
             rel_to_site(&target),
@@ -245,6 +247,72 @@ pub fn install_wheel_from(
         dist_info: info,
         direct_url: direct_url.map(|d| d.trim().to_owned()),
     })
+}
+
+/// Writes `bytes` to `path` (replacing whatever is there) with `mode` on Unix.
+fn write_file(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    let _ = fs::remove_file(path);
+    fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    if mode != 0 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    Ok(())
+}
+
+/// The unpacked-wheel store: one directory per wheel, by hash, that
+/// environments hard-link from.
+struct Store {
+    dir: PathBuf,
+}
+
+impl Store {
+    /// None when linking is switched off (`VIVAR_LINK_MODE=copy`) or there
+    /// is no cache directory to use.
+    fn for_wheel(data: &[u8]) -> Option<Store> {
+        if std::env::var("VIVAR_LINK_MODE").is_ok_and(|m| m == "copy") {
+            return None;
+        }
+        let mut h = sha256::Sha256::new();
+        h.update(data);
+        let dir = dirs::cache()
+            .ok()?
+            .join("unpacked")
+            .join(sha256::hex(&h.finish()));
+        fs::create_dir_all(&dir).ok()?;
+        Some(Store { dir })
+    }
+
+    /// Puts the wheel member `name` at `target`: a hard link to the store's
+    /// copy (made on first use), or a plain file when the link cannot be made
+    /// (another filesystem, a filesystem without links).
+    fn place(&self, name: &str, bytes: &[u8], mode: u32, target: &Path) -> Result<()> {
+        let cached = self.dir.join(name);
+        let fresh = match fs::metadata(&cached) {
+            Ok(m) if m.len() == bytes.len() as u64 => false,
+            _ => {
+                // Written whole under another name, then renamed: a parallel
+                // install never links a half-written file.
+                let part = self.dir.join(format!("{name}.part-{}", std::process::id()));
+                fs::create_dir_all(cached.parent().context("store path")?)?;
+                write_file(&part, bytes, mode)?;
+                fs::rename(&part, &cached)?;
+                true
+            }
+        };
+        let _ = fs::remove_file(target);
+        if fs::hard_link(&cached, target).is_ok() {
+            return Ok(());
+        }
+        if !fresh {
+            // A stale or foreign store entry is no reason to fail the install.
+            let _ = fs::remove_file(&cached);
+        }
+        write_file(target, bytes, mode)
+    }
 }
 
 /// Removes a distribution: every file in its RECORD, then empty directories.

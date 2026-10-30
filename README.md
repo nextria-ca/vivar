@@ -10,7 +10,7 @@ See [DESIGN.md](DESIGN.md) for the why and the roadmap, and
 ## Status
 
 **Usable today, pre-1.0.** Phases 0, 3 and 4 of the [design](DESIGN.md) are implemented,
-tested on Linux, macOS and Windows in CI (103 tests), and reviewed. No release has been
+tested on Linux, macOS and Windows in CI (109 tests), and reviewed. No release has been
 tagged yet; see Install for how to get it in the meantime.
 
 What works:
@@ -41,10 +41,10 @@ Python project: `pyproject.toml` (PEP 621), `.python-version`, a normal `.venv`,
 `uv.lock`. Anyone without vivar can still use it with `uv` or `pip`.
 
 Without uv, direct references (`pkg @ https://…/pkg.whl`, a `.tar.gz`, or
-`git+https://…@rev`) and packages that ship only a source distribution are built by
-vivar's own PEP 517 driver and cached; extra indexes, per-package sources, profiles
-(`cpu` / `cu124` / `rocm6.2`) and workspaces resolve natively too, so nothing in the
-day-to-day flow needs uv. Not yet: native (conda-forge) dependencies, and
+`git+https://…@rev#subdirectory=sub`) and packages that ship only a source distribution
+are built by vivar's own PEP 517 driver and cached; extra indexes, per-package sources,
+profiles (`cpu` / `cu124` / `rocm6.2`) and workspaces resolve natively too, so nothing in
+the day-to-day flow needs uv. CI runs the whole suite on both backends. Not yet: native (conda-forge) dependencies, and
 model-weight management (out of scope by decision).
 
 ## Install
@@ -183,6 +183,7 @@ vivar upgrade-deps [pkg…]       # upgrade within the declared constraints, the
 vivar licenses                  # every installed package with its license
 vivar audit                     # known vulnerabilities (OSV) for the locked packages
 vivar build                     # sdist + wheel into dist/
+vivar publish                   # upload dist/ to PyPI or an internal index (--repository-url, VIVAR_PUBLISH_TOKEN)
 vivar export docker             # a Dockerfile that installs exactly what uv.lock pins
 vivar export requirements       # pinned, hashed requirements.txt for pip-only consumers
 vivar export wheelhouse --target windows-x86_64 --python 3.12   # the lock's wheels, for offline installs
@@ -195,6 +196,7 @@ vivar pack --zstd --use-host-cuda               # faster compression; leave CUDA
 vivar kernel install            # register .venv as a Jupyter kernel (needs ipykernel)
 vivar run --env-file .env train.py
 vivar python pin 3.13           # repin the project and rebuild .venv on it
+vivar verify app-linux-x86_64.tar.gz        # a bundle for another machine, checked without running it
 vivar diff a.tar.gz b.tar.gz    # what changed between two bundles
 vivar diff --patch a.tar.gz b.tar.gz        # a delta archive; `vivar unpack --apply delta.tar.gz <unpacked-a>` upgrades in place
 vivar unpack --dedupe-with ./other b.tar.gz # hard-link files identical to an already unpacked bundle
@@ -323,7 +325,12 @@ vivar verify ./my-app   # an unpacked bundle, or a .venv directly
 ```
 
 `verify` runs inside the environment's own Python, so it needs no `uv` and works
-on an unpacked bundle. It exits non-zero if anything is broken:
+on an unpacked bundle. Given a bundle archive, or a bundle built for another
+platform (`vivar verify --static` forces it), it checks what the files alone can
+tell: integrity against the checksum lists, the interpreter and venv layout for that
+platform, every package's wheel tags and compiled extensions against it, and where
+the launchers point. The import, library and GPU checks still happen on the target.
+Run on this machine, it exits non-zero if anything is broken:
 
 - **Imports**: every top-level module of every installed package is imported in
   an isolated child process. A wheel built against a library the host lacks
@@ -383,8 +390,12 @@ Existing `[tool.vivar]` sections are never overwritten by `vivar init`.
 ## Footprint
 
 Three direct dependencies (`clap` with minimal features, `toml_edit`, `anyhow`),
-a release build under 1 MB, and no runtime beyond the `uv` binary it drives.
-`vivar init` creates no sample code, README, or git repo.
+a release build under 1 MB, and no runtime beyond the OS (`curl`, `tar`, `git` for
+git references) and, optionally, the `uv` binary it drives. The native installer
+unpacks each wheel once into `~/.cache/vivar/unpacked/<sha256>/` and hard-links its
+files into every environment (`VIVAR_LINK_MODE=copy` turns that off), so ten
+environments with torch cost one torch on disk. `vivar init` creates no sample code,
+README, or git repo.
 
 ## Development
 
@@ -392,6 +403,7 @@ a release build under 1 MB, and no runtime beyond the `uv` binary it drives.
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test            # unit tests + end-to-end tests (need `uv` on PATH and network on first run)
+VIVAR_BACKEND=native cargo test --test cli -- --include-ignored   # the same suite on the in-house backend (CI runs both)
 ```
 
 Regenerate the license inventory after changing dependencies:
@@ -406,6 +418,8 @@ Layout:
 - `src/main.rs`: CLI (clap) and command wiring.
 - `src/project.rs`: project discovery, `[tool.vivar]` defaults, policy parsing and checks.
 - `src/backend.rs`: the `Backend` trait and the phase 0 `UvBackend`.
+- `src/native.rs`, `src/resolve.rs`, `src/install.rs`, `src/index.rs`, `src/pep.rs`, `src/zip.rs`: the uv-free backend.
+- `src/publish.rs`: `publish`, the legacy upload API through curl.
 - `src/bundle.rs`: `pack`/`unpack` portable bundles (shells out to `tar`).
 - `src/verify.rs` + `src/verify.py`: `verify`, a Python driver run by the env's own interpreter.
 - `tests/cli.rs`: end-to-end tests against the built binary.

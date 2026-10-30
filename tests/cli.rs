@@ -1565,6 +1565,19 @@ fn cross_target_pack_builds_a_runnable_bundle() {
         "console script from a cross-built bundle failed"
     );
     assert!(stdout_of(&ok(&dest, &["verify"])).contains("integrity: all bundled files match"));
+    // --static checks the unpacked bundle's files without running it: a
+    // stray extension built for another interpreter is caught.
+    let stray = site_packages(&dest).join("stray.cpython-311-x86_64-linux-gnu.so");
+    fs::write(&stray, b"not really").unwrap();
+    let out = vivar(&dest, &["verify", "--static"]);
+    assert!(!out.status.success());
+    let text = stdout_of(&out);
+    assert!(
+        text.contains("built for CPython 311, not 3.12") && text.contains("not in the bundle"),
+        "{text}"
+    );
+    fs::remove_file(&stray).unwrap();
+    assert!(stdout_of(&ok(&dest, &["verify", "--static"])).contains("0 errors"));
 
     // Another platform: built, listed, structurally right, never executed.
     let other = if cfg!(target_os = "linux") {
@@ -1606,6 +1619,21 @@ fn cross_target_pack_builds_a_runnable_bundle() {
         ],
     ));
     assert!(diff.contains("platform:"), "{diff}");
+    // A bundle for another machine is verified statically: integrity, the
+    // layout for that platform, every wheel's tags, the launchers.
+    let text = stdout_of(&ok(&tmp.0, &["verify", archive2.to_str().unwrap()]));
+    assert!(
+        text.contains(&format!("static check of a {other} bundle")) && text.contains("0 errors"),
+        "{text}"
+    );
+    let json = stdout_of(&ok(
+        &tmp.0,
+        &["verify", "--json", archive2.to_str().unwrap()],
+    ));
+    assert!(
+        json.contains("\"static\": true") && json.contains(&format!("\"platform\": \"{other}\"")),
+        "{json}"
+    );
 }
 
 #[test]
@@ -2479,6 +2507,18 @@ fn native_backend_syncs_from_the_lock_without_uv() {
         "{}",
         stdout_of(&out)
     );
+    // A wheel's files are hard-linked from the unpacked-wheel store, so a
+    // second environment with six costs no second copy of six.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let six = site_packages(dir).join("six.py");
+        assert!(
+            fs::metadata(&six).unwrap().nlink() >= 2,
+            "{} is a copy, not a link into the store",
+            six.display()
+        );
+    }
     okn(
         dir,
         &[
@@ -2682,7 +2722,7 @@ fn native_backend_syncs_from_the_lock_without_uv() {
     assert!(status.success());
     let out = okn(dir, &["add", &format!("sdistpkg @ {}", file_url(&tarball))]);
     assert!(
-        stdout_of(&out).contains("building sdistpkg from source"),
+        String::from_utf8_lossy(&out.stderr).contains("building sdistpkg from source"),
         "{}",
         stdout_of(&out)
     );
@@ -2789,6 +2829,90 @@ fn native_backend_syncs_from_the_lock_without_uv() {
             "{lock}"
         );
         okn(dir, &["remove", "gitpkg"]);
+
+        // A package in a subdirectory of the repository.
+        fs::create_dir_all(repo.join("sub").join("src").join("subpkg")).unwrap();
+        fs::write(
+            repo.join("sub").join("pyproject.toml"),
+            "[project]\nname = \"subpkg\"\nversion = \"0.3\"\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("sub")
+                .join("src")
+                .join("subpkg")
+                .join("__init__.py"),
+            "VALUE = 3\n",
+        )
+        .unwrap();
+        for args in [
+            vec!["-c", "user.name=t", "-c", "user.email=t@t", "add", "."],
+            vec![
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "sub",
+            ],
+        ] {
+            let st = Command::new("git")
+                .current_dir(&repo)
+                .args(&args)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?}");
+        }
+        let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
+            .current_dir(dir)
+            .env("VIVAR_BACKEND", "native")
+            .env("PATH", &path_with_git)
+            .args([
+                "add",
+                &format!("subpkg @ git+{}@main#subdirectory=sub", file_url(&repo)),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git subdirectory add failed:\n{}{}",
+            stdout_of(&out),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        okn(
+            dir,
+            &[
+                "run",
+                "python",
+                "-c",
+                "import subpkg; assert subpkg.VALUE == 3",
+            ],
+        );
+        let lock = read(&dir.join("uv.lock"));
+        assert!(lock.contains("?subdirectory=sub&rev=main#"), "{lock}");
+        let direct_url = site_packages(dir)
+            .join("subpkg-0.3.dist-info")
+            .join("direct_url.json");
+        assert!(read(&direct_url).contains("\"subdirectory\":\"sub\""));
+        // Resynced from the lock, the subdirectory build is what stays.
+        okn(dir, &["sync"]);
+        okn(dir, &["run", "python", "-c", "import subpkg"]);
+        // A subdirectory that climbs out of the checkout is refused.
+        let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
+            .current_dir(dir)
+            .env("VIVAR_BACKEND", "native")
+            .env("PATH", &path_with_git)
+            .args([
+                "add",
+                &format!("evil @ git+{}@main#subdirectory=../x", file_url(&repo)),
+            ])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("inside the repository"));
+        okn(dir, &["remove", "subpkg"]);
     }
     okn(dir, &["remove", "minipkg", "sdistpkg"]);
     assert!(!native(dir, &["run", "python", "-c", "import minipkg"])
@@ -3002,4 +3126,167 @@ fn native_backend_syncs_from_the_lock_without_uv() {
             .unwrap();
         assert!(out.status.success());
     }
+}
+
+#[test]
+fn publish_uploads_through_the_legacy_api() {
+    let tmp = TempDir::new("publish");
+    let dir = &tmp.0;
+    init(dir);
+    // A wheel and an sdist in dist/, as `vivar build` would leave them.
+    let dist = dir.join("dist");
+    make_wheel(dir, &dist);
+    let sdist = dist.join("minipkg-1.0.tar.gz");
+    ok(
+        dir,
+        &[
+            "run",
+            "python",
+            "-c",
+            &format!(
+                "import tarfile, io\n\
+                 t = tarfile.open({:?}, 'w:gz')\n\
+                 data = b'Metadata-Version: 2.1\\nName: minipkg\\nVersion: 1.0\\nSummary: tiny\\n\\nthe readme\\n'\n\
+                 ti = tarfile.TarInfo('minipkg-1.0/PKG-INFO'); ti.size = len(data)\n\
+                 t.addfile(ti, io.BytesIO(data)); t.close()\n",
+                sdist.to_str().unwrap()
+            ),
+        ],
+    );
+    let out = ok(
+        dir,
+        &[
+            "publish",
+            "--dry-run",
+            "--repository-url",
+            "http://127.0.0.1:1/",
+        ],
+    );
+    let text = stdout_of(&out);
+    assert!(
+        text.contains("would upload minipkg-1.0-py3-none-any.whl (minipkg 1.0 bdist_wheel)")
+            && text.contains("would upload minipkg-1.0.tar.gz (minipkg 1.0 sdist)"),
+        "{text}"
+    );
+
+    // An upload endpoint of our own that records what arrives.
+    const SERVER: &str = r#"import http.server, json, sys, email.parser
+out, n, mode = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+seen = []
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers['Content-Length']))
+        msg = email.parser.BytesParser().parsebytes(b'Content-Type: ' + self.headers['Content-Type'].encode() + b'\r\n\r\n' + body)
+        fields = {}
+        for part in msg.get_payload():
+            name = part.get_param('name', header='content-disposition')
+            fn = part.get_param('filename', header='content-disposition')
+            if fn: fields['content'] = {'filename': fn, 'size': len(part.get_payload(decode=True))}
+            else: fields.setdefault(name, []).append(part.get_payload(decode=True).decode())
+        fields['auth'] = self.headers.get('Authorization', '')
+        seen.append(fields)
+        if mode == 'exists':
+            self.send_response(400); self.end_headers(); self.wfile.write(b'400 File already exists.')
+        else:
+            self.send_response(200); self.end_headers(); self.wfile.write(b'OK')
+s = http.server.HTTPServer(('127.0.0.1', 0), H)
+print(s.server_address[1], flush=True)
+for _ in range(n): s.handle_request()
+json.dump(seen, open(out, 'w'))
+"#;
+    let python = dir.join(".venv").join(BIN).join(exe("python"));
+    let serve = |mode: &str, n: &str, record: &Path| {
+        let mut child = Command::new(&python)
+            .args(["-c", SERVER, record.to_str().unwrap(), n, mode])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut port = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.take().unwrap()),
+            &mut port,
+        )
+        .unwrap();
+        (child, format!("http://127.0.0.1:{}/", port.trim()))
+    };
+
+    let record = tmp.0.join("seen.json");
+    let (mut server, url) = serve("ok", "2", &record);
+    let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
+        .current_dir(dir)
+        .env("VIVAR_PUBLISH_TOKEN", "s3cret")
+        .args(["publish", "--repository-url", &url])
+        .output()
+        .unwrap();
+    assert!(server.wait().unwrap().success());
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout_of(&out).contains("published 2 file(s)"),
+        "{}",
+        stdout_of(&out)
+    );
+    let seen = read(&record);
+    // Basic auth with __token__, the legacy form fields, the file itself.
+    assert!(
+        seen.contains("\"auth\": \"Basic X190b2tlbl9fOnMzY3JldA==\""),
+        "{seen}"
+    );
+    for needle in [
+        "\":action\": [\"file_upload\"]",
+        "\"name\": [\"minipkg\"]",
+        "\"version\": [\"1.0\"]",
+        "\"filetype\": [\"bdist_wheel\"]",
+        "\"filetype\": [\"sdist\"]",
+        "\"pyversion\": [\"py3\"]",
+        "\"pyversion\": [\"source\"]",
+        "\"summary\": [\"tiny\"]",
+        "\"description\": [\"the readme",
+        "\"license_expression\": [\"MIT\"]",
+        "\"filename\": \"minipkg-1.0-py3-none-any.whl\"",
+        "\"filename\": \"minipkg-1.0.tar.gz\"",
+        "\"sha256_digest\"",
+    ] {
+        assert!(seen.contains(needle), "{needle} missing from\n{seen}");
+    }
+
+    // An index that already has the file: an error, unless --skip-existing.
+    let (mut server, url) = serve("exists", "1", &record);
+    let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
+        .current_dir(dir)
+        .env("VIVAR_PUBLISH_TOKEN", "s3cret")
+        .args(["publish", "--repository-url", &url])
+        .output()
+        .unwrap();
+    assert!(server.wait().unwrap().success());
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("HTTP 400"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (mut server, url) = serve("exists", "2", &record);
+    let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
+        .current_dir(dir)
+        .env("VIVAR_PUBLISH_TOKEN", "s3cret")
+        .args(["publish", "--skip-existing", "--repository-url", &url])
+        .output()
+        .unwrap();
+    assert!(server.wait().unwrap().success());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout_of(&out).contains("published 0 file(s)")
+            && stdout_of(&out).contains("2 already there"),
+        "{}",
+        stdout_of(&out)
+    );
 }

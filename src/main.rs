@@ -18,6 +18,7 @@ mod man;
 mod native;
 mod pep;
 mod project;
+mod publish;
 mod python;
 mod resolve;
 mod sbom;
@@ -210,6 +211,34 @@ GPU vivar detects."
     },
     /// Build the project's sdist and wheel into dist/
     Build,
+    /// Upload the built distributions in dist/ to a package index
+    #[command(
+        long_about = "Upload wheels and source distributions to a package index through the \
+upload API every index speaks (PyPI, devpi, Artifactory, Nexus, GitLab). Files default to \
+everything in dist/. Credentials come from --token or --username/--password, from \
+VIVAR_PUBLISH_TOKEN or VIVAR_PUBLISH_USERNAME/VIVAR_PUBLISH_PASSWORD, or from ~/.netrc; \
+they are never put on a command line. --dry-run shows what would be sent."
+    )]
+    Publish {
+        /// Files to upload (default: dist/*.whl and dist/*.tar.gz)
+        files: Vec<PathBuf>,
+        /// Upload endpoint (default: VIVAR_PUBLISH_URL or PyPI)
+        #[arg(long)]
+        repository_url: Option<String>,
+        /// An API token (user `__token__`)
+        #[arg(long, conflicts_with = "password")]
+        token: Option<String>,
+        #[arg(long)]
+        username: Option<String>,
+        #[arg(long)]
+        password: Option<String>,
+        /// Treat a file the index already has as uploaded
+        #[arg(long)]
+        skip_existing: bool,
+        /// Show what would be uploaded and stop
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Write deployment files for the locked environment
     Export {
         #[command(subcommand)]
@@ -317,7 +346,7 @@ an unpacked bundle it also reports files changed since packing. --json prints a 
 CI can gate on."
     )]
     Verify {
-        /// Project, bundle, or .venv directory (default: the current project)
+        /// Project, bundle archive or directory, or .venv (default: the current project)
         path: Option<PathBuf>,
         /// Report a missing GPU/driver as a warning instead of an error
         #[arg(long)]
@@ -328,6 +357,10 @@ CI can gate on."
         /// Machine-readable report
         #[arg(long)]
         json: bool,
+        /// Check the bundle's files, tags and layout without running it (automatic for
+        /// an archive or a bundle built for another platform)
+        #[arg(long = "static")]
+        static_only: bool,
     },
     /// Replace this binary with the latest release (or a given one)
     Upgrade {
@@ -959,6 +992,46 @@ fn main() -> Result<()> {
             require(project, &cwd)?;
             backend.build(&cwd)?;
         }
+        Command::Publish {
+            files,
+            repository_url,
+            token,
+            username,
+            password,
+            skip_existing,
+            dry_run,
+        } => {
+            let files = if files.is_empty() {
+                let root = project
+                    .as_ref()
+                    .map(|p| p.root.clone())
+                    .unwrap_or_else(|| cwd.clone());
+                publish::dist_files(&root)?
+            } else {
+                files
+            };
+            let opts = publish::Options {
+                repository: repository_url
+                    .or_else(|| std::env::var("VIVAR_PUBLISH_URL").ok())
+                    .unwrap_or_else(|| publish::DEFAULT_URL.to_owned()),
+                username,
+                password: token.or(password),
+                skip_existing,
+                dry_run,
+            };
+            let (sent, skipped) = publish::run(&files, &opts)?;
+            if !dry_run {
+                println!(
+                    "published {sent} file(s) to {}{}",
+                    opts.repository,
+                    if skipped > 0 {
+                        format!(", {skipped} already there")
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+        }
         Command::Export { command } => match command {
             ExportCommand::Sbom { format, output } => {
                 let project = require(project, &cwd)?;
@@ -1199,6 +1272,7 @@ fn main() -> Result<()> {
             allow_missing_gpu,
             verbose,
             json,
+            static_only,
         } => {
             let base = match path {
                 Some(p) => p,
@@ -1207,6 +1281,20 @@ fn main() -> Result<()> {
                     .map(|p| p.venv_root().to_path_buf())
                     .unwrap_or(cwd),
             };
+            // An archive, or a bundle built for another machine, cannot be
+            // run here: check what its files say instead.
+            let foreign = base.is_dir()
+                && base.join(bundle::MANIFEST).is_file()
+                && bundle::platform_of(&base).is_ok_and(|p| p != bundle::platform());
+            if static_only || base.is_file() || foreign {
+                let report = bundle::verify_static(&base)?;
+                if json {
+                    print!("{}", report.json(&base));
+                } else {
+                    print!("{}", report.text());
+                }
+                std::process::exit(if report.errors() > 0 { 1 } else { 0 });
+            }
             let venv = verify::find_venv(&base)?;
             let (mut code, mut report) = verify::run(&venv, allow_missing_gpu, verbose, json)?;
             // An unpacked bundle also carries checksums: report anything changed since packing.

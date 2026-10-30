@@ -1,5 +1,6 @@
-//! Just enough zip to read wheels: the central directory, stored and
-//! deflated entries (RFC 1951 inflate written out in full), Unix modes.
+//! Just enough zip to read wheels: the central directory (zip64 included),
+//! stored and deflated entries (RFC 1951 inflate written out in full), Unix
+//! modes.
 
 use anyhow::{anyhow, bail, Result};
 
@@ -22,7 +23,9 @@ impl Entry {
     }
 }
 
-/// Lists the entries of a zip held in memory.
+/// Lists the entries of a zip held in memory. Zip64 archives (more than
+/// 65,535 entries or members past 4 GB, as the largest CUDA wheels are)
+/// are read through their zip64 records.
 pub fn entries(data: &[u8]) -> Result<Vec<Entry>> {
     // End of central directory: scan back for its signature (a comment may follow).
     let min = data.len().saturating_sub(22 + 65_535);
@@ -30,27 +33,72 @@ pub fn entries(data: &[u8]) -> Result<Vec<Entry>> {
         .rev()
         .find(|&i| data[i..].starts_with(&[0x50, 0x4b, 0x05, 0x06]))
         .ok_or_else(|| anyhow!("not a zip file (no end-of-central-directory record)"))?;
-    let count = u16le(data, eocd + 10)? as usize;
-    let mut pos = u32le(data, eocd + 16)? as usize;
-    let mut out = Vec::with_capacity(count);
+    let mut count = u16le(data, eocd + 10)? as u64;
+    let mut pos = u32le(data, eocd + 16)? as u64;
+    if count == 0xffff || pos == 0xffff_ffff {
+        // The zip64 locator sits right before the EOCD and points at the
+        // zip64 EOCD record, which holds the real count and offset.
+        let locator = eocd
+            .checked_sub(20)
+            .filter(|&l| data[l..].starts_with(&[0x50, 0x4b, 0x06, 0x07]))
+            .ok_or_else(|| anyhow!("zip64 archive without a zip64 locator"))?;
+        let record = u64le(data, locator + 8)? as usize;
+        if !data
+            .get(record..record + 4)
+            .is_some_and(|s| s == [0x50, 0x4b, 0x06, 0x06])
+        {
+            bail!("corrupt zip64 end-of-central-directory record");
+        }
+        count = u64le(data, record + 32)?;
+        pos = u64le(data, record + 48)?;
+    }
+    let mut pos =
+        usize::try_from(pos).map_err(|_| anyhow!("zip central directory offset too large"))?;
+    let count = usize::try_from(count).map_err(|_| anyhow!("too many zip entries"))?;
+    let mut out = Vec::with_capacity(count.min(1 << 20));
     for _ in 0..count {
-        if !data[pos..].starts_with(&[0x50, 0x4b, 0x01, 0x02]) {
+        if !data
+            .get(pos..pos + 4)
+            .is_some_and(|s| s == [0x50, 0x4b, 0x01, 0x02])
+        {
             bail!("corrupt zip central directory");
         }
         let method = u16le(data, pos + 10)?;
-        let compressed = u32le(data, pos + 20)? as u64;
-        let size = u32le(data, pos + 24)? as u64;
+        let mut compressed = u32le(data, pos + 20)? as u64;
+        let mut size = u32le(data, pos + 24)? as u64;
         let name_len = u16le(data, pos + 28)? as usize;
         let extra_len = u16le(data, pos + 30)? as usize;
         let comment_len = u16le(data, pos + 32)? as usize;
         let external = u32le(data, pos + 38)?;
-        let local_header = u32le(data, pos + 42)? as u64;
+        let mut local_header = u32le(data, pos + 42)? as u64;
         let name_bytes = data
             .get(pos + 46..pos + 46 + name_len)
             .ok_or_else(|| anyhow!("corrupt zip entry name"))?;
         let name = String::from_utf8_lossy(name_bytes).into_owned();
-        if compressed == 0xffff_ffff || size == 0xffff_ffff {
-            bail!("zip64 archives are not supported ({name})");
+        if compressed == 0xffff_ffff || size == 0xffff_ffff || local_header == 0xffff_ffff {
+            // The zip64 extra field carries, in this order, only the values
+            // the fixed record could not hold.
+            let extra_start = pos + 46 + name_len;
+            let extra = data
+                .get(extra_start..extra_start + extra_len)
+                .ok_or_else(|| anyhow!("corrupt zip extra field for {name}"))?;
+            let field = zip64_extra(extra)
+                .ok_or_else(|| anyhow!("{name}: zip64 sizes without a zip64 extra field"))?;
+            let mut at = 0;
+            let mut take = || -> Result<u64> {
+                let v = u64le(field, at)?;
+                at += 8;
+                Ok(v)
+            };
+            if size == 0xffff_ffff {
+                size = take()?;
+            }
+            if compressed == 0xffff_ffff {
+                compressed = take()?;
+            }
+            if local_header == 0xffff_ffff {
+                local_header = take()?;
+            }
         }
         out.push(Entry {
             name,
@@ -65,6 +113,20 @@ pub fn entries(data: &[u8]) -> Result<Vec<Entry>> {
     Ok(out)
 }
 
+/// The body of the zip64 extended information extra field (id 0x0001).
+fn zip64_extra(extra: &[u8]) -> Option<&[u8]> {
+    let mut at = 0;
+    while at + 4 <= extra.len() {
+        let id = u16le(extra, at).ok()?;
+        let len = u16le(extra, at + 2).ok()? as usize;
+        if id == 0x0001 {
+            return extra.get(at + 4..at + 4 + len);
+        }
+        at += 4 + len;
+    }
+    None
+}
+
 /// The decompressed bytes of an entry.
 pub fn read(data: &[u8], entry: &Entry) -> Result<Vec<u8>> {
     let h = entry.local_header as usize;
@@ -77,8 +139,10 @@ pub fn read(data: &[u8], entry: &Entry) -> Result<Vec<u8>> {
     let name_len = u16le(data, h + 26)? as usize;
     let extra_len = u16le(data, h + 28)? as usize;
     let start = h + 30 + name_len + extra_len;
+    let compressed = usize::try_from(entry.compressed)
+        .map_err(|_| anyhow!("{}: entry too large for this machine", entry.name))?;
     let raw = data
-        .get(start..start + entry.compressed as usize)
+        .get(start..start + compressed)
         .ok_or_else(|| anyhow!("truncated zip data for {}", entry.name))?;
     let out = match entry.method {
         0 => raw.to_vec(),
@@ -100,6 +164,12 @@ fn u16le(d: &[u8], at: usize) -> Result<u16> {
 fn u32le(d: &[u8], at: usize) -> Result<u32> {
     d.get(at..at + 4)
         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .ok_or_else(|| anyhow!("truncated zip"))
+}
+
+fn u64le(d: &[u8], at: usize) -> Result<u64> {
+    d.get(at..at + 8)
+        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
         .ok_or_else(|| anyhow!("truncated zip"))
 }
 
@@ -390,6 +460,71 @@ mod tests {
         let v2: Vec<u8> = (0..=255u8).cycle().take(1024).collect();
         assert_eq!(inflate(V2, 1024).unwrap(), v2);
         assert!(inflate(&V1[..5], 42).is_err());
+    }
+
+    /// A one-member archive whose central directory and end record are in
+    /// zip64 form, as a writer leaves them for members past 4 GB.
+    fn zip64_archive(name: &[u8], body: &[u8]) -> Vec<u8> {
+        let mut z = Vec::new();
+        let local = z.len() as u64;
+        z.extend_from_slice(&[0x50, 0x4b, 0x03, 0x04, 45, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        z.extend_from_slice(&[0; 4]); // crc (unchecked)
+        z.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        z.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        z.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes());
+        z.extend_from_slice(name);
+        z.extend_from_slice(body);
+        let cd = z.len() as u64;
+        z.extend_from_slice(&[0x50, 0x4b, 0x01, 0x02, 45, 3, 45, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        z.extend_from_slice(&[0; 4]); // crc
+        z.extend_from_slice(&[0xff; 4]); // compressed: in the zip64 field
+        z.extend_from_slice(&[0xff; 4]); // size: in the zip64 field
+        z.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        z.extend_from_slice(&28u16.to_le_bytes()); // extra length
+        z.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // comment, disk, internal attrs
+        z.extend_from_slice(&(0o100644u32 << 16).to_le_bytes());
+        z.extend_from_slice(&[0xff; 4]); // local header: in the zip64 field
+        z.extend_from_slice(name);
+        z.extend_from_slice(&[0x01, 0x00, 24, 0]);
+        z.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        z.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        z.extend_from_slice(&local.to_le_bytes());
+        let cd_size = z.len() as u64 - cd;
+        let z64 = z.len() as u64;
+        z.extend_from_slice(&[0x50, 0x4b, 0x06, 0x06]);
+        z.extend_from_slice(&44u64.to_le_bytes());
+        z.extend_from_slice(&[45, 3, 45, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        z.extend_from_slice(&1u64.to_le_bytes());
+        z.extend_from_slice(&1u64.to_le_bytes());
+        z.extend_from_slice(&cd_size.to_le_bytes());
+        z.extend_from_slice(&cd.to_le_bytes());
+        z.extend_from_slice(&[0x50, 0x4b, 0x06, 0x07, 0, 0, 0, 0]);
+        z.extend_from_slice(&z64.to_le_bytes());
+        z.extend_from_slice(&1u32.to_le_bytes());
+        z.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]);
+        z.extend_from_slice(&(cd_size as u32).to_le_bytes());
+        z.extend_from_slice(&[0xff; 4]);
+        z.extend_from_slice(&[0, 0]);
+        z
+    }
+
+    #[test]
+    fn reads_zip64_archives() {
+        let z = zip64_archive(b"big/file.bin", b"payload past the 4 GB mark, in spirit");
+        let list = entries(&z).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "big/file.bin");
+        assert_eq!(list[0].mode & 0o777, 0o644);
+        assert_eq!(
+            read(&z, &list[0]).unwrap(),
+            b"payload past the 4 GB mark, in spirit"
+        );
+        // Without its locator the zip64 end record cannot be found.
+        let mut broken = z.clone();
+        let locator = broken.len() - 22 - 20;
+        broken[locator..locator + 4].copy_from_slice(&[0; 4]);
+        assert!(entries(&broken).is_err());
     }
 
     #[test]

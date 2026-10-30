@@ -121,11 +121,13 @@ pub enum Source {
     Registry(String),
     /// A wheel or source distribution at a URL (`name @ https://…`).
     Url(String),
-    /// A git checkout (`name @ git+https://…@rev`), pinned to a commit.
+    /// A git checkout (`name @ git+https://…@rev#subdirectory=sub`), pinned
+    /// to a commit.
     Git {
         url: String,
         rev: Option<String>,
         commit: String,
+        subdirectory: Option<String>,
     },
 }
 
@@ -1448,6 +1450,51 @@ impl<'a> Resolver<'a> {
 
 /// An actual pin to one release (`==1.2.3`, `===x`), not `==1.*` or a range.
 /// `git+https://host/repo.git@rev` → (`https://host/repo.git`, `Some("rev")`).
+/// The lock's form of a git source, as uv writes it: the repository, then
+/// `?subdirectory=…` and `&rev=…` as asked, then `#commit`.
+pub fn git_lock_url(
+    url: &str,
+    rev: &Option<String>,
+    commit: &str,
+    subdirectory: &Option<String>,
+) -> String {
+    let mut query = Vec::new();
+    if let Some(s) = subdirectory {
+        query.push(format!("subdirectory={s}"));
+    }
+    if let Some(r) = rev {
+        query.push(format!("rev={r}"));
+    }
+    if query.is_empty() {
+        format!("{url}#{commit}")
+    } else {
+        format!("{url}?{}#{commit}", query.join("&"))
+    }
+}
+
+/// The `subdirectory` named in a direct git reference's fragment
+/// (`git+https://…@rev#subdirectory=sub`), checked to stay inside the checkout.
+pub fn git_subdirectory(url: &str) -> Result<Option<String>> {
+    let Some((_, fragment)) = url.split_once('#') else {
+        return Ok(None);
+    };
+    for part in fragment.split('&') {
+        if let Some(sub) = part.strip_prefix("subdirectory=") {
+            let sub = sub.trim_matches('/');
+            let clean = !sub.is_empty()
+                && !sub.contains('\\')
+                && !sub
+                    .split('/')
+                    .any(|c| c.is_empty() || c == "." || c == "..");
+            if !clean {
+                bail!("{url}: `subdirectory={sub}` must be a relative path inside the repository");
+            }
+            return Ok(Some(sub.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
 pub fn git_parts(url: &str) -> (String, Option<String>) {
     let u = url.strip_prefix("git+").unwrap_or(url);
     let u = u.split('#').next().unwrap_or(u);
@@ -1582,14 +1629,12 @@ pub fn write_lock(roots: &Roots, lock: &Lockable) -> String {
         match source {
             Source::Registry(u) => src.insert("registry", u.as_str().into()),
             Source::Url(u) => src.insert("url", u.as_str().into()),
-            Source::Git { url, rev, commit } => src.insert(
-                "git",
-                match rev {
-                    Some(r) => format!("{url}?rev={r}#{commit}"),
-                    None => format!("{url}#{commit}"),
-                }
-                .into(),
-            ),
+            Source::Git {
+                url,
+                rev,
+                commit,
+                subdirectory,
+            } => src.insert("git", git_lock_url(url, rev, commit, subdirectory).into()),
         };
         src
     };
@@ -1816,14 +1861,12 @@ pub fn write_lock(roots: &Roots, lock: &Lockable) -> String {
         match &p.source {
             Source::Registry(url) => src.insert("registry", url.as_str().into()),
             Source::Url(u) => src.insert("url", u.as_str().into()),
-            Source::Git { url, rev, commit } => src.insert(
-                "git",
-                match rev {
-                    Some(r) => format!("{url}?rev={r}#{commit}"),
-                    None => format!("{url}#{commit}"),
-                }
-                .into(),
-            ),
+            Source::Git {
+                url,
+                rev,
+                commit,
+                subdirectory,
+            } => src.insert("git", git_lock_url(url, rev, commit, subdirectory).into()),
         };
         t["source"] = value(src);
         // Plain edges go to `dependencies`; `extra == 'x'` edges under the
@@ -2297,6 +2340,7 @@ mod tests {
                 url: "https://example.com/minipkg.git".into(),
                 rev: Some("main".into()),
                 commit: "abc123".into(),
+                subdirectory: None,
             },
             resolved: BTreeMap::new(),
             resolution_markers: Vec::new(),

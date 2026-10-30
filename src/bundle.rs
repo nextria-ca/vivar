@@ -393,8 +393,350 @@ fn metadata_of(
     Ok((fields, lock))
 }
 
-fn platform() -> String {
+/// This machine as a bundle names it: `linux-x86_64`, `macos-aarch64`, `windows-x86_64`.
+pub fn platform() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// The platform a bundle (archive or directory) was built for, from its manifest.
+pub fn platform_of(path: &Path) -> Result<String> {
+    let tmp = std::env::temp_dir().join(format!("vivar-platform-{}", std::process::id()));
+    let result = metadata_of(path, &tmp).map(|(fields, _)| {
+        fields
+            .get("platform")
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_owned())
+    });
+    let _ = fs::remove_dir_all(&tmp);
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Static verification: what can be checked of a bundle built for another
+// machine without running anything from it.
+
+/// One finding: `error` or `warning`, what it is about, and the detail.
+pub type Finding = (&'static str, String, String);
+
+pub struct StaticReport {
+    pub platform: String,
+    pub python: String,
+    pub packages: usize,
+    pub findings: Vec<Finding>,
+}
+
+impl StaticReport {
+    pub fn errors(&self) -> usize {
+        self.findings.iter().filter(|f| f.0 == "error").count()
+    }
+
+    /// The same shape `verify` prints for a live check, marked static.
+    pub fn json(&self, path: &Path) -> String {
+        let findings: Vec<String> = self
+            .findings
+            .iter()
+            .map(|(level, subject, detail)| {
+                format!(
+                    "{{\"level\": {}, \"subject\": {}, \"detail\": {}}}",
+                    crate::json::quote(level),
+                    crate::json::quote(subject),
+                    crate::json::quote(detail)
+                )
+            })
+            .collect();
+        format!(
+            "{{\n  \"venv\": {},\n  \"python\": {},\n  \"platform\": {},\n  \"static\": true,\n  \"packages\": {},\n  \"ok\": {},\n  \"findings\": [{}]\n}}\n",
+            crate::json::quote(&path.display().to_string()),
+            crate::json::quote(&self.python),
+            crate::json::quote(&self.platform),
+            self.packages,
+            self.packages.saturating_sub(self.errors()),
+            findings.join(", ")
+        )
+    }
+
+    pub fn text(&self) -> String {
+        let mut out = format!(
+            "static check of a {} bundle (Python {}); imports, native libraries and the GPU are checked by `vivar verify` on that machine\n",
+            self.platform, self.python
+        );
+        for (level, subject, detail) in &self.findings {
+            let tag = if *level == "error" { "ERR" } else { "WARN" };
+            out.push_str(&format!("  {tag:4} {subject}: {detail}\n"));
+        }
+        let warnings = self.findings.len() - self.errors();
+        out.push_str(&format!(
+            "summary: {} packages, {} errors, {} warnings\n",
+            self.packages,
+            self.errors(),
+            warnings
+        ));
+        out
+    }
+}
+
+/// Checks a bundle built for another platform: integrity against its
+/// checksum lists, the Python and venv layout for that platform, every
+/// package's wheel tags and compiled extensions against it, and the
+/// launchers' interpreter paths. `path` is an archive or a bundle directory.
+pub fn verify_static(path: &Path) -> Result<StaticReport> {
+    let tmp = std::env::temp_dir().join(format!("vivar-static-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let result = (|| {
+        let dir = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            fs::create_dir_all(&tmp)?;
+            extract(path, &tmp)?;
+            tmp.clone()
+        };
+        static_checks(&dir)
+    })();
+    let _ = fs::remove_dir_all(&tmp);
+    result
+}
+
+fn static_checks(dir: &Path) -> Result<StaticReport> {
+    let manifest = manifest_of(dir)?;
+    let field = |k: &str| {
+        manifest
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned()
+    };
+    let platform = field("platform");
+    let python = field("python");
+    let python_dir = field("python-dir");
+    let mm = major_minor(&python);
+    let (os, arch) = platform
+        .split_once('-')
+        .ok_or_else(|| anyhow!("the bundle manifest names no platform"))?;
+    let windows = os == "windows";
+    let mut findings: Vec<Finding> = Vec::new();
+    let mut err = |subject: &str, detail: String| {
+        findings.push(("error", subject.to_owned(), detail));
+    };
+
+    // 1. Integrity: the checksum list, and the pre-relocation inventory
+    // while the bundle still sits where `pack` left it.
+    for bad in verify_checksums(dir)? {
+        err("integrity", format!("{bad} since the bundle was packed"));
+    }
+    let unrelocated = pyvenv_cfg(&dir.join(".venv"), "home").ok().as_deref()
+        == Some(field("python-home").as_str());
+    if unrelocated && dir.join(INVENTORY).is_file() {
+        for bad in verify_inventory(dir)? {
+            err("integrity", format!("{bad} since the bundle was packed"));
+        }
+    }
+
+    // 2. The interpreter and the venv around it.
+    let interpreter = if windows {
+        dir.join(&python_dir).join("python.exe")
+    } else {
+        dir.join(&python_dir)
+            .join("bin")
+            .join(format!("python{mm}"))
+    };
+    if python_dir.is_empty() || !interpreter.is_file() {
+        err(
+            "python",
+            format!("the bundle has no interpreter at {}", interpreter.display()),
+        );
+    }
+    let site = if windows {
+        dir.join(".venv").join("Lib").join("site-packages")
+    } else {
+        dir.join(".venv")
+            .join("lib")
+            .join(format!("python{mm}"))
+            .join("site-packages")
+    };
+    if !site.is_dir() {
+        err(
+            "venv",
+            format!("no site-packages for Python {mm} at {}", site.display()),
+        );
+    }
+    let bin = dir
+        .join(".venv")
+        .join(if windows { "Scripts" } else { "bin" });
+    let launcher = bin.join(if windows { "python.exe" } else { "python" });
+    // On Unix the launcher is a symlink that dangles until `unpack` relocates it.
+    if fs::symlink_metadata(&launcher).is_err() {
+        err(
+            "venv",
+            format!("no interpreter launcher at {}", launcher.display()),
+        );
+    }
+
+    // 3. Every package's wheel tags fit the platform.
+    let target = crate::wheelhouse::Target::new(Some(&platform), &mm)?;
+    let mut packages = 0;
+    let mut cuda = false;
+    if let Ok(entries) = fs::read_dir(&site) {
+        let mut dists: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "dist-info"))
+            .collect();
+        dists.sort();
+        for info in dists {
+            packages += 1;
+            let stem = info
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            if stem.starts_with("nvidia_") || stem.starts_with("nvidia-") {
+                cuda = true;
+            }
+            let Ok(wheel) = fs::read_to_string(info.join("WHEEL")) else {
+                continue; // editable or hand-made: nothing compiled to check
+            };
+            let tags: Vec<&str> = wheel
+                .lines()
+                .filter_map(|l| l.strip_prefix("Tag:"))
+                .map(str::trim)
+                .collect();
+            if tags.is_empty() {
+                continue;
+            }
+            let fits = tags
+                .iter()
+                .any(|t| target.score(&format!("{stem}-{t}.whl")).is_some());
+            if !fits {
+                err(
+                    &stem.replace('_', "-"),
+                    format!(
+                        "built for {}, not {platform} on Python {mm}",
+                        tags.join(", ")
+                    ),
+                );
+            }
+        }
+    }
+
+    // 4. Compiled extensions carry their interpreter and platform in their name.
+    let mut files = Vec::new();
+    if site.is_dir() {
+        walk(dir, site.strip_prefix(dir).unwrap_or(&site), &mut files)?;
+    }
+    for rel in &files {
+        let name = rel.file_name().unwrap_or_default().to_string_lossy();
+        let Some(problem) = extension_mismatch(&name, os, arch, &mm) else {
+            continue;
+        };
+        err(&rel.to_string_lossy().replace('\\', "/"), problem);
+    }
+
+    // 5. Launchers point into this venv (as packed, or as relocated).
+    let venv_paths = [
+        field("venv"),
+        dir.join(".venv").to_string_lossy().into_owned(),
+    ];
+    if let Ok(entries) = fs::read_dir(&bin) {
+        let mut entries: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+        entries.sort();
+        for path in entries {
+            if !path.is_file() || path.is_symlink() {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let mut head = [0u8; 512];
+            let read = fs::File::open(&path)
+                .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
+                .unwrap_or(0);
+            let first = String::from_utf8_lossy(&head[..read]);
+            let first = first.lines().next().unwrap_or("");
+            if let Some(interp) = first.strip_prefix("#!") {
+                let interp = interp.split_whitespace().next().unwrap_or("");
+                let own = venv_paths.iter().any(|v| !v.is_empty() && interp.starts_with(v.as_str()))
+                    || interp == "python" // vivar's Windows scripts, started by their .cmd shim
+                    || !interp.starts_with('/') && !interp.contains(":\\"); // /usr/bin/env style
+                if !own {
+                    err(
+                        &name,
+                        format!("shebang points outside the bundle at {interp}"),
+                    );
+                }
+            }
+            if windows {
+                if let Some(stem) = name.strip_suffix("-script.py") {
+                    if !bin.join(format!("{stem}.cmd")).is_file() {
+                        err(&name, "has no .cmd shim beside it".to_owned());
+                    }
+                }
+            }
+        }
+    }
+
+    // 6. What only the target can tell.
+    if cuda || field("host-cuda") == "true" {
+        findings.push((
+            "warning",
+            "cuda".to_owned(),
+            if manifest.get("host-cuda").and_then(|v| v.as_bool()) == Some(true) {
+                "packed with --use-host-cuda: the target supplies the CUDA libraries, and `vivar verify` there checks the driver".to_owned()
+            } else {
+                "CUDA packages need an NVIDIA driver on the target; `vivar verify` there checks it".to_owned()
+            },
+        ));
+    }
+    Ok(StaticReport {
+        platform,
+        python,
+        packages,
+        findings,
+    })
+}
+
+/// Why a compiled extension's file name does not fit the platform, if it does not.
+fn extension_mismatch(name: &str, os: &str, arch: &str, mm: &str) -> Option<String> {
+    let (stem, ext) = name.rsplit_once('.')?;
+    match ext {
+        "pyd" if os != "windows" => return Some(format!("a Windows extension in a {os} bundle")),
+        "so" if os == "windows" => return Some("a Unix extension in a windows bundle".to_owned()),
+        "so" | "pyd" => {}
+        _ => return None,
+    }
+    // `mod.cpython-312-x86_64-linux-gnu.so`, `mod.cp312-win_amd64.pyd`, `mod.abi3.so`.
+    let tag = stem.rsplit('.').next().unwrap_or("");
+    let digits = mm.replace('.', "");
+    if let Some(rest) = tag.strip_prefix("cpython-") {
+        let (ver, plat) = rest.split_once('-').unwrap_or((rest, ""));
+        if ver.trim_end_matches('t') != digits {
+            return Some(format!("built for CPython {ver}, not {mm}"));
+        }
+        // Linux names carry the arch (`x86_64-linux-gnu`); macOS is just `darwin`.
+        let fits = match os {
+            "linux" => plat.contains("linux") && plat.contains(arch),
+            "macos" => plat == "darwin",
+            _ => false,
+        };
+        if !plat.is_empty() && !fits {
+            return Some(format!("built for {plat}, not {os}-{arch}"));
+        }
+    } else if let Some(rest) = tag.strip_prefix("cp") {
+        let (ver, plat) = rest.split_once('-').unwrap_or((rest, ""));
+        if ver.chars().all(|c| c.is_ascii_digit()) && !ver.is_empty() && ver != digits {
+            return Some(format!("built for CPython {ver}, not {mm}"));
+        }
+        let want = if arch == "x86_64" {
+            "win_amd64"
+        } else {
+            "win_arm64"
+        };
+        if plat.starts_with("win_") && plat != want {
+            return Some(format!("built for {plat}, not {want}"));
+        }
+    }
+    None
 }
 
 /// Absolute path without symlink resolution and without Windows' `\\?\`
@@ -1503,6 +1845,27 @@ mod tests {
         assert_eq!(replace_bytes(b"a/x/b/x", b"/x", b"/yy"), b"a/yy/b/yy");
         assert_eq!(replace_bytes(b"nothing", b"zzz", b"y"), b"nothing");
         assert_eq!(replace_bytes(b"abc", b"", b"y"), b"abc");
+    }
+
+    #[test]
+    fn extension_names_are_checked_against_the_platform() {
+        let ok = |n: &str, os: &str, arch: &str| extension_mismatch(n, os, arch, "3.12").is_none();
+        assert!(ok("x.cpython-312-x86_64-linux-gnu.so", "linux", "x86_64"));
+        assert!(ok("x.cpython-312-darwin.so", "macos", "aarch64"));
+        assert!(ok("x.cp312-win_amd64.pyd", "windows", "x86_64"));
+        assert!(ok("x.abi3.so", "linux", "aarch64"));
+        assert!(ok("libfoo.so", "linux", "aarch64"));
+        assert!(ok("readme.txt", "windows", "x86_64"));
+        assert!(!ok("x.cpython-311-x86_64-linux-gnu.so", "linux", "x86_64"));
+        assert!(!ok("x.cpython-312-aarch64-linux-gnu.so", "linux", "x86_64"));
+        assert!(!ok(
+            "x.cpython-312-x86_64-linux-gnu.so",
+            "windows",
+            "x86_64"
+        ));
+        assert!(!ok("x.cp312-win_amd64.pyd", "linux", "x86_64"));
+        assert!(!ok("x.cp312-win_arm64.pyd", "windows", "x86_64"));
+        assert!(!ok("x.cp313-win_amd64.pyd", "windows", "x86_64"));
     }
 
     #[test]

@@ -152,7 +152,7 @@ We never write our own SAT/PubGrub resolver or wheel/conda package parsers. Thos
 | Phase | Scope | Exit criteria |
 |---|---|---|
 | **0: MVP** ✅ | CLI + `[tool.vivar]` defaults + deny policy, `UvBackend` for init/add/remove/lock/sync/run/python | Team can use it daily for pure-Python projects |
-| **1: Own the core** | In-process resolver + installer, `vivar.lock`, global cache (venvs, Python downloads, run ✅) | No `uv` binary needed, speed on par with uv |
+| **1: Own the core** ✅ | In-process resolver + installer, global cache with hard links (wheels, builds, Python downloads) | No `uv` binary needed; CI runs the suite on the native backend too |
 | **2: Native deps** | rattler integration, `--native`, unified conda-forge + PyPI solve | GPU/GDAL project fully reproducible from the lock |
 | **3: Policy** ✅ | License allowlist, vulnerability audit (OSV), mirrors/offline, org policy file, `export docker`, `require-hashes` | `vivar audit` runs in CI and passes |
 | **4: Polish** ✅ | Workspaces, PEP 723 scripts, `tool run`, tasks, installers, `tree`/`why`, `outdated`, `doctor`, completions, bundle integrity + `diff` | — |
@@ -275,8 +275,23 @@ in well under a minute cold and in half a second warm, and `uv lock --check` acc
 
 Deferred: native dependencies via conda-forge (phase 2).
 
-## 13. Open questions
+Phase 1 closed (2026-10-30): the native installer hard-links every wheel's files
+from `~/.cache/vivar/unpacked/<sha256>/` (copy on filesystems without links or with
+`VIVAR_LINK_MODE=copy`), zip64 wheels (CUDA-sized) are read, git references take
+`#subdirectory=`, progress goes to stderr so `tool run` output stays clean, and CI runs
+the end-to-end suite a second time with `VIVAR_BACKEND=native`. There is no
+`vivar.lock`: both backends write `uv.lock`, so a project stays usable with uv and
+pip alone, and that is a decision rather than a gap. Also in: `publish` (the legacy
+upload API, credentials off the command line) and a static `verify` for bundles
+built for another platform (integrity, layout, wheel tags, compiled extensions,
+launchers; the import and GPU checks still run on the target).
 
-- Our own license (internal vs. open source).
-- Where does the org policy file live?
-- Do we already have an internal package mirror (Artifactory/Nexus/devpi)? `index-url` is ready for it.
+## 13. Decisions and open questions
+
+- **License**: Apache-2.0 (`LICENSE`), so the repository can go public when ready.
+- **Org policy file**: `VIVAR_POLICY` (a path), then `$XDG_CONFIG_HOME/vivar/policy.toml`
+  (`%APPDATA%\vivar\policy.toml`), then `/etc/vivar/policy.toml`; the installers and
+  offline bundles deliver it (`VIVAR_POLICY_URL`, or `policy.toml` beside the installer).
+- **Internal mirror**: `index-url` in policy (a URL or a wheelhouse directory) and
+  `VIVAR_INDEX_TOKEN` are ready for Artifactory/Nexus/devpi; which one Nextria runs is
+  still to be settled. `publish` uploads to the same kind of index.

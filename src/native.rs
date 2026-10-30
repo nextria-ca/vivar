@@ -606,7 +606,7 @@ fn fetch_wheel(pkg: &Package, target: &wheelhouse::Target, source: &Source) -> R
             return Ok(dest);
         }
     }
-    println!("downloading {name}");
+    eprintln!("downloading {name}");
     // Index credentials go to the configured index's own host only: not to a
     // CDN, and not to whatever registry a lock happens to name.
     let url = if source
@@ -688,22 +688,54 @@ fn direct_url_of(pkg: &Package) -> Option<String> {
             ))
         }
         "git" => {
-            let (repo_with_rev, commit) = pkg.source.split_once('#')?;
-            let (repo, query) = repo_with_rev
-                .split_once('?')
-                .map(|(r, q)| (r, Some(q)))
-                .unwrap_or((repo_with_rev, None));
-            let rev = query
-                .and_then(|q| q.strip_prefix("rev="))
+            let git = GitLock::parse(&pkg.source)?;
+            let rev = git
+                .rev
+                .as_deref()
                 .map(|r| format!(",\"requested_revision\":{}", crate::json::quote(r)))
                 .unwrap_or_default();
+            let sub = git
+                .subdirectory
+                .as_deref()
+                .map(|s| format!(",\"subdirectory\":{}", crate::json::quote(s)))
+                .unwrap_or_default();
             Some(format!(
-                "{{\"url\":{},\"vcs_info\":{{\"vcs\":\"git\",\"commit_id\":{}{rev}}}}}",
-                crate::json::quote(repo),
-                crate::json::quote(commit)
+                "{{\"url\":{}{sub},\"vcs_info\":{{\"vcs\":\"git\",\"commit_id\":{}{rev}}}}}",
+                crate::json::quote(&git.repo),
+                crate::json::quote(&git.commit)
             ))
         }
         _ => None,
+    }
+}
+
+/// A git source as the lock records it: `repo?subdirectory=sub&rev=r#commit`.
+struct GitLock {
+    repo: String,
+    rev: Option<String>,
+    subdirectory: Option<String>,
+    commit: String,
+}
+
+impl GitLock {
+    fn parse(source: &str) -> Option<GitLock> {
+        let (repo_with_query, commit) = source.split_once('#')?;
+        let (repo, query) = repo_with_query
+            .split_once('?')
+            .map(|(r, q)| (r, Some(q)))
+            .unwrap_or((repo_with_query, None));
+        let param = |key: &str| {
+            query?
+                .split('&')
+                .find_map(|p| p.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
+                .map(str::to_owned)
+        };
+        Some(GitLock {
+            repo: repo.to_owned(),
+            rev: param("rev"),
+            subdirectory: param("subdirectory"),
+            commit: commit.to_owned(),
+        })
     }
 }
 
@@ -717,7 +749,7 @@ fn direct_identity(json: &str) -> Option<SourceIdentity> {
     let doc = crate::json::parse(json).ok()?;
     let url = doc.get("url")?.as_str()?.to_owned();
     // A build from a repository subdirectory is another package than the
-    // root's, even at the same commit; vivar never writes one itself.
+    // root's, even at the same commit.
     let subdirectory = doc
         .get("subdirectory")
         .and_then(|s| s.as_str())
@@ -1022,7 +1054,7 @@ impl Builder<'_> {
         fs::create_dir_all(&dir)?;
         let dest = dir.join(&file.filename);
         if !dest.is_file() {
-            println!("downloading {}", file.filename);
+            eprintln!("downloading {}", file.filename);
             let url = if self
                 .index_urls
                 .iter()
@@ -1135,7 +1167,7 @@ impl Builder<'_> {
             return Ok(w);
         }
         fs::create_dir_all(&out)?;
-        println!("building {name} from source");
+        eprintln!("building {name} from source");
         let built = self.backend.pep517(src, &out, &self.series, &["wheel"])?;
         let wheel = out.join(built.first().context("no wheel built")?);
         if !wheel.is_file() {
@@ -1148,23 +1180,47 @@ impl Builder<'_> {
     }
 
     /// A git checkout at a commit: `source` is the lock's
-    /// `https://host/repo?rev=<rev>#<commit>`.
+    /// `https://host/repo?subdirectory=<sub>&rev=<rev>#<commit>`.
     fn wheel_from_git(&self, name: &str, source: &str) -> Result<PathBuf> {
-        let (repo_with_rev, commit) = source
-            .split_once('#')
+        let git = GitLock::parse(source)
             .ok_or_else(|| anyhow!("{name}: git source {source:?} has no commit"))?;
-        let repo = repo_with_rev.split('?').next().unwrap_or(repo_with_rev);
         if self.backend.no_build {
             bail!("{name} comes from git and would have to be built; policy requires wheels");
         }
-        let key = self.build_key(&format!("{repo}#{commit}"))?;
+        let key = self.build_key(&Self::git_identity(
+            &git.repo,
+            &git.commit,
+            git.subdirectory.as_deref(),
+        ))?;
         if let Some(w) = self.fitting_cached_wheel(&Self::built_dir(&key)?) {
             return Ok(w);
         }
-        let src = Self::clone(repo, Some(commit))?.0;
-        let wheel = self.wheel_from_tree(name, &src, &key);
+        let src = Self::clone(&git.repo, Some(&git.commit))?.0;
+        let wheel = Self::project_in(&src, git.subdirectory.as_deref())
+            .and_then(|tree| self.wheel_from_tree(name, &tree, &key));
         let _ = fs::remove_dir_all(&src);
         wheel
+    }
+
+    /// What identifies a git build in the cache: the repository and commit,
+    /// plus the subdirectory when the package lives in one.
+    fn git_identity(repo: &str, commit: &str, subdirectory: Option<&str>) -> String {
+        match subdirectory {
+            Some(s) => format!("{repo}#{commit}/{s}"),
+            None => format!("{repo}#{commit}"),
+        }
+    }
+
+    /// The project directory inside a checkout: its root, or `subdirectory`.
+    fn project_in(checkout: &Path, subdirectory: Option<&str>) -> Result<PathBuf> {
+        let Some(sub) = subdirectory else {
+            return Ok(checkout.to_path_buf());
+        };
+        let dir = checkout.join(sub);
+        if !dir.is_dir() {
+            bail!("the repository has no directory {sub:?} (asked for with `subdirectory=`)");
+        }
+        Ok(dir)
     }
 
     /// Clones `repo` at `rev` (a branch, tag or commit; HEAD when none) into a
@@ -1254,17 +1310,17 @@ impl Fetch for Builder<'_> {
             })?;
             Ok((version, crate::index::parse_metadata(&text)))
         };
-        if let Some(spec) = url.strip_prefix("git+") {
-            if spec.contains("#subdirectory=") {
-                bail!("{name}: git references with a subdirectory are not supported yet");
-            }
+        if url.starts_with("git+") {
             if self.backend.no_build {
                 bail!("{name} comes from git and would have to be built; policy requires wheels");
             }
+            let subdirectory = crate::resolve::git_subdirectory(&url)?;
             let (repo, rev) = crate::resolve::git_parts(&url);
             let (src, commit) = Self::clone(&repo, rev.as_deref())?;
-            let key = self.build_key(&format!("{repo}#{commit}"))?;
-            let wheel = self.wheel_from_tree(&name, &src, &key);
+            let key =
+                self.build_key(&Self::git_identity(&repo, &commit, subdirectory.as_deref()))?;
+            let wheel = Self::project_in(&src, subdirectory.as_deref())
+                .and_then(|tree| self.wheel_from_tree(&name, &tree, &key));
             let _ = fs::remove_dir_all(&src);
             let (version, metadata) = metadata_of(&wheel?)?;
             return Ok(Direct {
@@ -1275,6 +1331,7 @@ impl Fetch for Builder<'_> {
                     url: repo,
                     rev,
                     commit,
+                    subdirectory,
                 },
             });
         }
@@ -1479,7 +1536,7 @@ impl Backend for NativeBackend {
             install::install_wheel_from(&wheel, &layout, direct_url_of(pkg).as_deref())?;
             installed += 1;
         }
-        println!("native install: {installed} package(s)");
+        eprintln!("native install: {installed} package(s)");
         Ok(())
     }
 

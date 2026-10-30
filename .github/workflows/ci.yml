@@ -30,3 +30,17 @@ jobs:
         run: |
           cargo metadata --format-version 1 > /tmp/meta.json
           python3 scripts/licenses.py /tmp/meta.json | diff -u THIRD_PARTY_LICENSES.md -
+  native:
+    # The same end-to-end suite with uv's resolver and installer out of the
+    # picture: every vivar command goes through the in-house backend.
+    runs-on: ubuntu-latest
+    env:
+      UV_MANAGED_PYTHON: "1"
+      VIVAR_BACKEND: native
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v5
+      - run: uv python install 3.12
+      - run: cargo test --test cli -- --include-ignored

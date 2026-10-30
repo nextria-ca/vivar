@@ -5,6 +5,7 @@ import ctypes, importlib, importlib.metadata as md, os, platform, re, signal, su
 VERBOSE = "--verbose" in sys.argv
 ALLOW_MISSING_GPU = "--allow-missing-gpu" in sys.argv
 JSON = "--json" in sys.argv
+MIN_VRAM_GB = next((float(a.split("=", 1)[1]) for a in sys.argv if a.startswith("--min-vram=")), None)
 IMPORT_TIMEOUT = 120
 SITE = sysconfig.get_paths()["purelib"]
 CUDA_LIB = re.compile(r"^lib(cuda|cudart|cublas|cublasLt|cudnn|cufft|curand|cusparse|cusolver|nvrtc|nccl|nvJitLink|nvToolsExt)\b")
@@ -196,6 +197,38 @@ def cuda_runtime_version(dists):
     return None
 
 
+def gpu_fit(info):
+    """Whether the torch wheel has kernels for this GPU (sm_XY binaries of the
+    same major and no newer minor, or PTX it can JIT-compile), and whether
+    the card has the memory asked for."""
+    out = []
+    cap = info.get("capability") or ""
+    archs = info.get("archs") or []
+    if cap.startswith("sm_") and archs:
+        major, minor = int(cap[3]), int(cap[4:])
+        def fits(arch):
+            kind, _, num = arch.partition("_")
+            if not num.isdigit():
+                return False
+            a_major, a_minor = int(num[0]), int(num[1:])
+            if kind == "sm":
+                return a_major == major and a_minor <= minor
+            return kind == "compute" and (a_major, a_minor) <= (major, minor)
+        if not any(fits(a) for a in archs):
+            out.append(("ERR", "torch", f"no CUDA kernels for this GPU ({cap}); the wheel was built for {', '.join(archs)}"))
+        else:
+            out.append(("ok", "torch", f"kernels present for {cap}"))
+    vram = info.get("vram_gb")
+    if vram is not None:
+        free = info.get("free_gb")
+        detail = f"{vram} GB of GPU memory" + (f", {free} GB free" if free is not None else "")
+        if MIN_VRAM_GB is not None and vram < MIN_VRAM_GB:
+            out.append(("ERR", "torch", f"{detail}; at least {MIN_VRAM_GB:g} GB required (--min-vram)"))
+        else:
+            out.append(("ok", "torch", detail))
+    return out
+
+
 def torch_checks():
     """Runs torch's own accelerator probes in a child (a broken CUDA stack can
     crash the interpreter). Yields (level, subject, detail)."""
@@ -219,6 +252,16 @@ try:
     out["cuda_available"] = torch.cuda.is_available()
     if out["cuda_available"]:
         out["device"] = torch.cuda.get_device_name(0)
+        cap = torch.cuda.get_device_capability(0)
+        out["capability"] = f"sm_{cap[0]}{cap[1]}"
+        out["archs"] = list(torch.cuda.get_arch_list())
+        props = torch.cuda.get_device_properties(0)
+        out["vram_gb"] = round(props.total_memory / 2**30, 1)
+        try:
+            free, _ = torch.cuda.mem_get_info()
+            out["free_gb"] = round(free / 2**30, 1)
+        except Exception:  # noqa: BLE001
+            out["free_gb"] = None
         a = torch.randn(256, 256, device="cuda")
         out["matmul_ok"] = bool(torch.allclose(a @ torch.eye(256, device="cuda"), a, atol=1e-4))
     elif out["mps"]:
@@ -246,6 +289,9 @@ print(json.dumps(out))
             if info.get("matmul_ok"):
                 results.append(("ok", "torch", f"CUDA {info['cuda_built']} works on {info.get('device')}"
                                                f" (cuDNN {info.get('cudnn')}, NCCL {info.get('nccl') or 'n/a'})"))
+                # A tensor that moves is not enough: the wheel must carry
+                # kernels for this GPU's architecture, and the GPU enough memory.
+                results.extend(gpu_fit(info))
             else:
                 results.append(("ERR", "torch", f"CUDA matmul failed on {info.get('device')}: {info.get('error', 'wrong result')}"))
         else:

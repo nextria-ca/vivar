@@ -903,6 +903,9 @@ pub fn pack(root: &Path, name: &str, output: Option<&Path>, opts: PackOptions) -
         .and_then(|n| n.to_str())
         .ok_or_else(|| anyhow!("unexpected Python root {}", python_root.display()))?
         .to_owned();
+    if opts.slim {
+        refuse_slim_for_shared_libpython(&python_root, &major_minor(&version))?;
+    }
     let tree = Tree {
         root: root.to_path_buf(),
         python_root,
@@ -913,6 +916,29 @@ pub fn pack(root: &Path, name: &str, output: Option<&Path>, opts: PackOptions) -
         platform: platform(),
     };
     archive(&tree, name, output, opts)
+}
+
+/// `--slim` leaves libpython out, which is only safe when the interpreter
+/// does not load it: a dynamically linked Python names `libpython3.X` among
+/// the libraries it needs, and that name is in its binary.
+fn refuse_slim_for_shared_libpython(python_root: &Path, mm: &str) -> Result<()> {
+    let exe = if cfg!(windows) {
+        python_root.join("python.exe")
+    } else {
+        python_root.join("bin").join(format!("python{mm}"))
+    };
+    let Ok(bytes) = fs::read(&exe) else {
+        return Ok(());
+    };
+    let needle = b"libpython";
+    let dynamic = bytes.windows(needle.len()).any(|w| w == needle);
+    if dynamic {
+        bail!(
+            "{} loads libpython at run time, so --slim would leave the interpreter unable to start; pack without --slim",
+            exe.display()
+        );
+    }
+    Ok(())
 }
 
 /// Paths inside a cross-built bundle are recorded under this root; `unpack`
@@ -1174,6 +1200,7 @@ fn archive(tree: &Tree, name: &str, output: Option<&Path>, opts: PackOptions) ->
     manifest["python-home"] = value(&tree.home);
     manifest["venv"] = value(&tree.venv);
     manifest["created-by"] = value(concat!("vivar ", env!("CARGO_PKG_VERSION")));
+    manifest["created"] = value(crate::sbom::timestamp());
     if opts.host_cuda {
         manifest["host-cuda"] = value(true);
     }
@@ -1303,6 +1330,7 @@ pub fn unpack(
     require_signature: bool,
     trusted_keys: &[String],
     dedupe_with: Option<&Path>,
+    not_before: Option<&str>,
 ) -> Result<PathBuf> {
     fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
     let dest = absolute(dest)?;
@@ -1320,6 +1348,26 @@ pub fn unpack(
         );
     }
     check_signature(&dest, require_signature, trusted_keys)?;
+    // A valid old bundle is still an old bundle: refuse one packed before
+    // the date asked for (the stamp is under the signature).
+    if let Some(floor) = not_before {
+        let created = manifest_of(&dest)?
+            .get("created")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .unwrap_or_default();
+        if created.is_empty() || created.as_str() < floor {
+            bail!(
+                "{} was packed {}, before {floor} (--not-before)",
+                archive.display(),
+                if created.is_empty() {
+                    "at an unknown time".to_owned()
+                } else {
+                    format!("on {created}")
+                }
+            );
+        }
+    }
     let mut bad = verify_checksums(&dest)?;
     if dest.join(INVENTORY).is_file() {
         bad.extend(verify_inventory(&dest)?);

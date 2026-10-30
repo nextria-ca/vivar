@@ -357,6 +357,10 @@ rewrite the environment's paths, launchers and activate scripts for this locatio
         /// Hard-link files identical to this already-unpacked bundle (same filesystem)
         #[arg(long)]
         dedupe_with: Option<PathBuf>,
+        /// Refuse a bundle packed before this date (`2026-10-30`, or a full timestamp):
+        /// a valid signature on an old bundle is not a reason to install it
+        #[arg(long, value_name = "DATE")]
+        not_before: Option<String>,
     },
     /// Check every installed package imports and its native libraries, CUDA
     /// driver, and scripts work on this machine
@@ -384,6 +388,10 @@ CI can gate on."
         /// an archive or a bundle built for another platform)
         #[arg(long = "static")]
         static_only: bool,
+        /// Fail unless the GPU has at least this much memory, in GB (a model that needs
+        /// 48 GB does not run on 24, however well the tensor probe went)
+        #[arg(long, value_name = "GB")]
+        min_vram: Option<f64>,
     },
     /// Replace this binary with the latest release (or a given one)
     Upgrade {
@@ -1303,6 +1311,7 @@ fn main() -> Result<()> {
             apply,
             require_signature,
             dedupe_with,
+            not_before,
         } => {
             let require_signature = require_signature || policy.require_signed_bundles;
             if apply {
@@ -1326,6 +1335,7 @@ fn main() -> Result<()> {
                 require_signature,
                 &policy.trusted_keys,
                 dedupe_with.as_deref(),
+                not_before.as_deref(),
             )?;
             let bin = dest.join(".venv").join(venv::BIN);
             if cfg!(windows) {
@@ -1350,6 +1360,7 @@ fn main() -> Result<()> {
             verbose,
             json,
             static_only,
+            min_vram,
         } => {
             let base = match path {
                 Some(p) => p,
@@ -1373,7 +1384,8 @@ fn main() -> Result<()> {
                 std::process::exit(if report.errors() > 0 { 1 } else { 0 });
             }
             let venv = verify::find_venv(&base)?;
-            let (mut code, mut report) = verify::run(&venv, allow_missing_gpu, verbose, json)?;
+            let (mut code, mut report) =
+                verify::run(&venv, allow_missing_gpu, verbose, json, min_vram)?;
             // An unpacked bundle also carries checksums: report anything changed since packing.
             let bundle_dir = venv.parent().unwrap_or(&venv);
             if bundle_dir.join(bundle::CHECKSUMS).is_file() {
@@ -1557,7 +1569,7 @@ fn run_check(
         record(
             &mut results,
             "verify",
-            verify::run(&venv_dir, false, false, true).and_then(|(code, _)| {
+            verify::run(&venv_dir, false, false, true, None).and_then(|(code, _)| {
                 if !integrity.is_empty() {
                     Err(anyhow::anyhow!(
                         "{} bundled file(s) changed since packing",

@@ -47,25 +47,40 @@ else
       http://*|https://*) curl -LsSf "$VIVAR_ARCHIVE" -o "$TMP/$ASSET" ;;
       *) cp "$VIVAR_ARCHIVE" "$TMP/$ASSET" ;;
     esac
-  elif command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-    if [ "$VERSION" = latest ]; then
-      gh release download --repo "$REPO" --pattern "$ASSET" --dir "$TMP"
-    else
-      gh release download "$VERSION" --repo "$REPO" --pattern "$ASSET" --dir "$TMP"
-    fi
   else
-    if [ "$VERSION" = latest ]; then API=https://api.github.com/repos/$REPO/releases/latest
-    else API=https://api.github.com/repos/$REPO/releases/tags/$VERSION; fi
-    AUTH=${GITHUB_TOKEN:+-H "Authorization: Bearer $GITHUB_TOKEN"}
-    # shellcheck disable=SC2086
-    URL=$(curl -sSf $AUTH "$API" | tr -d '\n' \
-      | sed -n "s|.*\"url\": *\"\([^\"]*/releases/assets/[0-9]*\)\"[^}]*\"name\": *\"$ASSET\".*|\1|p")
-    if [ -z "$URL" ]; then
-      echo "vivar: could not find $ASSET in release $VERSION of $REPO (private repo? log in with gh or set GITHUB_TOKEN)" >&2
+    # One release asset by name, through gh when logged in, else the API.
+    fetch_asset() {
+      if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+        if [ "$VERSION" = latest ]; then
+          gh release download --repo "$REPO" --pattern "$1" --dir "$TMP"
+        else
+          gh release download "$VERSION" --repo "$REPO" --pattern "$1" --dir "$TMP"
+        fi
+        return
+      fi
+      if [ "$VERSION" = latest ]; then API=https://api.github.com/repos/$REPO/releases/latest
+      else API=https://api.github.com/repos/$REPO/releases/tags/$VERSION; fi
+      AUTH=${GITHUB_TOKEN:+-H "Authorization: Bearer $GITHUB_TOKEN"}
+      # shellcheck disable=SC2086
+      URL=$(curl -sSf $AUTH "$API" | tr -d '\n' \
+        | sed -n "s|.*\"url\": *\"\([^\"]*/releases/assets/[0-9]*\)\"[^}]*\"name\": *\"$1\".*|\1|p")
+      if [ -z "$URL" ]; then
+        echo "vivar: could not find $1 in release $VERSION of $REPO (private repo? log in with gh or set GITHUB_TOKEN)" >&2
+        exit 1
+      fi
+      # shellcheck disable=SC2086
+      curl -LsSf $AUTH -H "Accept: application/octet-stream" "$URL" -o "$TMP/$1"
+    }
+    fetch_asset "$ASSET"
+    # The archive must match the release's own checksum list.
+    fetch_asset SHA256SUMS
+    EXPECTED=$(grep " $ASSET\$" "$TMP/SHA256SUMS" | cut -d' ' -f1)
+    if command -v sha256sum >/dev/null 2>&1; then ACTUAL=$(sha256sum "$TMP/$ASSET" | cut -d' ' -f1)
+    else ACTUAL=$(shasum -a 256 "$TMP/$ASSET" | cut -d' ' -f1); fi
+    if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
+      echo "vivar: $ASSET does not match SHA256SUMS of release $VERSION (expected ${EXPECTED:-nothing}, got $ACTUAL); not installing" >&2
       exit 1
     fi
-    # shellcheck disable=SC2086
-    curl -LsSf $AUTH -H "Accept: application/octet-stream" "$URL" -o "$TMP/$ASSET"
   fi
   tar -xzf "$TMP/$ASSET" -C "$TMP"
   install -m 755 "$TMP/vivar-$TARGET/vivar" "$DIR/vivar"

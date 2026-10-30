@@ -53,21 +53,35 @@ if ($Offline) {
     if ($env:VIVAR_ARCHIVE) {
       if ($env:VIVAR_ARCHIVE -match "^https?://") { Invoke-WebRequest $env:VIVAR_ARCHIVE -OutFile $zip }
       else { Copy-Item $env:VIVAR_ARCHIVE $zip }
-    } elseif (Test-GhLogin) {
-      $ghArgs = @("release", "download")
-      if ($Version -ne "latest") { $ghArgs += $Version }
-      $ghArgs += @("--repo", $Repo, "--pattern", $Asset, "--dir", $Tmp)
-      & gh @ghArgs
-      if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }
     } else {
-      $api = if ($Version -eq "latest") { "https://api.github.com/repos/$Repo/releases/latest" } else { "https://api.github.com/repos/$Repo/releases/tags/$Version" }
-      $headers = @{ "User-Agent" = "vivar-install" }
-      if ($env:GITHUB_TOKEN) { $headers["Authorization"] = "Bearer $env:GITHUB_TOKEN" }
-      $release = Invoke-RestMethod $api -Headers $headers
-      $assetInfo = $release.assets | Where-Object { $_.name -eq $Asset }
-      if (-not $assetInfo) { throw "vivar: $Asset not found in release $Version of $Repo (private repo? log in with gh or set GITHUB_TOKEN)" }
-      $headers["Accept"] = "application/octet-stream"
-      Invoke-WebRequest $assetInfo.url -Headers $headers -OutFile $zip
+      # One release asset by name, through gh when logged in, else the API.
+      function Get-ReleaseAsset($name) {
+        if (Test-GhLogin) {
+          $ghArgs = @("release", "download")
+          if ($Version -ne "latest") { $ghArgs += $Version }
+          $ghArgs += @("--repo", $Repo, "--pattern", $name, "--dir", $Tmp)
+          & gh @ghArgs
+          if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }
+          return
+        }
+        $api = if ($Version -eq "latest") { "https://api.github.com/repos/$Repo/releases/latest" } else { "https://api.github.com/repos/$Repo/releases/tags/$Version" }
+        $headers = @{ "User-Agent" = "vivar-install" }
+        if ($env:GITHUB_TOKEN) { $headers["Authorization"] = "Bearer $env:GITHUB_TOKEN" }
+        $release = Invoke-RestMethod $api -Headers $headers
+        $assetInfo = $release.assets | Where-Object { $_.name -eq $name }
+        if (-not $assetInfo) { throw "vivar: $name not found in release $Version of $Repo (private repo? log in with gh or set GITHUB_TOKEN)" }
+        $headers["Accept"] = "application/octet-stream"
+        Invoke-WebRequest $assetInfo.url -Headers $headers -OutFile (Join-Path $Tmp $name)
+      }
+      Get-ReleaseAsset $Asset
+      # The archive must match the release's own checksum list.
+      Get-ReleaseAsset "SHA256SUMS"
+      $line = Get-Content (Join-Path $Tmp "SHA256SUMS") | Where-Object { $_ -match " $([regex]::Escape($Asset))$" } | Select-Object -First 1
+      $expected = if ($line) { ($line -split "\s+")[0].ToLower() } else { "" }
+      $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+      if (-not $expected -or $expected -ne $actual) {
+        throw "vivar: $Asset does not match SHA256SUMS of release $Version (expected '$expected', got $actual); not installing"
+      }
     }
     Expand-Archive $zip -DestinationPath $Tmp -Force
     Copy-Item (Join-Path $Tmp "vivar-$Target\vivar.exe") (Join-Path $Dir "vivar.exe") -Force

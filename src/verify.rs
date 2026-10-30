@@ -29,6 +29,7 @@ pub fn run(
     allow_missing_gpu: bool,
     verbose: bool,
     json: bool,
+    min_vram_gb: Option<f64>,
 ) -> Result<(i32, String)> {
     let python = if cfg!(windows) {
         venv.join("Scripts").join("python.exe")
@@ -42,6 +43,9 @@ pub fn run(
     }
     if verbose {
         cmd.arg("--verbose");
+    }
+    if let Some(gb) = min_vram_gb {
+        cmd.arg(format!("--min-vram={gb}"));
     }
     if json {
         cmd.arg("--json").stdout(Stdio::piped());

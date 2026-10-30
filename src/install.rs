@@ -292,13 +292,30 @@ impl Store {
     fn place(&self, name: &str, bytes: &[u8], mode: u32, target: &Path) -> Result<()> {
         let cached = self.dir.join(name);
         let fresh = match fs::metadata(&cached) {
-            Ok(m) if m.len() == bytes.len() as u64 => false,
+            Ok(m) if m.len() == bytes.len() as u64 => {
+                // A copy from before files were made read-only is fixed up.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if m.permissions().mode() & 0o222 != 0 {
+                        let _ = fs::set_permissions(
+                            &cached,
+                            fs::Permissions::from_mode(m.permissions().mode() & !0o222),
+                        );
+                    }
+                }
+                false
+            }
             _ => {
                 // Written whole under another name, then renamed: a parallel
                 // install never links a half-written file.
                 let part = self.dir.join(format!("{name}.part-{}", std::process::id()));
                 fs::create_dir_all(cached.parent().context("store path")?)?;
-                write_file(&part, bytes, mode)?;
+                // Read-only: a linked file is shared by every environment,
+                // so an edit in one would be an edit in all. (Not on
+                // Windows, where the attribute also blocks deletion.)
+                let shared_mode = if cfg!(unix) { mode & !0o222 } else { mode };
+                write_file(&part, bytes, shared_mode)?;
                 fs::rename(&part, &cached)?;
                 true
             }

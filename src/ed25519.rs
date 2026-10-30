@@ -480,10 +480,23 @@ pub fn sign(secret: &[u8; 32], message: &[u8]) -> [u8; 64] {
     out
 }
 
+/// Whether a point is one of the eight of small order: a key or nonce
+/// there would make signatures that say nothing about the message.
+fn small_order(p: &Point) -> bool {
+    let mut eight = [0u8; 32];
+    eight[0] = 8;
+    let mut identity = [0u8; 32];
+    identity[0] = 1;
+    encode(&scalar_mul(&eight, p)) == identity
+}
+
 pub fn verify(public: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
     let Some(a) = decode(public) else {
         return false;
     };
+    if small_order(&a) {
+        return false;
+    }
     let mut rb = [0u8; 32];
     rb.copy_from_slice(&signature[..32]);
     let mut s = [0u8; 32];
@@ -492,6 +505,9 @@ pub fn verify(public: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
         return false;
     }
     let Some(r) = decode(&rb) else { return false };
+    if small_order(&r) {
+        return false;
+    }
     let mut h = Sha512::new();
     h.update(&rb);
     h.update(public);
@@ -520,6 +536,37 @@ mod tests {
     use super::*;
 
     use crate::sha256::hex;
+
+    #[test]
+    fn rejects_what_a_forger_would_try() {
+        let secret = [7u8; 32];
+        let kp = keypair(secret);
+        let msg = b"bundle checksums";
+        let sig = sign(&secret, msg);
+        assert!(verify(&kp.public, msg, &sig));
+        // A changed message, a flipped signature bit, another key.
+        assert!(!verify(&kp.public, b"bundle checksumz", &sig));
+        let mut flipped = sig;
+        flipped[3] ^= 1;
+        assert!(!verify(&kp.public, msg, &flipped));
+        assert!(!verify(&keypair([8u8; 32]).public, msg, &sig));
+        // S + L is the same scalar spelled non-canonically: refused.
+        let mut malleable = sig;
+        let mut carry = 0u16;
+        for i in 0..32 {
+            let v = malleable[32 + i] as u16 + L[i] as u16 + carry;
+            malleable[32 + i] = v as u8;
+            carry = v >> 8;
+        }
+        assert!(!verify(&kp.public, msg, &malleable));
+        // A small-order public key or nonce proves nothing.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        assert!(!verify(&identity, msg, &sig));
+        let mut small_r = sig;
+        small_r[..32].copy_from_slice(&identity);
+        assert!(!verify(&kp.public, msg, &small_r));
+    }
 
     #[test]
     fn rfc8032_vectors() {

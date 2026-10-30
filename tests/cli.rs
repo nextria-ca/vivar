@@ -521,6 +521,8 @@ fn verify_reports_broken_packages_and_missing_cuda() {
     init(dir);
     ok(dir, &["add", "six", "pycodestyle"]);
 
+    // --min-vram is only judged when torch is there; a plain environment passes.
+    ok(dir, &["verify", "--min-vram", "48"]);
     let out = ok(dir, &["verify", "--verbose"]);
     let stdout = stdout_of(&out);
     assert!(stdout.contains("ok   six"), "{stdout}");
@@ -1066,11 +1068,32 @@ fn bundle_integrity_and_diff() {
         "no differences"
     );
 
+    // A valid old bundle is refused when a newer one is required; the stamp
+    // is in the manifest, under the signature.
+    let stale = tmp.0.join("stale");
+    fails_with(
+        &tmp.0,
+        &[
+            "unpack",
+            "--not-before",
+            "2999-01-01",
+            a.to_str().unwrap(),
+            stale.to_str().unwrap(),
+        ],
+        "was packed on",
+    );
+    fs::remove_dir_all(&stale).unwrap();
     // A clean unpack verifies; a tampered one is caught at unpack and by verify.
     let good = tmp.0.join("good");
     ok(
         &tmp.0,
-        &["unpack", a.to_str().unwrap(), good.to_str().unwrap()],
+        &[
+            "unpack",
+            "--not-before",
+            "2026-10-30",
+            a.to_str().unwrap(),
+            good.to_str().unwrap(),
+        ],
     );
     assert!(stdout_of(&ok(&good, &["verify"])).contains("integrity: all bundled files match"));
     let six = site_packages(&good).join("six.py");
@@ -2519,6 +2542,8 @@ fn native_backend_syncs_from_the_lock_without_uv() {
             "{} is a copy, not a link into the store",
             six.display()
         );
+        // Shared by every environment, so nobody edits it in place.
+        assert_eq!(fs::metadata(&six).unwrap().mode() & 0o222, 0);
     }
     okn(
         dir,

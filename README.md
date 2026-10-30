@@ -147,8 +147,11 @@ For a corporate CA set `SSL_CERT_FILE=/path/to/ca-bundle.pem` once: curl, uv and
 Python all read it (`VIVAR_CA_BUNDLE` overrides it for vivar's own downloads only).
 `vivar doctor` shows what is in effect.
 
-Release archives are checked against the release's `SHA256SUMS` by `vivar upgrade`,
-and Python runtimes against python-build-standalone's published checksums.
+Release archives are checked against the release's `SHA256SUMS` by the installers and by
+`vivar upgrade` (pin a version with `VIVAR_VERSION=v0.1.0`), and Python runtimes against
+python-build-standalone's published checksums. The online installer also fetches `uv`
+from its own installer when it is missing; `VIVAR_SKIP_UV=1` leaves that out, and the
+offline bundle needs no network at all.
 
 ### Platforms
 
@@ -215,6 +218,8 @@ vivar verify app-linux-x86_64.tar.gz        # a bundle for another machine, chec
 vivar diff a.tar.gz b.tar.gz    # what changed between two bundles
 vivar diff --patch a.tar.gz b.tar.gz        # a delta archive; `vivar unpack --apply delta.tar.gz <unpacked-a>` upgrades in place
 vivar unpack --dedupe-with ./other b.tar.gz # hard-link files identical to an already unpacked bundle
+vivar unpack --not-before 2026-10-30 b.tar.gz   # refuse an older bundle, however valid its signature
+vivar verify --min-vram 48      # also fail when the GPU has less memory; kernels for its architecture are checked too
 vivar key generate && vivar pack --sign     # sign bundles (Ed25519); `unpack --require-signature` or policy enforces it
 vivar export sbom --format spdx # CycloneDX (default) or SPDX bill of materials from the lock
 vivar doctor                    # what's installed, configured, broken
@@ -442,8 +447,9 @@ a release build under 1 MB, and no runtime beyond the OS (`curl`, `tar`, `git` f
 git references) and, optionally, the `uv` binary it drives. The native installer
 unpacks each wheel once into `~/.cache/vivar/unpacked/<sha256>/` and hard-links its
 files into every environment (`VIVAR_LINK_MODE=copy` turns that off), so ten
-environments with torch cost one torch on disk. `vivar init` creates no sample code,
-README, or git repo.
+environments with torch cost one torch on disk; the linked files are read-only on Unix,
+since an edit in one environment would be an edit in all. `vivar init` creates no sample
+code, README, or git repo.
 
 ## Development
 

@@ -11,7 +11,7 @@ draws on.
 
 **Usable today, pre-1.0.** Every planned phase is implemented (projects, policy, polish,
 the uv-free core, and native dependencies from conda-forge), tested on Linux, macOS and
-Windows in CI (131 tests), and reviewed. Releases are tagged `v*`, starting with v0.1.0 (v0.1.1 adds the verified installs, dated bundles and GPU fit checks; v0.1.2 the locked policy, per-GPU checks and store garbage collection);
+Windows in CI (132 tests), and reviewed. Releases are tagged `v*`, starting with v0.1.0 (v0.1.1 adds the verified installs, dated bundles and GPU fit checks; v0.1.2 the locked policy, per-GPU checks and store garbage collection);
 see Install.
 
 What works:

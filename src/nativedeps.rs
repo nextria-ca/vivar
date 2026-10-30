@@ -11,7 +11,7 @@ use crate::condasolve::{Channels, Provider, Solver};
 use crate::condaspec::{MatchSpec, Record};
 use crate::project::{self, Policy, Project};
 use anyhow::{anyhow, bail, Context, Result};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use toml_edit::{value, Array, ArrayOfTables, DocumentMut, Item, Table};
@@ -164,9 +164,37 @@ impl NativeLock {
     }
 }
 
-/// Whether the project declares native dependencies at all.
+/// The project that owns the environment: the workspace root for a member.
+fn owner(project: &Project) -> Project {
+    match project.workspace.as_deref() {
+        Some(_) => Project::load(project.venv_root()).unwrap_or_else(|_| Project {
+            root: project.root.clone(),
+            doc: Default::default(),
+            workspace: None,
+        }),
+        None => Project {
+            root: project.root.clone(),
+            doc: project.doc_clone(),
+            workspace: None,
+        },
+    }
+}
+
+/// Whether the environment's project declares native dependencies at all
+/// (the workspace root's declaration counts for every member).
 pub fn declared(project: &Project) -> bool {
-    !project.native_dependencies().is_empty()
+    !owner(project).native_dependencies().is_empty()
+}
+
+/// Drops the native lock when nothing native is declared any more. Returns
+/// whether there was one.
+pub fn retire(project: &Project) -> Result<bool> {
+    let path = project.venv_root().join(LOCKFILE);
+    if path.is_file() {
+        fs::remove_file(&path)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// The subdirs the project's lock covers: `[tool.vivar] platforms`, else
@@ -334,26 +362,27 @@ pub fn lock(project: &Project, policy: &Policy, upgrade: bool) -> Result<Vec<Str
     Ok(changes)
 }
 
-/// Whether the native lock exists and covers what is declared for this machine.
+/// Whether the native lock exists and satisfies what is declared for this
+/// machine: every spec matched by its locked build, the Python series as
+/// pinned.
 pub fn lock_is_current(project: &Project) -> bool {
+    let project = owner(project);
     let root = project.venv_root();
     let Ok(Some(lock)) = NativeLock::read(root) else {
         return false;
     };
     let subdir = condaindex::host_subdir();
-    let locked: BTreeSet<&str> = lock
-        .for_subdir(&subdir)
-        .iter()
-        .map(|r| r.name.as_str())
-        .collect();
-    if locked.is_empty() {
+    let locked = lock.for_subdir(&subdir);
+    if locked.is_empty()
+        || lock.python_series(&subdir).as_deref() != Some(python_series(&project).as_str())
+    {
         return false;
     }
     project
         .native_dependencies()
         .iter()
         .filter_map(|s| MatchSpec::parse(s).ok())
-        .all(|s| locked.contains(s.name.as_str()))
+        .all(|s| locked.iter().any(|r| s.matches(r)))
 }
 
 /// conda names whose PyPI name differs.
@@ -420,6 +449,10 @@ pub fn sync(project: &Project, policy: &Policy) -> Result<(usize, usize)> {
     for url in &lock.channels {
         policy.check_channel(url)?;
     }
+    // Policy may have changed since the lock was written.
+    for r in &wanted {
+        policy.check_deny(&[&r.name])?;
+    }
     let prefix = root.join(".venv");
     // A plain venv in the way is replaced: the prefix brings its own Python.
     if prefix.join("pyvenv.cfg").is_file() && !prefix.join("conda-meta").is_dir() {
@@ -444,9 +477,18 @@ pub fn sync(project: &Project, policy: &Policy) -> Result<(usize, usize)> {
     let same = |l: &condalink::Linked, r: &Record| {
         l.name == r.name && l.version == r.version && l.build == r.build
     };
+    // Another Python series moves site-packages: everything is relinked.
+    let series_changed = present
+        .iter()
+        .find(|l| l.name == "python")
+        .is_some_and(|l| {
+            let mut it = l.version.split('.');
+            let have = format!("{}.{}", it.next().unwrap_or(""), it.next().unwrap_or(""));
+            have != python_mm
+        });
     let mut removed = 0;
     for l in &present {
-        if !wanted.iter().any(|r| same(l, r)) {
+        if series_changed || !wanted.iter().any(|r| same(l, r)) {
             condalink::unlink(&prefix, l)?;
             removed += 1;
         }

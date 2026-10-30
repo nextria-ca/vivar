@@ -632,17 +632,34 @@ fn main() -> Result<()> {
         Command::Remove { packages, native } => {
             let project = require(project, &cwd)?;
             if native {
-                let missing = project::remove_native(&project.root, &packages)?;
+                // Every name is checked before the manifest changes.
+                let declared: Vec<String> = project
+                    .native_dependencies()
+                    .iter()
+                    .map(|s| s.split_whitespace().next().unwrap_or(s).to_lowercase())
+                    .collect();
+                let missing: Vec<&String> = packages
+                    .iter()
+                    .filter(|p| !declared.contains(&p.to_lowercase()))
+                    .collect();
                 if !missing.is_empty() {
                     bail!(
                         "not declared as native dependencies: {}",
-                        missing.join(", ")
+                        missing
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
                 }
-                let backend = NativeBackend::new(&policy);
-                backend.lock(&cwd)?;
-                backend.sync(&cwd)?;
-                venv::mark_synced(project.venv_root());
+                transact(&project, &*backend, &cwd, None, || {
+                    project::remove_native(&project.root, &packages)?;
+                    let backend = NativeBackend::new(&policy);
+                    backend.lock(&cwd)?;
+                    backend.sync(&cwd)?;
+                    venv::mark_synced(project.venv_root());
+                    Ok(())
+                })?;
                 return Ok(());
             }
             venv::ensure(project.venv_root(), &project.name())?;
@@ -1624,6 +1641,7 @@ fn transact(
         project.root.join(project::PYPROJECT),
         project.venv_root().join(lock::LOCKFILE),
         project.venv_root().join(".python-version"),
+        project.venv_root().join(nativedeps::LOCKFILE),
     ];
     let snapshot: Vec<Option<Vec<u8>>> = files.iter().map(|p| std::fs::read(p).ok()).collect();
     let env_before = venv::fingerprint(&venv_dir);

@@ -201,32 +201,90 @@ fn placeholders(info: &[Member]) -> Vec<(String, String, bool)> {
     out
 }
 
-/// Replaces the placeholder: text files take the prefix as is; binary ones
-/// keep their length (the prefix padded with NULs), as conda does.
-fn replace_prefix(data: &[u8], placeholder: &[u8], prefix: &[u8], text: bool) -> Result<Vec<u8>> {
-    if !text && prefix.len() > placeholder.len() {
-        bail!(
-            "the environment path is {} bytes long; binaries built for conda allow {}",
-            prefix.len(),
-            placeholder.len()
-        );
-    }
-    let mut replacement = prefix.to_vec();
-    if !text {
-        replacement.resize(placeholder.len(), 0);
-    }
+/// Replaces `old` with `new` in a text file.
+fn text_replace(data: &[u8], old: &[u8], new: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
     let mut i = 0;
     while i < data.len() {
-        if data[i..].starts_with(placeholder) {
-            out.extend_from_slice(&replacement);
-            i += placeholder.len();
+        if data[i..].starts_with(old) {
+            out.extend_from_slice(new);
+            i += old.len();
         } else {
             out.push(data[i]);
             i += 1;
         }
     }
+    out
+}
+
+/// Replaces `old` with `new` in a binary, as conda does: the whole
+/// NUL-terminated string the prefix starts (`<old>/share/terminfo`) is
+/// rewritten with `new`, its suffix kept, and NUL-padded so the string's
+/// room (`budget` bytes for the prefix part) stays the same size. The same
+/// call moves a prefix again later, `old` being the previous prefix.
+fn binary_replace(data: &[u8], old: &[u8], new: &[u8], budget: usize) -> Result<Vec<u8>> {
+    if new.len() > budget {
+        bail!(
+            "the environment path is {} bytes long; binaries built for conda allow {budget}",
+            new.len()
+        );
+    }
+    let slack = budget.saturating_sub(old.len());
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if !data[i..].starts_with(old) {
+            out.push(data[i]);
+            i += 1;
+            continue;
+        }
+        let string_end = data[i + old.len()..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|n| i + old.len() + n)
+            .unwrap_or(data.len());
+        // After an earlier move the string is followed by its padding.
+        let region_end = string_end + slack;
+        if region_end > data.len() || data[string_end..region_end].iter().any(|&b| b != 0) {
+            bail!("unexpected layout around an embedded path in a binary file");
+        }
+        out.extend_from_slice(new);
+        out.extend_from_slice(&data[i + old.len()..string_end]);
+        out.extend(std::iter::repeat_n(0u8, budget - new.len()));
+        i = region_end;
+    }
     Ok(out)
+}
+
+/// Replaces the placeholder at link time.
+fn replace_prefix(data: &[u8], placeholder: &[u8], prefix: &[u8], text: bool) -> Result<Vec<u8>> {
+    if text {
+        Ok(text_replace(data, placeholder, prefix))
+    } else {
+        binary_replace(data, placeholder, prefix, placeholder.len())
+    }
+}
+
+/// Whether a symlink at `at` (relative to the prefix) pointing at `target`
+/// stays inside the prefix, judged lexically.
+fn link_stays_inside(at: &str, target: &str) -> bool {
+    if target.starts_with('/') || target.contains(':') {
+        return false;
+    }
+    let mut depth: i64 = at.matches('/').count() as i64; // the link's directory depth
+    for part in target.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => depth += 1,
+        }
+    }
+    true
 }
 
 /// The destination of a package member inside the prefix: noarch python
@@ -250,6 +308,23 @@ pub fn link(record: &Record, archive: &Path, layout: &PrefixLayout) -> Result<Li
     let holders = placeholders(&info);
     let prefix_text = layout.prefix.to_string_lossy().replace('\\', "/");
     let prefix_bytes = prefix_text.as_bytes();
+    fs::create_dir_all(&layout.prefix)?;
+    let prefix_real = fs::canonicalize(&layout.prefix)?;
+    // Nothing is written through a directory that leads outside the prefix
+    // (a symlink an earlier member planted).
+    let parent_inside = |dest: &Path| -> Result<()> {
+        let parent = dest.parent().context("member parent")?;
+        fs::create_dir_all(parent)?;
+        let real = fs::canonicalize(parent)?;
+        if !real.starts_with(&prefix_real) {
+            bail!(
+                "{}: refusing to write {} through a link outside the prefix",
+                record.filename,
+                dest.display()
+            );
+        }
+        Ok(())
+    };
     let mut files: Vec<String> = Vec::new();
     let mut written: Vec<(String, String, bool)> = Vec::new();
     let rel_of = |dest: &Path| -> String {
@@ -269,11 +344,20 @@ pub fn link(record: &Record, archive: &Path, layout: &PrefixLayout) -> Result<Li
         let dest = destination(&m.path, noarch_python, layout)?;
         match m.kind {
             tar::Kind::Dir => {
+                parent_inside(&dest)?;
                 fs::create_dir_all(&dest)?;
                 continue;
             }
             tar::Kind::Symlink => {
-                fs::create_dir_all(dest.parent().context("member parent")?)?;
+                if !link_stays_inside(&rel_of(&dest), &m.link) {
+                    bail!(
+                        "{}: refusing link {} -> {} (outside the prefix)",
+                        record.filename,
+                        m.path,
+                        m.link
+                    );
+                }
+                parent_inside(&dest)?;
                 let _ = fs::remove_file(&dest);
                 #[cfg(unix)]
                 std::os::unix::fs::symlink(&m.link, &dest)
@@ -290,8 +374,11 @@ pub fn link(record: &Record, archive: &Path, layout: &PrefixLayout) -> Result<Li
                 continue;
             }
             tar::Kind::Hardlink => {
+                if !safe_relative(&m.link) {
+                    bail!("{}: refusing hard link to {}", record.filename, m.link);
+                }
                 let source = destination(&m.link, noarch_python, layout)?;
-                fs::create_dir_all(dest.parent().context("member parent")?)?;
+                parent_inside(&dest)?;
                 let _ = fs::remove_file(&dest);
                 if fs::hard_link(&source, &dest).is_err() {
                     fs::copy(&source, &dest)?;
@@ -301,7 +388,7 @@ pub fn link(record: &Record, archive: &Path, layout: &PrefixLayout) -> Result<Li
             }
             tar::Kind::File => {}
         }
-        fs::create_dir_all(dest.parent().context("member parent")?)?;
+        parent_inside(&dest)?;
         // Binaries keep the build prefix on Windows, as conda leaves them
         // (Windows binaries do not load by that path); text files are rewritten.
         let holder = holders
@@ -568,21 +655,10 @@ pub fn relocate(prefix: &Path, old: &str) -> Result<usize> {
             let file = prefix.join(path);
             let Ok(data) = fs::read(&file) else { continue };
             let rewritten = if *text {
-                replace_prefix(&data, old.as_bytes(), new.as_bytes(), true)?
+                text_replace(&data, old.as_bytes(), new.as_bytes())
             } else {
-                // `old` sits NUL-padded to the placeholder's length.
-                let mut padded_old = old.as_bytes().to_vec();
-                padded_old.resize(placeholder.len(), 0);
-                let mut padded_new = new.as_bytes().to_vec();
-                if padded_new.len() > placeholder.len() {
-                    bail!(
-                        "{}: the new path is longer than the {} bytes the binary allows",
-                        file.display(),
-                        placeholder.len()
-                    );
-                }
-                padded_new.resize(placeholder.len(), 0);
-                replace_prefix(&data, &padded_old, &padded_new, true)?
+                binary_replace(&data, old.as_bytes(), new.as_bytes(), placeholder.len())
+                    .with_context(|| format!("relocating {}", file.display()))?
             };
             if rewritten != data {
                 fs::write(&file, rewritten)?;
@@ -598,15 +674,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prefix_replacement_keeps_binary_length() {
+    fn prefix_replacement_keeps_binary_length_and_suffixes() {
         let ph = b"/opt/anaconda1anaconda2anaconda3";
         let data = b"x=/opt/anaconda1anaconda2anaconda3/lib;y";
         let text = replace_prefix(data, ph, b"/home/me/.venv", true).unwrap();
         assert_eq!(text, b"x=/home/me/.venv/lib;y");
+        // A binary keeps the string whole: prefix, suffix, then the padding.
+        let data = b"\0/opt/anaconda1anaconda2anaconda3/share/terminfo\0next\0";
         let bin = replace_prefix(data, ph, b"/home/me/.venv", false).unwrap();
         assert_eq!(bin.len(), data.len());
-        assert!(bin.starts_with(b"x=/home/me/.venv\0"));
+        let want = {
+            let mut w = b"\0/home/me/.venv/share/terminfo".to_vec();
+            w.extend(std::iter::repeat_n(0u8, ph.len() - "/home/me/.venv".len()));
+            w.extend_from_slice(b"\0next\0");
+            w
+        };
+        assert_eq!(bin, want);
+        // Moving it again keeps the layout; a path too long is refused.
+        let moved = binary_replace(&bin, b"/home/me/.venv", b"/srv/app/.venv", ph.len()).unwrap();
+        assert_eq!(moved.len(), data.len());
+        assert!(moved.starts_with(b"\0/srv/app/.venv/share/terminfo\0"));
         assert!(replace_prefix(data, ph, &[b'a'; 40], false).is_err());
+        assert!(link_stays_inside("lib/libz.so", "libz.so.1"));
+        assert!(link_stays_inside(
+            "bin/python",
+            "../lib/python3.12/bin/python"
+        ));
+        assert!(!link_stays_inside("bin/python", "../../etc/passwd"));
+        assert!(!link_stays_inside("bin/x", "/etc/passwd"));
     }
 
     #[test]

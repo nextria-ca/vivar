@@ -1291,6 +1291,15 @@ impl<'a> Resolver<'a> {
             // A requirement on the root or a member is met by the workspace
             // itself; its version is checked, nothing is fetched.
             if let Some(v) = locals.get(&req.name) {
+                // What the native environment provides comes as built: an
+                // extra would want dependencies no one resolves.
+                if !req.extras.is_empty() && roots.provided.contains_key(&req.name) {
+                    bail!(
+                        "{}[{}] asks for an extra of a package the native environment provides; add the extra's dependencies to native-dependencies or drop the extra",
+                        req.name,
+                        req.extras.join(",")
+                    );
+                }
                 if !req.specifier.matches_allowing_pre(v) {
                     // The member's version is fixed; the candidate that asked
                     // for another may not be. Try older ones first.

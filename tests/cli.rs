@@ -3776,6 +3776,35 @@ fn native_dependencies_from_conda_forge() {
         "{sbom}"
     );
     ok(dir, &["check", "--no-audit"]);
+    let spdx = stdout_of(&ok(
+        dir,
+        &["export", "sbom", "--format", "spdx", "--output", "-"],
+    ));
+    assert!(spdx.contains("pkg:conda/tzdata@"), "{spdx}");
+    // A deny list added after the lock still stops the sync and `check`.
+    let pyproject_path = dir.join("pyproject.toml");
+    let text = read(&pyproject_path).replace("deny = []", "deny = [\"tzdata\"]");
+    fs::write(&pyproject_path, text).unwrap();
+    fails_with(dir, &["sync"], "deny list");
+    assert!(!vivar(dir, &["check", "--no-audit"]).status.success());
+    let text = read(&pyproject_path).replace("deny = [\"tzdata\"]", "deny = []");
+    fs::write(&pyproject_path, text).unwrap();
+    // An extra of a package the prefix provides cannot be resolved.
+    fs::write(
+        &pyproject_path,
+        read(&pyproject_path).replace("\"six\",", "\"six[nothing]\","),
+    )
+    .unwrap();
+    fails_with(
+        dir,
+        &["lock"],
+        "extra of a package the native environment provides",
+    );
+    fs::write(
+        &pyproject_path,
+        read(&pyproject_path).replace("\"six[nothing]\",", "\"six\","),
+    )
+    .unwrap();
     let doctor = stdout_of(&ok(dir, &["doctor"]));
     assert!(
         doctor.contains("native dependencies: 2 declared"),

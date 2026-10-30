@@ -215,16 +215,33 @@ pub fn warn_if_stale(root: &Path) {
     }
 }
 
+/// PATH with the environment first: its `bin`/`Scripts`, and for a native
+/// (conda) prefix on Windows the directories conda packages put executables
+/// in (`Library\bin`, the prefix root for `python.exe`).
+pub fn env_path(venv: &Path) -> OsString {
+    let mut dirs = vec![venv.join(BIN)];
+    if cfg!(windows) && crate::nativedeps::is_prefix(venv) {
+        dirs.push(venv.join("Library").join("mingw-w64").join("bin"));
+        dirs.push(venv.join("Library").join("usr").join("bin"));
+        dirs.push(venv.join("Library").join("bin"));
+        dirs.push(venv.to_path_buf());
+    }
+    let mut path = OsString::new();
+    for d in dirs {
+        path.push(d.as_os_str());
+        path.push(if cfg!(windows) { ";" } else { ":" });
+    }
+    path.push(env::var_os("PATH").unwrap_or_default());
+    path
+}
+
 /// `vivar shell`: an interactive shell with the env activated.
 pub fn shell(root: &Path, prompt: &str, extra: &[(String, String)]) -> Result<i32> {
     let venv = root.join(".venv");
     if !venv.join("pyvenv.cfg").exists() {
         bail!("{} has no .venv yet; run `vivar sync`", root.display());
     }
-    let bin = venv.join(BIN);
-    let mut path = OsString::from(bin.as_os_str());
-    path.push(if cfg!(windows) { ";" } else { ":" });
-    path.push(env::var_os("PATH").unwrap_or_default());
+    let path = env_path(&venv);
 
     let shell = env::var_os("SHELL")
         .filter(|s| !s.is_empty())
@@ -327,12 +344,17 @@ pub fn exec_with(venv: &Path, args: &[String], extra: &[(String, String)]) -> Re
         .split_first()
         .ok_or_else(|| anyhow!("nothing to run"))?;
 
-    let mut path = OsString::from(bin.as_os_str());
-    path.push(if cfg!(windows) { ";" } else { ":" });
-    path.push(env::var_os("PATH").unwrap_or_default());
+    let path = env_path(venv);
 
     // The env's own entry points win over anything else on PATH.
-    let exe = [bin.join(program), bin.join(format!("{program}.exe"))]
+    let mut candidates = vec![bin.join(program), bin.join(format!("{program}.exe"))];
+    if cfg!(windows) && crate::nativedeps::is_prefix(venv) {
+        for d in [venv.join("Library").join("bin"), venv.to_path_buf()] {
+            candidates.push(d.join(program));
+            candidates.push(d.join(format!("{program}.exe")));
+        }
+    }
+    let exe = candidates
         .into_iter()
         .find(|p| p.is_file())
         .unwrap_or_else(|| PathBuf::from(program));

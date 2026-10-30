@@ -1008,7 +1008,7 @@ fn top_table<'a>(doc: &'a mut DocumentMut, key: &str) -> Result<&'a mut Table> {
 /// workspace, `workspace` is the root project: that is where `.venv` lives.
 pub struct Project {
     pub root: PathBuf,
-    doc: DocumentMut,
+    pub(crate) doc: DocumentMut,
     pub workspace: Option<Box<Project>>,
 }
 
@@ -1582,6 +1582,11 @@ impl Project {
         Policy::from_table(table, &self.root)
     }
 
+    /// A copy of the parsed manifest, for a project view rooted elsewhere.
+    pub fn doc_clone(&self) -> DocumentMut {
+        self.doc.clone()
+    }
+
     /// Refuses requirements whose package name is on the deny list.
     pub fn check_requirements<S: AsRef<str>>(&self, reqs: &[S]) -> Result<()> {
         self.policy()?.check_deny(reqs)
@@ -1590,7 +1595,14 @@ impl Project {
     /// Checks every dependency declared in `pyproject.toml` against the deny list,
     /// so hand-editing the file can't bypass `vivar add`.
     pub fn check_declared(&self) -> Result<()> {
-        self.check_requirements(&self.declared_requirements())
+        let mut reqs = self.declared_requirements();
+        // Native dependencies answer to the same deny list.
+        reqs.extend(
+            self.native_dependencies()
+                .iter()
+                .map(|s| s.split_whitespace().next().unwrap_or(s).to_owned()),
+        );
+        self.check_requirements(&reqs)
             .map_err(|e| anyhow!("{e} (declared in {})", self.root.join(PYPROJECT).display()))
     }
 

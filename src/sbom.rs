@@ -137,6 +137,37 @@ pub fn generate(project: &Project, format: Format) -> Result<String> {
                     quote(&id)
                 ));
             }
+            for r in &native {
+                let id = format!(
+                    "SPDXRef-Package-conda-{}-{}",
+                    r.name.replace(['.', '_'], "-"),
+                    r.version.replace(|c: char| !c.is_ascii_alphanumeric(), "-")
+                );
+                let purl = conda_purl(r);
+                let declared = r
+                    .license
+                    .clone()
+                    .filter(|l| !l.is_empty())
+                    .unwrap_or_else(|| "NOASSERTION".to_owned());
+                let download = if r.url.is_empty() {
+                    "NOASSERTION".to_owned()
+                } else {
+                    r.url.clone()
+                };
+                pkgs.push(format!(
+                    "{{\"SPDXID\":{},\"name\":{},\"versionInfo\":{},\"downloadLocation\":{},\"filesAnalyzed\":false,\"licenseConcluded\":\"NOASSERTION\",\"licenseDeclared\":{},\"externalRefs\":[{{\"referenceCategory\":\"PACKAGE-MANAGER\",\"referenceType\":\"purl\",\"referenceLocator\":{}}}]}}",
+                    quote(&id),
+                    quote(&r.name),
+                    quote(&r.version),
+                    quote(&download),
+                    quote(&declared),
+                    quote(&purl)
+                ));
+                rels.push(format!(
+                    "{{\"spdxElementId\":\"SPDXRef-DOCUMENT\",\"relatedSpdxElement\":{},\"relationshipType\":\"DESCRIBES\"}}",
+                    quote(&id)
+                ));
+            }
             format!(
                 "{{\"spdxVersion\":\"SPDX-2.3\",\"dataLicense\":\"CC0-1.0\",\"SPDXID\":\"SPDXRef-DOCUMENT\",\"name\":{},\"documentNamespace\":{},\"creationInfo\":{{\"created\":{},\"creators\":[{}]}},\"packages\":[{}],\"relationships\":[{}]}}\n",
                 quote(&name),

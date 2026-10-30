@@ -65,6 +65,12 @@ impl NativeBackend {
     /// Python resolve knows what the environment provides.
     fn native_lock(&self, project: &Project, upgrade: bool) -> Result<()> {
         if !crate::nativedeps::declared(project) {
+            if crate::nativedeps::retire(project)? {
+                println!(
+                    "native: nothing native declared any more; {} removed (the prefix keeps its Python)",
+                    crate::nativedeps::LOCKFILE
+                );
+            }
             return Ok(());
         }
         let changes = crate::nativedeps::lock(project, &self.policy, upgrade)?;

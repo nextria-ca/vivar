@@ -1099,6 +1099,13 @@ fn bundle_integrity_and_diff() {
     let six = site_packages(&good).join("six.py");
     let mut text = read(&six);
     text.push_str("\n# tampered\n");
+    // Installed files are read-only (shared store links); a tamperer would
+    // lift that first, so the test does too.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&six, fs::Permissions::from_mode(0o644)).unwrap();
+    }
     fs::write(&six, text).unwrap();
     let out = vivar(&good, &["verify"]);
     assert!(!out.status.success());

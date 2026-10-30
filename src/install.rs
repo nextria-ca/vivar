@@ -291,21 +291,18 @@ impl Store {
     /// (another filesystem, a filesystem without links).
     fn place(&self, name: &str, bytes: &[u8], mode: u32, target: &Path) -> Result<()> {
         let cached = self.dir.join(name);
+        // A copy from before files were made read-only is replaced by a new
+        // one (renamed over the entry), so the inode other environments
+        // link to is left alone.
+        #[cfg(unix)]
+        let usable = |m: &fs::Metadata| {
+            use std::os::unix::fs::PermissionsExt;
+            m.permissions().mode() & 0o222 == 0
+        };
+        #[cfg(not(unix))]
+        let usable = |_: &fs::Metadata| true;
         let fresh = match fs::metadata(&cached) {
-            Ok(m) if m.len() == bytes.len() as u64 => {
-                // A copy from before files were made read-only is fixed up.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if m.permissions().mode() & 0o222 != 0 {
-                        let _ = fs::set_permissions(
-                            &cached,
-                            fs::Permissions::from_mode(m.permissions().mode() & !0o222),
-                        );
-                    }
-                }
-                false
-            }
+            Ok(m) if m.len() == bytes.len() as u64 && usable(&m) => false,
             _ => {
                 // Written whole under another name, then renamed: a parallel
                 // install never links a half-written file.

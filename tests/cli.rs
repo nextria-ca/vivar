@@ -2741,9 +2741,38 @@ fn native_backend_syncs_from_the_lock_without_uv() {
                 .unwrap();
             assert!(st.success(), "git {args:?}");
         }
-        okn(
-            dir,
-            &["add", &format!("gitpkg @ git+{}@main", file_url(&repo))],
+        // The native run keeps a bare PATH; git's own directory joins it, since
+        // a git reference needs git on the machine that resolves it.
+        let git_dir = {
+            let finder = if cfg!(windows) { "where" } else { "which" };
+            let out = Command::new(finder).arg("git").output().unwrap();
+            let first = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            Path::new(&first)
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_default()
+        };
+        let path_with_git = std::env::join_paths(
+            std::iter::once(git_dir).chain(std::env::split_paths(bare_path())),
+        )
+        .unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
+            .current_dir(dir)
+            .env("VIVAR_BACKEND", "native")
+            .env("PATH", &path_with_git)
+            .args(["add", &format!("gitpkg @ git+{}@main", file_url(&repo))])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git add failed:\n{}{}",
+            stdout_of(&out),
+            String::from_utf8_lossy(&out.stderr)
         );
         okn(
             dir,

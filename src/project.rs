@@ -757,8 +757,11 @@ pub enum SourceKind {
         reference: Option<GitRef>,
         subdirectory: Option<String>,
     },
-    /// A wheel or source archive at a URL.
-    Url(String),
+    /// A wheel or source archive at a URL, built from `subdirectory` when given.
+    Url {
+        url: String,
+        subdirectory: Option<String>,
+    },
     /// A file or directory, as written: relative to the pyproject declaring it.
     Path {
         path: String,
@@ -1210,7 +1213,10 @@ impl Project {
                         subdirectory: text("subdirectory"),
                     }
                 } else if let Some(url) = text("url") {
-                    SourceKind::Url(url)
+                    SourceKind::Url {
+                        url,
+                        subdirectory: text("subdirectory"),
+                    }
                 } else if let Some(path) = text("path") {
                     SourceKind::Path {
                         path,
@@ -1269,6 +1275,28 @@ impl Project {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Two of `selected` (groups and extras) that a `[tool.uv.conflicts]` set
+    /// says exclude each other, if any.
+    pub fn conflicting(&self, selected: &[Selector]) -> Option<(Selector, Selector)> {
+        for set in self.conflict_sets() {
+            let chosen: Vec<&Selector> = set.iter().filter(|s| selected.contains(s)).collect();
+            if chosen.len() > 1 {
+                return Some((chosen[0].clone(), chosen[1].clone()));
+            }
+        }
+        None
+    }
+
+    /// What a profile name selects: a dependency group, or an extra of the
+    /// project when it is declared as one and not as a group.
+    pub fn profile_selector(&self, profile: &str) -> Selector {
+        if !self.has_group(profile) && self.has_extra(profile) {
+            Selector::Extra(normalize(profile))
+        } else {
+            Selector::Group(profile.to_owned())
+        }
     }
 
     /// `[tool.vivar] profiles`: dependency groups that are machine variants.
@@ -1748,7 +1776,10 @@ lint = ["ruff"]
         );
         assert_eq!(
             sources["b"][1].kind,
-            SourceKind::Url("https://h/b.whl".into())
+            SourceKind::Url {
+                url: "https://h/b.whl".into(),
+                subdirectory: None
+            }
         );
         assert_eq!(
             sources["c"][0].kind,

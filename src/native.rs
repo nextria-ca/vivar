@@ -263,10 +263,12 @@ impl NativeBackend {
                 .iter()
                 .find(|e| e.selector().is_some() && e.selector().as_ref() == selector);
             let plain = on_side.iter().find(|e| e.selector().is_none());
-            let specific: BTreeSet<Option<Selector>> = on_side
+            // Group- or extra-specific entries that all name one destination
+            // are one source; different destinations need declared conflicts.
+            let specific: BTreeSet<&SourceKind> = on_side
                 .iter()
                 .filter(|e| e.selector().is_some())
-                .map(|e| e.selector())
+                .map(|e| &e.kind)
                 .collect();
             let pick = match (exact, plain) {
                 (Some(e), _) => Some(*e),
@@ -335,7 +337,10 @@ impl NativeBackend {
                         commit: String::new(),
                         subdirectory: subdirectory.clone(),
                     },
-                    SourceKind::Url(u) => ResolvedSource::Url(u.clone()),
+                    SourceKind::Url { url, subdirectory } => ResolvedSource::Url {
+                        url: url.clone(),
+                        subdirectory: subdirectory.clone(),
+                    },
                     SourceKind::Path { path, editable } => {
                         let rel = lock_rel(e).unwrap_or_default();
                         if e.base.join(path).is_dir() {
@@ -658,19 +663,32 @@ fn safe_file_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\'])
 }
 
-/// `https://host/x.whl#sha256=<64 hex>` → (`https://host/x.whl`, the digest).
-/// Anything else after `sha256=` is refused: the digest names a cache path.
-fn split_hash_fragment(url: &str) -> Result<(String, Option<String>)> {
-    match url.split_once('#') {
-        Some((bare, frag)) => match frag.strip_prefix("sha256=") {
-            Some(h) if h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()) => {
-                Ok((bare.to_owned(), Some(h.to_lowercase())))
+/// `https://host/x.tar.gz#sha256=<64 hex>&subdirectory=sub` → the bare URL,
+/// the digest, the subdirectory. A digest in any other form is refused: it
+/// names a cache path. A subdirectory must stay inside the archive.
+fn split_fragment(url: &str) -> Result<(String, Option<String>, Option<String>)> {
+    let (bare, sha, sub) = crate::resolve::url_fragment(url);
+    let sha = match sha {
+        Some(h) if h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()) => {
+            Some(h.to_lowercase())
+        }
+        Some(h) => bail!("{url}: `#sha256={h}` is not a 64-character hex digest"),
+        None => None,
+    };
+    let sub = match sub {
+        Some(s) => {
+            let s = s.trim_matches('/').to_owned();
+            let clean = !s.is_empty()
+                && !s.contains('\\')
+                && !s.split('/').any(|c| c.is_empty() || c == "." || c == "..");
+            if !clean {
+                bail!("{url}: `subdirectory={s}` must be a relative path inside the archive");
             }
-            Some(h) => bail!("{url}: `#sha256={h}` is not a 64-character hex digest"),
-            None => Ok((bare.to_owned(), None)),
-        },
-        None => Ok((url.to_owned(), None)),
-    }
+            Some(s)
+        }
+        None => None,
+    };
+    Ok((bare, sha, sub))
 }
 
 /// Where wheels come from: the configured index (credentials go to its host
@@ -737,7 +755,7 @@ fn fetch_wheel(pkg: &Package, target: &wheelhouse::Target, source: &Source) -> R
             yanked: false,
             has_metadata: false,
         };
-        return builder.wheel_from_sdist(&pkg.name, &sdist);
+        return builder.wheel_from_sdist_in(&pkg.name, &sdist, pkg.subdirectory.as_deref());
     }
     let name = artifact.filename();
     if !safe_file_name(&name) {
@@ -818,7 +836,7 @@ fn apply(
                 installed += 1;
             }
             "path" => {
-                let wheel = wheel_from_path(pkg, lock_root, source)?;
+                let wheel = wheel_from_path(pkg, lock_root, target, source)?;
                 install::install_wheel_from(
                     &wheel,
                     layout,
@@ -857,7 +875,12 @@ fn apply(
 
 /// The wheel for a `path` package: the file itself when it is a wheel
 /// (checked against the lock's hash), else the archive built once.
-fn wheel_from_path(pkg: &Package, lock_root: &Path, source: &Source) -> Result<PathBuf> {
+fn wheel_from_path(
+    pkg: &Package,
+    lock_root: &Path,
+    target: &wheelhouse::Target,
+    source: &Source,
+) -> Result<PathBuf> {
     let file = lock_root.join(&pkg.source);
     if !file.is_file() {
         bail!(
@@ -887,6 +910,13 @@ fn wheel_from_path(pkg: &Package, lock_root: &Path, source: &Source) -> Result<P
         .to_string_lossy()
         .into_owned();
     if filename.ends_with(".whl") {
+        if target.score(&filename).is_none() {
+            bail!(
+                "{} is built for another platform or Python ({filename} does not fit {})",
+                pkg.name,
+                target.label()
+            );
+        }
         return Ok(file);
     }
     let builder = source.builder.as_ref().ok_or_else(|| {
@@ -922,9 +952,14 @@ fn direct_url_of(pkg: &Package, lock_root: &Path) -> Option<String> {
             .map(|h| format!(",\"archive_info\":{{\"hash\":\"sha256={h}\"}}"))
             .unwrap_or_default()
     };
+    let sub = pkg
+        .subdirectory
+        .as_deref()
+        .map(|s| format!(",\"subdirectory\":{}", crate::json::quote(s)))
+        .unwrap_or_default();
     match pkg.source_kind.as_str() {
         "url" => Some(format!(
-            "{{\"url\":{}{}}}",
+            "{{\"url\":{}{sub}{}}}",
             crate::json::quote(&pkg.source),
             archive_hash()
         )),
@@ -1616,6 +1651,35 @@ fn wheel_metadata(name: &str, wheel: &Path) -> Result<(Version, Metadata)> {
 }
 
 impl Builder<'_> {
+    /// A wheel built from a source archive, from `subdirectory` of it when
+    /// given (cached by the archive's hash and that directory).
+    fn wheel_from_sdist_in(
+        &self,
+        name: &str,
+        sdist: &File,
+        subdirectory: Option<&str>,
+    ) -> Result<PathBuf> {
+        if self.backend.no_build {
+            bail!("{name} ships only a source distribution and policy requires wheels");
+        }
+        let (archive, hash) = self.fetch_sdist(sdist)?;
+        let identity = match subdirectory {
+            Some(sub) => format!("{hash}/{sub}"),
+            None => hash,
+        };
+        let key = self.build_key(&identity)?;
+        if let Some(w) = self.fitting_cached_wheel(&Self::built_dir(&key)?) {
+            return Ok(w);
+        }
+        let scratch =
+            std::env::temp_dir().join(format!("vivar-sdist-{}-{key}", std::process::id()));
+        let result = Self::unpack_sdist(&archive, &scratch)
+            .and_then(|src| Self::project_in(&src, subdirectory))
+            .and_then(|src| self.wheel_from_tree(name, &src, &key));
+        let _ = fs::remove_dir_all(&scratch);
+        result
+    }
+
     /// Clones `repo` at `reference`, builds the project (in `subdirectory`
     /// when given) and describes the result.
     fn git_build(
@@ -1655,13 +1719,20 @@ impl Fetch for Builder<'_> {
     fn sourced(&self, name: &str, source: &Sourced) -> Result<Direct> {
         let name = project::normalize(name);
         match &source.kind {
-            SourceKind::Url(u) => self.direct(&Requirement {
-                name: name.clone(),
-                extras: Vec::new(),
-                specifier: crate::pep::Specifier::parse("")?,
-                marker: None,
-                url: Some(u.clone()),
-            }),
+            SourceKind::Url { url, subdirectory } => {
+                let url = match subdirectory {
+                    Some(sub) if !url.contains('#') => format!("{url}#subdirectory={sub}"),
+                    Some(sub) => format!("{url}&subdirectory={sub}"),
+                    None => url.clone(),
+                };
+                self.direct(&Requirement {
+                    name: name.clone(),
+                    extras: Vec::new(),
+                    specifier: crate::pep::Specifier::parse("")?,
+                    marker: None,
+                    url: Some(url),
+                })
+            }
             SourceKind::Git {
                 url,
                 reference,
@@ -1726,20 +1797,7 @@ impl Fetch for Builder<'_> {
     }
 
     fn wheel_from_sdist(&self, name: &str, sdist: &File) -> Result<PathBuf> {
-        if self.backend.no_build {
-            bail!("{name} ships only a source distribution and policy requires wheels");
-        }
-        let (archive, hash) = self.fetch_sdist(sdist)?;
-        let key = self.build_key(&hash)?;
-        if let Some(w) = self.fitting_cached_wheel(&Self::built_dir(&key)?) {
-            return Ok(w);
-        }
-        let scratch =
-            std::env::temp_dir().join(format!("vivar-sdist-{}-{key}", std::process::id()));
-        let result = Self::unpack_sdist(&archive, &scratch)
-            .and_then(|src| self.wheel_from_tree(name, &src, &key));
-        let _ = fs::remove_dir_all(&scratch);
-        result
+        self.wheel_from_sdist_in(name, sdist, None)
     }
 
     fn direct(&self, req: &Requirement) -> Result<Direct> {
@@ -1751,8 +1809,9 @@ impl Fetch for Builder<'_> {
             let (repo, rev) = crate::resolve::git_parts(&url);
             return self.git_build(&name, &repo, rev.map(GitRef::Rev), subdirectory);
         }
-        // `#sha256=…` on the URL is a promise to hold the download to.
-        let (url, expected) = split_hash_fragment(&url)?;
+        // `#sha256=…` on the URL is a promise to hold the download to;
+        // `#subdirectory=…` names the project inside an archive.
+        let (url, expected, subdirectory) = split_fragment(&url)?;
         let filename = crate::lock::Artifact {
             url: url.clone(),
             hash: None,
@@ -1778,6 +1837,9 @@ impl Fetch for Builder<'_> {
                 fs::create_dir_all(dest.parent().context("cache path")?)?;
                 fs::copy(&path, &dest)?;
             }
+            if subdirectory.is_some() {
+                bail!("{name}: a wheel has no subdirectory to build from");
+            }
             return Ok(Direct {
                 version,
                 metadata,
@@ -1785,7 +1847,10 @@ impl Fetch for Builder<'_> {
                     sha256: Some(hash),
                     ..file
                 }],
-                source: ResolvedSource::Url(url),
+                source: ResolvedSource::Url {
+                    url,
+                    subdirectory: None,
+                },
             });
         }
         let (archive, hash) = self.fetch_sdist(&file)?;
@@ -1793,14 +1858,14 @@ impl Fetch for Builder<'_> {
             sha256: Some(hash),
             ..file
         };
-        let wheel = self.wheel_from_sdist(&name, &hashed)?;
+        let wheel = self.wheel_from_sdist_in(&name, &hashed, subdirectory.as_deref())?;
         let _ = archive;
         let (version, metadata) = metadata_of(&wheel)?;
         Ok(Direct {
             version,
             metadata,
             files: vec![hashed],
-            source: ResolvedSource::Url(url),
+            source: ResolvedSource::Url { url, subdirectory },
         })
     }
 }
@@ -1832,11 +1897,15 @@ impl Backend for NativeBackend {
                         .name()
                 } else {
                     let file = path.file_name().unwrap_or_default().to_string_lossy();
-                    let stem = file
-                        .trim_end_matches(".whl")
-                        .trim_end_matches(".tar.gz")
-                        .trim_end_matches(".zip");
-                    project::normalize(stem.split('-').next().unwrap_or(stem))
+                    // A wheel's name has no hyphens; an archive's may, so its
+                    // version is what comes after the last one.
+                    let stem = if let Some(w) = file.strip_suffix(".whl") {
+                        w.split('-').next().unwrap_or(w)
+                    } else {
+                        let base = file.trim_end_matches(".tar.gz").trim_end_matches(".zip");
+                        base.rsplit_once('-').map(|(n, _)| n).unwrap_or(base)
+                    };
+                    project::normalize(stem)
                 };
                 let rel = project::relative_path(&project.root, path);
                 paths.push((name.clone(), rel, editable && path.is_dir()));
@@ -1846,6 +1915,8 @@ impl Backend for NativeBackend {
                 requirements.push(p.clone());
             }
         }
+        // The names a path stands for go past the deny list like any other.
+        project.check_requirements(&requirements)?;
         for r in &requirements {
             project::add_dependency(&project.root, r, group)?;
         }
@@ -2081,8 +2152,13 @@ impl Backend for NativeBackend {
             it.next().unwrap_or(0),
         ];
         let env = MarkerEnv::for_target(os, arch, version);
-        let groups: Vec<&str> = group.into_iter().collect();
-        let wanted = plan(&lock, &env, &groups)?;
+        // A profile is a group, or an extra declared as one.
+        let (groups, extras): (Vec<&str>, Vec<&str>) = match group {
+            Some(p) if project.profile_selector(p).is_group() => (vec![p], Vec::new()),
+            Some(p) => (Vec::new(), vec![p]),
+            None => (Vec::new(), Vec::new()),
+        };
+        let wanted = plan_with(&lock, &env, &groups, &extras)?;
         let series = format!("{}.{}", version[0], version[1]);
         let t = wheelhouse::Target::new(Some(&format!("{os}-{arch}")), &series)?;
         // `target` is a site-packages directory; scripts go beside it in bin/, as uv's layout does.
@@ -2094,10 +2170,17 @@ impl Backend for NativeBackend {
             python: "python".to_owned(),
             windows: os == "windows",
         };
+        // Local files and directories count too: a wheel is laid out, an
+        // archive or directory build is refused rather than left out.
         let registry: Vec<&Package> = wanted
             .iter()
             .copied()
-            .filter(|p| matches!(p.source_kind.as_str(), "registry" | "url" | "git"))
+            .filter(|p| {
+                matches!(
+                    p.source_kind.as_str(),
+                    "registry" | "url" | "git" | "path" | "directory"
+                )
+            })
             .collect();
         let (installed, _) = self.with_source(None, |source| {
             apply(project.venv_root(), &registry, &layout, &t, source)

@@ -2674,8 +2674,57 @@ fn native_backend_syncs_from_the_lock_without_uv() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+    // The requirement still has to be met by what the source holds.
+    let pyproject_path = dir.join("pyproject.toml");
+    let text = read(&pyproject_path).replace("\"minipkg\",", "\"minipkg>=2\",");
+    fs::write(&pyproject_path, text).unwrap();
+    let out = native(dir, &["lock"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("does not satisfy `minipkg>=2`"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = read(&pyproject_path).replace("\"minipkg>=2\",", "\"minipkg\",");
+    fs::write(&pyproject_path, text).unwrap();
     okn(dir, &["remove", "minipkg"]);
     assert!(!read(&dir.join("pyproject.toml")).contains("minipkg"));
+    // The name a path stands for goes past the deny list, and a wheel built
+    // for another platform is refused.
+    let text = read(&pyproject_path).replace("deny = []", "deny = [\"minipkg\"]");
+    fs::write(&pyproject_path, text).unwrap();
+    let out = native(dir, &["add", local_whl.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("deny list"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = read(&pyproject_path);
+    assert!(
+        !text.contains("\"minipkg\",") && !text.contains("minipkg = { path"),
+        "{text}"
+    );
+    let text = text.replace("deny = [\"minipkg\"]", "deny = []");
+    fs::write(&pyproject_path, text).unwrap();
+    let foreign = wheels_dir.join("minipkg-1.0-py3-none-win_amd64.whl");
+    fs::copy(&local_whl, &foreign).unwrap();
+    let out = native(dir, &["add", foreign.to_str().unwrap()]);
+    if cfg!(windows) {
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        okn(dir, &["remove", "minipkg"]);
+    } else {
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("another platform"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
     // A local project directory: editable (a .pth), or built and installed,
     // in which case a change to its source is picked up by the next sync.
     let local_dir = tmp.0.join("dirpkg");
@@ -2844,6 +2893,116 @@ fn native_backend_syncs_from_the_lock_without_uv() {
         lock.contains("sdist = { url = \"file:///") && lock.contains("sdistpkg-0.1.tar.gz"),
         "{lock}"
     );
+    // An archive holding the project in a subdirectory, by URL fragment and
+    // as a declared source; and a local archive whose name has hyphens.
+    let multi = tmp.0.join("multi");
+    fs::create_dir_all(multi.join("sub").join("src").join("subarch")).unwrap();
+    fs::write(
+        multi.join("sub").join("pyproject.toml"),
+        "[project]\nname = \"subarch\"\nversion = \"0.2\"\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n",
+    )
+    .unwrap();
+    fs::write(
+        multi
+            .join("sub")
+            .join("src")
+            .join("subarch")
+            .join("__init__.py"),
+        "VALUE = 8\n",
+    )
+    .unwrap();
+    let multi_tar = tmp.0.join("multi.tar.gz");
+    let status = Command::new("tar")
+        .arg("-czf")
+        .arg(&multi_tar)
+        .arg("-C")
+        .arg(&tmp.0)
+        .arg("multi")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    okn(
+        dir,
+        &[
+            "add",
+            &format!("subarch @ {}#subdirectory=sub", file_url(&multi_tar)),
+        ],
+    );
+    okn(
+        dir,
+        &[
+            "run",
+            "python",
+            "-c",
+            "import subarch; assert subarch.VALUE == 8",
+        ],
+    );
+    let lock = read(&dir.join("uv.lock"));
+    assert!(lock.contains("subdirectory = \"sub\" }"), "{lock}");
+    okn(dir, &["sync"]);
+    okn(dir, &["remove", "subarch"]);
+    let text = read(&dir.join("pyproject.toml"))
+        .replace("dependencies = [", "dependencies = [\n    \"subarch\",")
+        + &format!(
+            "\n[tool.uv.sources]\nsubarch = {{ url = \"{}\", subdirectory = \"sub\" }}\n",
+            file_url(&multi_tar)
+        );
+    fs::write(dir.join("pyproject.toml"), text).unwrap();
+    okn(dir, &["sync"]);
+    okn(
+        dir,
+        &[
+            "run",
+            "python",
+            "-c",
+            "import subarch; assert subarch.VALUE == 8",
+        ],
+    );
+    let lock = read(&dir.join("uv.lock"));
+    assert!(
+        lock.contains("{ name = \"subarch\", url = \"file:///")
+            && lock.contains("subdirectory = \"sub\" }"),
+        "{lock}"
+    );
+    okn(dir, &["remove", "subarch"]);
+    let hy = tmp.0.join("my-lib-1.0");
+    fs::create_dir_all(hy.join("src").join("my_lib")).unwrap();
+    fs::write(
+        hy.join("pyproject.toml"),
+        "[project]\nname = \"my-lib\"\nversion = \"1.0\"\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n",
+    )
+    .unwrap();
+    fs::write(
+        hy.join("src").join("my_lib").join("__init__.py"),
+        "VALUE = 9\n",
+    )
+    .unwrap();
+    let hy_tar = tmp.0.join("my-lib-1.0.tar.gz");
+    let status = Command::new("tar")
+        .arg("-czf")
+        .arg(&hy_tar)
+        .arg("-C")
+        .arg(&tmp.0)
+        .arg("my-lib-1.0")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    okn(dir, &["add", hy_tar.to_str().unwrap()]);
+    assert!(
+        read(&dir.join("pyproject.toml")).contains("my-lib = { path = \"my-lib-1.0.tar.gz\" }"),
+        "{}",
+        read(&dir.join("pyproject.toml"))
+    );
+    okn(
+        dir,
+        &[
+            "run",
+            "python",
+            "-c",
+            "import my_lib; assert my_lib.VALUE == 9",
+        ],
+    );
+    okn(dir, &["remove", "my-lib"]);
     // A second resolve reuses the built wheel.
     let out = okn(dir, &["lock"]);
     assert!(
@@ -3136,10 +3295,49 @@ fn native_backend_syncs_from_the_lock_without_uv() {
             "import variant; assert variant.VALUE == 43",
         ],
     );
+    // Two extras that exclude each other are refused before anything changes.
+    let out = native(dir, &["sync", "--extra", "slow", "--extra", "fast"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("exclude each other"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    okn(
+        dir,
+        &[
+            "run",
+            "python",
+            "-c",
+            "import variant; assert variant.VALUE == 43",
+        ],
+    );
+    // A bundle packed with an extra-based profile active keeps that extra.
+    if cfg!(unix) {
+        let archive = tmp.0.join("fast.tar.gz");
+        okn(dir, &["pack", "-o", archive.to_str().unwrap()]);
+        let listing = Command::new("tar")
+            .args(["-tzf", archive.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        assert!(listing.contains("variant-2.0.dist-info"), "{listing}");
+    }
     okn(dir, &["sync"]);
     assert!(!native(dir, &["run", "python", "-c", "import variant"])
         .status
         .success());
+    // Two groups routed to the same index are one source, no conflicts needed.
+    let text = plain.clone()
+        + &format!(
+            "\n[dependency-groups]\ndev = [\"variant\"]\ntest = [\"variant\"]\n\n[[tool.uv.index]]\nname = \"wh\"\nurl = \"{}\"\nexplicit = true\n\n[tool.uv.sources]\nvariant = [{{ index = \"wh\", group = \"dev\" }}, {{ index = \"wh\", group = \"test\" }}]\n",
+            file_url(&wh)
+        );
+    fs::write(&pyproject, text).unwrap();
+    okn(dir, &["lock"]);
+    assert!(read(&dir.join("uv.lock")).contains("name = \"variant\""));
+    fs::write(&pyproject, &plain).unwrap();
+    okn(dir, &["lock"]);
 
     // A marker on a source entry forks the lock: one side per marker, each
     // routed to its own index, and the installer takes this machine's side.
@@ -3311,6 +3509,8 @@ fn native_backend_syncs_from_the_lock_without_uv() {
     if cfg!(unix) {
         let here = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
         let archive = tmp.0.join("native-x.tar.gz");
+        // A local wheel travels into a cross-target bundle like any other.
+        okn(dir, &["add", local_whl.to_str().unwrap()]);
         okn(
             dir,
             &[
@@ -3323,6 +3523,16 @@ fn native_backend_syncs_from_the_lock_without_uv() {
                 archive.to_str().unwrap(),
             ],
         );
+        let listing = Command::new("tar")
+            .args(["-tzf", archive.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        assert!(
+            listing.contains("site-packages/minipkg/__init__.py"),
+            "{listing}"
+        );
+        okn(dir, &["remove", "minipkg"]);
         let dest = tmp.0.join("native-x-dest");
         okn(
             &tmp.0,

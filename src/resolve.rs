@@ -181,8 +181,12 @@ pub struct Pin {
 pub enum Source {
     /// A package index, by URL (or a wheelhouse directory).
     Registry(String),
-    /// A wheel or source distribution at a URL (`name @ https://…`).
-    Url(String),
+    /// A wheel or source archive at a URL (`name @ https://…`), built from
+    /// `subdirectory` of the archive when given.
+    Url {
+        url: String,
+        subdirectory: Option<String>,
+    },
     /// A git checkout (`name @ git+https://…@rev#subdirectory=sub`), pinned
     /// to a commit.
     Git {
@@ -205,7 +209,13 @@ impl Source {
         let mut src = toml_edit::InlineTable::new();
         match self {
             Source::Registry(u) => src.insert("registry", u.as_str().into()),
-            Source::Url(u) => src.insert("url", u.as_str().into()),
+            Source::Url { url, subdirectory } => {
+                src.insert("url", url.as_str().into());
+                if let Some(sub) = subdirectory {
+                    src.insert("subdirectory", sub.as_str().into());
+                }
+                None
+            }
             Source::Git {
                 url,
                 reference,
@@ -1332,6 +1342,17 @@ impl<'a> Resolver<'a> {
                         );
                     }
                 }
+                // The source says which version there is; the requirement
+                // still has to be satisfied by it.
+                if !req.specifier.matches_allowing_pre(&d.version) {
+                    bail!(
+                        "{} is version {} at its declared source, which does not satisfy `{}{}`",
+                        req.name,
+                        d.version,
+                        req.name,
+                        req.specifier
+                    );
+                }
                 let switching = !state.directs.contains_key(&req.name);
                 match state.assigned.iter().find(|(n, _)| *n == req.name) {
                     // Chosen from the index before the URL arrived: the same
@@ -1643,6 +1664,24 @@ pub fn git_lock_url(
     out
 }
 
+/// A direct reference's URL without its fragment, plus the `sha256=` and
+/// `subdirectory=` the fragment carries (`&`-separated, either order).
+pub fn url_fragment(url: &str) -> (String, Option<String>, Option<String>) {
+    let Some((bare, fragment)) = url.split_once('#') else {
+        return (url.to_owned(), None, None);
+    };
+    let mut sha = None;
+    let mut sub = None;
+    for part in fragment.split('&') {
+        if let Some(v) = part.strip_prefix("sha256=") {
+            sha = Some(v.to_owned());
+        } else if let Some(v) = part.strip_prefix("subdirectory=") {
+            sub = Some(v.to_owned());
+        }
+    }
+    (bare.to_owned(), sha, sub)
+}
+
 /// The `subdirectory` named in a direct git reference's fragment
 /// (`git+https://…@rev#subdirectory=sub`), checked to stay inside the checkout.
 pub fn git_subdirectory(url: &str) -> Result<Option<String>> {
@@ -1951,7 +1990,11 @@ pub fn write_lock(roots: &Roots, lock: &Lockable) -> String {
                             );
                         }
                         (Some(u), _) => {
-                            t.insert("url", u.into());
+                            let (bare, _, sub) = url_fragment(u);
+                            t.insert("url", bare.into());
+                            if let Some(sub) = sub {
+                                t.insert("subdirectory", sub.into());
+                            }
                         }
                         (None, Some(s)) => {
                             match &s.source {
@@ -1972,8 +2015,11 @@ pub fn write_lock(roots: &Roots, lock: &Lockable) -> String {
                                         git_lock_url(url, reference, "", subdirectory).into(),
                                     );
                                 }
-                                Source::Url(u) => {
-                                    t.insert("url", u.as_str().into());
+                                Source::Url { url, subdirectory } => {
+                                    t.insert("url", url.as_str().into());
+                                    if let Some(sub) = subdirectory {
+                                        t.insert("subdirectory", sub.as_str().into());
+                                    }
                                 }
                                 Source::Path(p) => {
                                     t.insert("path", p.as_str().into());

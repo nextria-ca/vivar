@@ -1,6 +1,9 @@
 mod audit;
 mod backend;
 mod bundle;
+mod condaindex;
+mod condasolve;
+mod condaspec;
 mod dirs;
 mod doctor;
 mod ed25519;
@@ -15,6 +18,7 @@ mod kernel;
 mod licenses;
 mod lock;
 mod man;
+mod msgpack;
 mod native;
 mod pep;
 mod project;
@@ -25,12 +29,14 @@ mod sbom;
 mod sha256;
 mod sha512;
 mod sign;
+mod tar;
 mod tool;
 mod upgrade;
 mod venv;
 mod verify;
 mod wheelhouse;
 mod zip;
+mod zstd;
 
 use anyhow::{bail, Result};
 use backend::{Backend, UvBackend};
@@ -828,17 +834,7 @@ fn main() -> Result<()> {
                     Some(name.to_owned())
                 }
             };
-            // A profile is a dependency group, or an extra of the project
-            // when it is declared as one.
-            let mut groups: Vec<&str> = Vec::new();
-            let mut extras: Vec<&str> = extra.iter().map(String::as_str).collect();
-            if let Some(p) = profile.as_deref() {
-                if project.has_group(p) || !project.has_extra(p) {
-                    groups.push(p);
-                } else {
-                    extras.push(p);
-                }
-            }
+            let (groups, extras) = selection(&project, profile.as_deref(), &extra)?;
             backend.sync_with(&cwd, &groups, &extras)?;
             venv::mark_profile(project.venv_root(), profile.as_deref());
             venv::mark_synced(project.venv_root());
@@ -1220,7 +1216,8 @@ fn main() -> Result<()> {
                 }
                 None => {
                     venv::ensure(project.venv_root(), &project.name())?;
-                    backend.sync_group(&cwd, profile.as_deref())?;
+                    let (groups, extras) = selection(&project, profile.as_deref(), &[])?;
+                    backend.sync_with(&cwd, &groups, &extras)?;
                     venv::mark_synced(project.venv_root());
                     venv::mark_profile(project.venv_root(), profile.as_deref());
                     after_install(&project, &policy)?;
@@ -1660,17 +1657,33 @@ fn transact(
             .flat_map(|p| p.profiles())
             .collect();
         let exists = |g: &str| {
-            owner.as_ref().is_some_and(|p| p.has_group(g))
-                || member.as_ref().is_some_and(|p| p.has_group(g))
+            owner
+                .as_ref()
+                .is_some_and(|p| p.has_group(g) || p.has_extra(g))
+                || member
+                    .as_ref()
+                    .is_some_and(|p| p.has_group(g) || p.has_extra(g))
+        };
+        let is_extra = |g: &str| {
+            let via = |p: &Project| !p.profile_selector(g).is_group();
+            owner.as_ref().is_some_and(via) || member.as_ref().is_some_and(via)
         };
         let profile = profile_before.as_deref().filter(|p| exists(p));
-        let mut groups: Vec<&str> = profile.into_iter().collect();
+        let mut groups: Vec<&str> = Vec::new();
+        let mut extras: Vec<&str> = Vec::new();
+        if let Some(p) = profile {
+            if is_extra(p) {
+                extras.push(p);
+            } else {
+                groups.push(p);
+            }
+        }
         if let Some(g) =
             group.filter(|g| exists(g) && !groups.contains(g) && !profiles.iter().any(|p| p == g))
         {
             groups.push(g);
         }
-        let _ = backend.sync_groups(cwd, &groups);
+        let _ = backend.sync_with(cwd, &groups, &extras);
         venv::mark_profile(project.venv_root(), profile);
         venv::mark_synced(project.venv_root());
     }
@@ -1831,6 +1844,42 @@ fn print_policy(project: Option<&Project>, policy: &project::Policy, json: bool)
 
 /// Policy checks that need the environment installed: licenses, and the
 /// lockfile's hashes/sources when `require-hashes` is on.
+/// The groups and extras a sync installs: the profile (a group, or an extra
+/// declared as one) plus the extras asked for, none of which may exclude
+/// another by `[tool.uv.conflicts]`.
+fn selection<'a>(
+    project: &Project,
+    profile: Option<&'a str>,
+    extras: &'a [String],
+) -> Result<(Vec<&'a str>, Vec<&'a str>)> {
+    let mut groups: Vec<&str> = Vec::new();
+    let mut chosen: Vec<&str> = extras.iter().map(String::as_str).collect();
+    if let Some(p) = profile {
+        if project.profile_selector(p).is_group() {
+            groups.push(p);
+        } else {
+            chosen.push(p);
+        }
+    }
+    let selectors: Vec<project::Selector> = groups
+        .iter()
+        .map(|g| project::Selector::Group(g.to_string()))
+        .chain(
+            chosen
+                .iter()
+                .map(|e| project::Selector::Extra(project::normalize(e))),
+        )
+        .collect();
+    if let Some((a, b)) = project.conflicting(&selectors) {
+        bail!(
+            "{} and {} exclude each other ([tool.uv.conflicts]); choose one",
+            a.name(),
+            b.name()
+        );
+    }
+    Ok((groups, chosen))
+}
+
 fn after_install(project: &Project, policy: &project::Policy) -> Result<()> {
     check_hashes(project, policy)?;
     licenses::check(

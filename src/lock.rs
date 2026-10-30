@@ -17,6 +17,8 @@ pub struct Package {
     pub source_kind: String,
     /// The registry URL for registry packages.
     pub source: String,
+    /// For a URL archive built from one of its directories.
+    pub subdirectory: Option<String>,
     /// Direct dependencies (all extras and groups flattened). Forked lockfiles
     /// pin an edge to a version when several variants of a package exist.
     pub dependencies: Vec<Dep>,
@@ -115,12 +117,15 @@ impl Lock {
                     .unwrap_or("")
                     .to_owned()
             };
-            let (source_kind, source) = table
-                .get("source")
-                .and_then(Item::as_inline_table)
+            let source_table = table.get("source").and_then(Item::as_inline_table);
+            let (source_kind, source) = source_table
                 .and_then(|t| t.iter().next())
                 .map(|(k, v)| (k.to_owned(), v.as_str().unwrap_or("").to_owned()))
                 .unwrap_or_default();
+            let subdirectory = source_table
+                .and_then(|t| t.get("subdirectory"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
 
             let deps_of = |item: Option<&Item>| -> Vec<Dep> {
                 let mut out = Vec::new();
@@ -221,6 +226,7 @@ impl Lock {
                 version: str_of("version"),
                 source_kind,
                 source,
+                subdirectory,
                 dependencies,
                 base_dependencies,
                 extras,

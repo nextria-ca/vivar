@@ -404,8 +404,14 @@ impl Backend for UvBackend {
                 "--output-file",
             ])
             .arg(&lock);
-        if let Some(group) = group {
-            export.args(["--group", group]);
+        if let Some(profile) = group {
+            // A profile is a group, or an extra declared as one.
+            let project = crate::project::Project::require(dir)?;
+            if project.profile_selector(profile).is_group() {
+                export.args(["--group", profile]);
+            } else {
+                export.args(["--extra", profile]);
+            }
         }
         Self::check(export)?;
         // The host interpreter only drives the layout (same series is enough);

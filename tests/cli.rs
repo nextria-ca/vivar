@@ -2489,10 +2489,11 @@ fn native_backend_syncs_from_the_lock_without_uv() {
         let out = native(cwd, args);
         assert!(
             out.status.success(),
-            "native vivar {} failed:\n{}{}",
+            "native vivar {} failed:\n{}{}\npyproject.toml:\n{}",
             args.join(" "),
             stdout_of(&out),
-            String::from_utf8_lossy(&out.stderr)
+            String::from_utf8_lossy(&out.stderr),
+            fs::read_to_string(cwd.join("pyproject.toml")).unwrap_or_default()
         );
         out
     };
@@ -2635,6 +2636,109 @@ fn native_backend_syncs_from_the_lock_without_uv() {
     assert!(!native(dir, &["run", "python", "-c", "import socks"])
         .status
         .success());
+    // A local wheel is added as a `path` source, as uv writes it, locked
+    // by name and hash, and installed from where it sits.
+    let wheels_dir = tmp.0.join("wheels");
+    let local_whl = make_wheel(dir, &wheels_dir);
+    okn(dir, &["add", local_whl.to_str().unwrap()]);
+    let pyproject_text = read(&dir.join("pyproject.toml"));
+    assert!(
+        pyproject_text.contains("minipkg = { path = \"wheels/minipkg-1.0-py3-none-any.whl\" }"),
+        "{pyproject_text}"
+    );
+    let lock = read(&dir.join("uv.lock"));
+    assert!(
+        lock.contains("source = { path = \"wheels/minipkg-1.0-py3-none-any.whl\" }")
+            && lock
+                .contains("{ name = \"minipkg\", path = \"wheels/minipkg-1.0-py3-none-any.whl\" }")
+            && lock.contains("filename = \"minipkg-1.0-py3-none-any.whl\", hash = \"sha256:"),
+        "{lock}"
+    );
+    okn(
+        dir,
+        &[
+            "run",
+            "python",
+            "-c",
+            "import minipkg; assert minipkg.VALUE == 42",
+        ],
+    );
+    if let Ok(out) = Command::new("uv")
+        .current_dir(dir)
+        .args(["lock", "--check"])
+        .output()
+    {
+        assert!(
+            out.status.success(),
+            "uv rejects the native lock with a path source: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    okn(dir, &["remove", "minipkg"]);
+    assert!(!read(&dir.join("pyproject.toml")).contains("minipkg"));
+    // A local project directory: editable (a .pth), or built and installed,
+    // in which case a change to its source is picked up by the next sync.
+    let local_dir = tmp.0.join("dirpkg");
+    fs::create_dir_all(local_dir.join("src").join("dirpkg")).unwrap();
+    fs::write(
+        local_dir.join("pyproject.toml"),
+        "[project]\nname = \"dirpkg\"\nversion = \"0.5\"\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n",
+    )
+    .unwrap();
+    let dir_init = local_dir.join("src").join("dirpkg").join("__init__.py");
+    fs::write(&dir_init, "VALUE = 1\n").unwrap();
+    okn(dir, &["add", "--editable", local_dir.to_str().unwrap()]);
+    assert!(
+        read(&dir.join("pyproject.toml"))
+            .contains("dirpkg = { path = \"dirpkg\", editable = true }"),
+        "{}",
+        read(&dir.join("pyproject.toml"))
+    );
+    assert!(
+        read(&dir.join("uv.lock")).contains("source = { editable = \"dirpkg\" }"),
+        "{}",
+        read(&dir.join("uv.lock"))
+    );
+    fs::write(&dir_init, "VALUE = 2\n").unwrap();
+    okn(
+        dir,
+        &[
+            "run",
+            "python",
+            "-c",
+            "import dirpkg; assert dirpkg.VALUE == 2",
+        ],
+    );
+    okn(dir, &["remove", "dirpkg"]);
+    okn(dir, &["add", local_dir.to_str().unwrap()]);
+    assert!(
+        read(&dir.join("uv.lock")).contains("source = { directory = \"dirpkg\" }"),
+        "{}",
+        read(&dir.join("uv.lock"))
+    );
+    okn(
+        dir,
+        &[
+            "run",
+            "python",
+            "-c",
+            "import dirpkg; assert dirpkg.VALUE == 2",
+        ],
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    fs::write(&dir_init, "VALUE = 3\n").unwrap();
+    okn(dir, &["sync"]);
+    okn(
+        dir,
+        &[
+            "run",
+            "python",
+            "-c",
+            "import dirpkg; assert dirpkg.VALUE == 3",
+        ],
+    );
+    okn(dir, &["remove", "dirpkg"]);
+
     // Direct references resolve natively: a wheel by URL, a source
     // distribution by URL (built with its own backend), a git checkout.
     let file_url = |p: &Path| {
@@ -2986,6 +3090,111 @@ fn native_backend_syncs_from_the_lock_without_uv() {
     let text = read(&pyproject);
     let cut = text.find("\n[dependency-groups]\nslow").unwrap();
     fs::write(&pyproject, &text[..cut]).unwrap();
+    okn(dir, &["lock"]);
+    okn(dir, &["sync"]);
+
+    // Profiles over extras of the project work the same way, and
+    // `sync --extra` (or `--profile`, when the extra is declared as one)
+    // installs them.
+    let plain = read(&pyproject);
+    let text = plain.clone()
+        + &format!(
+            "\n[project.optional-dependencies]\nslow = [\"variant==1.0\"]\nfast = [\"variant==2.0\"]\n\n[[tool.uv.index]]\nname = \"wh\"\nurl = \"{}\"\nexplicit = true\n\n[tool.uv.sources]\nvariant = [{{ index = \"wh\", extra = \"slow\" }}, {{ index = \"wh\", extra = \"fast\" }}]\n\n[tool.uv]\nconflicts = [[{{ extra = \"slow\" }}, {{ extra = \"fast\" }}]]\n\n[tool.vivar]\nprofiles = [\"slow\", \"fast\"]\n",
+            file_url(&wh)
+        );
+    fs::write(&pyproject, text).unwrap();
+    okn(dir, &["lock"]);
+    let lock = read(&dir.join("uv.lock"));
+    assert_eq!(
+        lock.matches("[[package]]\nname = \"variant\"").count(),
+        2,
+        "{lock}"
+    );
+    assert!(
+        lock.contains("slow = [{ name = \"variant\", version = \"1.0\" }]")
+            && lock.contains("fast = [{ name = \"variant\", version = \"2.0\" }]")
+            && lock.contains("conflict = { package = \"demo\", extra = \"slow\" }"),
+        "{lock}"
+    );
+    okn(dir, &["sync", "--extra", "slow"]);
+    okn(
+        dir,
+        &[
+            "run",
+            "python",
+            "-c",
+            "import variant; assert variant.VALUE == 42",
+        ],
+    );
+    okn(dir, &["sync", "--profile", "fast"]);
+    okn(
+        dir,
+        &[
+            "run",
+            "python",
+            "-c",
+            "import variant; assert variant.VALUE == 43",
+        ],
+    );
+    okn(dir, &["sync"]);
+    assert!(!native(dir, &["run", "python", "-c", "import variant"])
+        .status
+        .success());
+
+    // A marker on a source entry forks the lock: one side per marker, each
+    // routed to its own index, and the installer takes this machine's side.
+    let wh_b = tmp.0.join("wh-b");
+    fs::create_dir_all(&wh_b).unwrap();
+    fs::copy(
+        wh.join("variant-2.0-py3-none-any.whl"),
+        wh_b.join("variant-2.0-py3-none-any.whl"),
+    )
+    .unwrap();
+    let wh_a = tmp.0.join("wh-a");
+    fs::create_dir_all(&wh_a).unwrap();
+    fs::copy(
+        wh.join("variant-1.0-py3-none-any.whl"),
+        wh_a.join("variant-1.0-py3-none-any.whl"),
+    )
+    .unwrap();
+    let text = plain.replace(
+        "dependencies = [",
+        "dependencies = [\n    \"variant\",",
+    ) + &format!(
+        "\n[[tool.uv.index]]\nname = \"a\"\nurl = \"{}\"\nexplicit = true\n\n[[tool.uv.index]]\nname = \"b\"\nurl = \"{}\"\nexplicit = true\n\n[tool.uv.sources]\nvariant = [{{ index = \"a\", marker = \"sys_platform == 'linux'\" }}, {{ index = \"b\", marker = \"sys_platform != 'linux'\" }}]\n",
+        file_url(&wh_a),
+        file_url(&wh_b)
+    );
+    fs::write(&pyproject, text).unwrap();
+    let out = okn(dir, &["lock"]);
+    assert!(
+        stdout_of(&out).contains("lock forks on"),
+        "{}",
+        stdout_of(&out)
+    );
+    let lock = read(&dir.join("uv.lock"));
+    assert!(
+        lock.contains("resolution-markers = [")
+            && lock.matches("[[package]]\nname = \"variant\"").count() == 2
+            && lock.contains(
+                "{ name = \"variant\", version = \"1.0\", marker = \"sys_platform == 'linux'\" }"
+            )
+            && lock.contains("{ name = \"variant\", index = \"file:///")
+            && lock.contains("marker = \"sys_platform != 'linux'\" }"),
+        "{lock}"
+    );
+    okn(dir, &["sync"]);
+    let expected = if cfg!(target_os = "linux") { 42 } else { 43 };
+    okn(
+        dir,
+        &[
+            "run",
+            "python",
+            "-c",
+            &format!("import variant; assert variant.VALUE == {expected}, variant.VALUE"),
+        ],
+    );
+    fs::write(&pyproject, &plain).unwrap();
     okn(dir, &["lock"]);
     okn(dir, &["sync"]);
     assert!(!native(dir, &["run", "python", "-c", "import variant"])

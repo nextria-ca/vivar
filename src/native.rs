@@ -1,18 +1,19 @@
 //! The in-house backend: resolves with `resolve.rs`, installs environments
 //! straight from `uv.lock` (wheels only, every artifact hash-checked), and
-//! builds through PEP 517, with no uv process. Projects using uv-specific
-//! features (workspaces, per-package sources, profiles) are refused rather
-//! than resolved differently.
+//! builds through PEP 517, with no uv process. Workspaces, every form of
+//! `[tool.uv.sources]`, profiles over groups or extras and forks are
+//! resolved the way uv resolves them; the one uv-only shape left (a source
+//! that is not a table) is refused rather than resolved differently.
 
 use crate::backend::{Backend, Change};
 use crate::index::Index;
 use crate::index::{File, Metadata};
 use crate::lock::{Lock, Package};
 use crate::pep::{eval_marker, MarkerEnv, Requirement, Version};
-use crate::project::{self, Policy, Project};
+use crate::project::{self, GitRef, Policy, Project, Selector, SourceKind, UvSource};
 use crate::resolve::{
-    resolve_with_forks, write_lock, Direct, Fetch, ForkNeeded, Lockable, Resolution, Resolver,
-    Roots, Source as ResolvedSource,
+    resolve_with_forks, write_lock, Direct, Fetch, Lockable, Resolver, Roots,
+    Source as ResolvedSource, Sourced,
 };
 use crate::{dirs, install, sha256, upgrade, venv, wheelhouse};
 use anyhow::{anyhow, bail, Context, Result};
@@ -101,7 +102,7 @@ impl NativeBackend {
             .flat_map(|r| r.split(',').map(|c| c.trim().to_owned()))
             .filter(|c| !c.is_empty())
             .collect();
-        let mut sources = project.uv_sources();
+        let mut sources: BTreeMap<String, Vec<UvSource>> = project.uv_sources();
         let mut indexes = project.uv_indexes();
         let mut workspace_bound = project.uv_workspace_sources();
         for m in &members {
@@ -176,7 +177,8 @@ impl NativeBackend {
         // Indexes: a policy wheelhouse is the only source, full stop. Otherwise
         // the policy index, else the project's `default = true` index, else
         // PyPI is the index of last resort; non-explicit project indexes are
-        // searched before it; `[tool.uv.sources]` routes packages to one.
+        // searched before it; `[tool.uv.sources]` routes packages to one, or
+        // to git, a URL or a path.
         let wheelhouse = self.wheelhouse_dir().is_some();
         if wheelhouse {
             indexes.clear();
@@ -201,40 +203,160 @@ impl NativeBackend {
                 .map(|i| i.url.clone())
                 .ok_or_else(|| anyhow!("[tool.uv.sources] names index {name:?}, which [[tool.uv.index]] does not declare"))
         };
-        let conflicts: Vec<Vec<String>> = project.conflict_groups();
-        let profile_groups: Vec<String> = conflicts.iter().flatten().cloned().collect();
-        // The route for a package when resolving `group` (None: the base or a
-        // single resolution). A group-specific entry applies inside its group,
-        // or on its own when it is the only one and nothing conflicts yet
-        // (the first profile, before a second declares the conflict).
-        let routes_for = |group: Option<&str>| -> Result<Vec<(String, Index)>> {
+        let conflicts: Vec<Vec<Selector>> = project.conflict_sets();
+        let profile_items: Vec<Selector> = conflicts.iter().flatten().cloned().collect();
+        // Markers that select between sources: the lock forks on each, so a
+        // side sees exactly one source per package.
+        let mut selector_markers: Vec<String> = Vec::new();
+        for e in sources.values().flatten() {
+            if let Some(m) = &e.marker {
+                let negated = crate::resolve::negate_marker(m)
+                    .with_context(|| format!("marker on a [tool.uv.sources] entry: {m}"))?;
+                // A marker and its negation are one fork, not two.
+                let known = selector_markers.iter().any(|k| {
+                    k == m
+                        || *k == negated
+                        || crate::resolve::negate_marker(k).is_ok_and(|n| n == *m)
+                });
+                if !known {
+                    selector_markers.push(m.clone());
+                }
+            }
+        }
+        // A source for `name` resolved inside the lock: the lock-relative path
+        // for a path source, for the lock to record.
+        let lock_rel = |src: &UvSource| -> Option<String> {
+            match &src.kind {
+                SourceKind::Path { path, .. } => {
+                    Some(project::relative_path(&root, &src.base.join(path)))
+                }
+                _ => None,
+            }
+        };
+        // The entry for a package when resolving `selector` (None: the base or
+        // a single resolution) on a fork side described by `restrictions`. A
+        // marker-bound entry applies on the side where its marker holds; a
+        // selector-specific entry applies inside its group or extra, or on its
+        // own when it is the only one and nothing conflicts yet (the first
+        // profile, before a second declares the conflict).
+        let entry_for = |pkg: &str,
+                         entries: &[UvSource],
+                         selector: Option<&Selector>,
+                         restrictions: &[(String, bool)]|
+         -> Result<Option<UvSource>> {
+            // A marker-bound entry is on this side when the side settles its
+            // marker as true: the marker itself held, or its negation did not.
+            let settled = |m: &str| -> bool {
+                let negated = crate::resolve::negate_marker(m).ok();
+                restrictions.iter().any(|(r, holds)| {
+                    (r == m && *holds)
+                        || (!*holds
+                            && (negated.as_deref() == Some(r.as_str())
+                                || crate::resolve::negate_marker(r).is_ok_and(|n| n == m)))
+                })
+            };
+            let on_side: Vec<&UvSource> = entries
+                .iter()
+                .filter(|e| e.marker.as_deref().is_none_or(settled))
+                .collect();
+            let exact = on_side
+                .iter()
+                .find(|e| e.selector().is_some() && e.selector().as_ref() == selector);
+            let plain = on_side.iter().find(|e| e.selector().is_none());
+            let specific: BTreeSet<Option<Selector>> = on_side
+                .iter()
+                .filter(|e| e.selector().is_some())
+                .map(|e| e.selector())
+                .collect();
+            let pick = match (exact, plain) {
+                (Some(e), _) => Some(*e),
+                (None, Some(p)) => Some(*p),
+                (None, None) if selector.is_none() && profile_items.is_empty() => {
+                    if specific.len() > 1 {
+                        bail!("{pkg} has several group- or extra-specific sources but no conflicts are declared between them; `vivar profile add` declares them");
+                    }
+                    on_side.first().copied()
+                }
+                (None, None) => None,
+            };
+            Ok(pick.cloned())
+        };
+        let routes_for = |selector: Option<&Selector>,
+                          restrictions: &[(String, bool)]|
+         -> Result<Vec<(String, Index)>> {
             let mut out = Vec::new();
             for (pkg, entries) in &sources {
-                let exact = entries
-                    .iter()
-                    .find(|(_, g)| g.is_some() && g.as_deref() == group);
-                let plain = entries.iter().find(|(_, g)| g.is_none());
-                let grouped: BTreeSet<&String> = entries
-                    .iter()
-                    .filter_map(|(i, g)| g.as_ref().map(|_| i))
-                    .collect();
-                let pick = match (exact, plain) {
-                    (Some(e), _) => Some(e),
-                    (None, Some(p)) => Some(p),
-                    (None, None) if group.is_none() && profile_groups.is_empty() => {
-                        if grouped.len() > 1 {
-                            bail!("{pkg} is routed to several indexes by group but no conflicts are declared between those groups; `vivar profile add` declares them");
-                        }
-                        entries.first()
-                    }
-                    (None, None) => None,
-                };
-                if let Some((idx, _)) = pick {
-                    out.push((pkg.clone(), Index::new(Some(&index_url(idx)?))));
+                if let Some(UvSource {
+                    kind: SourceKind::Index(idx),
+                    ..
+                }) = entry_for(pkg, entries, selector, restrictions)?
+                {
+                    out.push((pkg.clone(), Index::new(Some(&index_url(&idx)?))));
                 }
             }
             Ok(out)
         };
+        let sourced_for = |selector: Option<&Selector>,
+                           restrictions: &[(String, bool)]|
+         -> Result<BTreeMap<String, Sourced>> {
+            let mut out = BTreeMap::new();
+            for (pkg, entries) in &sources {
+                let Some(src) = entry_for(pkg, entries, selector, restrictions)? else {
+                    continue;
+                };
+                if matches!(src.kind, SourceKind::Index(_) | SourceKind::Workspace) {
+                    continue;
+                }
+                let rel = lock_rel(&src);
+                out.insert(
+                    pkg.clone(),
+                    Sourced {
+                        kind: src.kind,
+                        base: src.base,
+                        rel,
+                    },
+                );
+            }
+            Ok(out)
+        };
+        // What the lock's metadata says about each declared source.
+        for (pkg, entries) in &sources {
+            for e in entries {
+                let source = match &e.kind {
+                    SourceKind::Index(idx) => ResolvedSource::Registry(index_url(idx)?),
+                    SourceKind::Workspace => continue,
+                    SourceKind::Git {
+                        url,
+                        reference,
+                        subdirectory,
+                    } => ResolvedSource::Git {
+                        url: url.clone(),
+                        reference: reference.clone(),
+                        commit: String::new(),
+                        subdirectory: subdirectory.clone(),
+                    },
+                    SourceKind::Url(u) => ResolvedSource::Url(u.clone()),
+                    SourceKind::Path { path, editable } => {
+                        let rel = lock_rel(e).unwrap_or_default();
+                        if e.base.join(path).is_dir() {
+                            if editable.unwrap_or(false) {
+                                ResolvedSource::Editable(rel)
+                            } else {
+                                ResolvedSource::Directory(rel)
+                            }
+                        } else {
+                            ResolvedSource::Path(rel)
+                        }
+                    }
+                };
+                roots.sources.push(crate::resolve::RootSource {
+                    name: pkg.clone(),
+                    source,
+                    selector: e.selector(),
+                    marker: e.marker.clone(),
+                });
+            }
+        }
         let defaults = || -> Vec<Index> {
             indexes
                 .iter()
@@ -243,7 +365,7 @@ impl NativeBackend {
                 .collect()
         };
         let build = |roots: &Roots,
-                     group: Option<&str>,
+                     selector: Option<&Selector>,
                      prefer: BTreeMap<String, Version>,
                      restrictions: &[(String, bool)]|
          -> Result<Resolver<'_>> {
@@ -251,7 +373,8 @@ impl NativeBackend {
                 .fetch(&builder)
                 .machine(machine)
                 .requires_python(roots.requires_python.as_deref())
-                .routes(routes_for(group)?)
+                .routes(routes_for(selector, restrictions)?)
+                .sources(sourced_for(selector, restrictions)?)
                 .defaults(defaults())
                 .prefer(prefer)
                 .upgrade(upgrade, upgrade_all);
@@ -260,30 +383,38 @@ impl NativeBackend {
             }
             Ok(r)
         };
+        // One lock (base, or a profile's) may fork on a marker where the graph
+        // needs it, and always forks on the markers that select sources.
         let resolve = |roots: &Roots,
-                       group: Option<&str>,
+                       selector: Option<&Selector>,
                        prefer: BTreeMap<String, Version>|
-         -> Result<Resolution> {
-            build(roots, group, prefer, &[])?
-                .resolve(roots)
-                .map_err(|e| match e.downcast_ref::<ForkNeeded>() {
-                    Some(f) => anyhow!("{f}; a lock with profiles cannot also fork (uv can)"),
-                    None => e,
-                })
-        };
-        // Without profiles the lock may fork on a marker where the graph needs
-        // it. Profiles (conflicting groups) resolve one at a time on top of
-        // the base, each preferring what the base chose, and merge into one lock.
-        let lockable = if profile_groups.is_empty() {
-            let prefer_ref = &prefer;
-            let sides = resolve_with_forks(
-                &|restrictions| build(&roots, None, prefer_ref.clone(), restrictions),
-                &roots,
-                Vec::new(),
-            )?;
-            if sides.len() == 1 {
-                Lockable::single(sides.into_iter().next().map(|(_, r)| r).unwrap())
-            } else {
+         -> Result<Lockable> {
+            let mut sides = Vec::new();
+            let mut seeds: Vec<Vec<(String, bool)>> = vec![Vec::new()];
+            for m in &selector_markers {
+                seeds = seeds
+                    .into_iter()
+                    .flat_map(|s| {
+                        let mut yes = s.clone();
+                        yes.push((m.clone(), true));
+                        let mut no = s;
+                        no.push((m.clone(), false));
+                        [yes, no]
+                    })
+                    .collect();
+            }
+            for seed in seeds {
+                // Contradictory markers leave a side with nothing to serve.
+                if build(roots, selector, prefer.clone(), &seed)?.env_count() == 0 {
+                    continue;
+                }
+                sides.extend(resolve_with_forks(
+                    &|restrictions| build(roots, selector, prefer.clone(), restrictions),
+                    roots,
+                    seed,
+                )?);
+            }
+            if sides.len() > 1 {
                 println!(
                     "lock forks on {}",
                     sides
@@ -292,24 +423,37 @@ impl NativeBackend {
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
-                Lockable::merge_forks(sides)
             }
+            Ok(Lockable::merge_forks(sides))
+        };
+        // Profiles (conflicting groups or extras) resolve one at a time on top
+        // of the base, each preferring what the base chose, and merge into one lock.
+        let lockable = if profile_items.is_empty() {
+            resolve(&roots, None, prefer.clone())?
         } else {
             let mut base_roots = roots.clone();
-            base_roots.retain_groups(&profile_groups, false);
+            base_roots.retain_selectors(&profile_items, false);
             let base = resolve(&base_roots, None, prefer.clone())?;
             let mut profiles = Vec::new();
-            for g in &profile_groups {
-                let declared = roots.groups.contains_key(g)
-                    || roots.members.iter().any(|m| m.roots.groups.contains_key(g));
+            for sel in &profile_items {
+                let declared = match sel {
+                    Selector::Group(g) => {
+                        roots.groups.contains_key(g)
+                            || roots.members.iter().any(|m| m.roots.groups.contains_key(g))
+                    }
+                    Selector::Extra(e) => {
+                        roots.extras.contains_key(e)
+                            || roots.members.iter().any(|m| m.roots.extras.contains_key(e))
+                    }
+                };
                 if !declared {
                     continue;
                 }
                 let mut pr = base_roots.clone();
-                pr.restore_group(&roots, g);
+                pr.restore_selector(&roots, sel);
                 let mut keep = prefer.clone();
-                keep.extend(base.assigned.clone());
-                profiles.push((g.clone(), resolve(&pr, Some(g), keep)?));
+                keep.extend(base.assigned());
+                profiles.push((sel.clone(), resolve(&pr, Some(sel), keep)?));
             }
             Lockable::merge(base, profiles)?
         };
@@ -355,6 +499,7 @@ fn roots_of(project: &Project) -> Result<Roots> {
             .collect::<Result<_>>()?,
         editable: project.is_package(),
         members: Vec::new(),
+        sources: Vec::new(),
     })
 }
 
@@ -426,12 +571,22 @@ fn changes_between(old: &BTreeMap<String, String>, new: &BTreeMap<String, String
 }
 
 /// The set of lock packages an environment should contain for `env`, given
-/// the root packages' groups and extras.
+/// the root packages' groups.
 pub fn plan<'a>(lock: &'a Lock, env: &MarkerEnv, groups: &[&str]) -> Result<Vec<&'a Package>> {
+    plan_with(lock, env, groups, &[])
+}
+
+/// `plan`, with these extras of the root packages requested too.
+pub fn plan_with<'a>(
+    lock: &'a Lock,
+    env: &MarkerEnv,
+    groups: &[&str],
+    extras: &[&str],
+) -> Result<Vec<&'a Package>> {
     let mut wanted: BTreeMap<(String, String), &Package> = BTreeMap::new();
     let mut queue: VecDeque<(&Package, Vec<String>)> = VecDeque::new();
     for root in lock.roots() {
-        queue.push_back((root, Vec::new()));
+        queue.push_back((root, extras.iter().map(|e| project::normalize(e)).collect()));
     }
     let mut seen: BTreeSet<(String, String, Vec<String>)> = BTreeSet::new();
     while let Some((pkg, extras)) = queue.pop_front() {
@@ -640,7 +795,7 @@ fn apply(
     let want_names: BTreeSet<&str> = wanted.iter().map(|p| p.name.as_str()).collect();
     let mut removed = 0;
     for dist in &present {
-        let keep = wanted.iter().any(|p| same_install(p, dist));
+        let keep = wanted.iter().any(|p| same_install(p, dist, lock_root));
         if !keep && (want_names.contains(dist.name.as_str()) || !dist.name.is_empty()) {
             install::uninstall(dist)?;
             removed += 1;
@@ -649,17 +804,48 @@ fn apply(
     let present = install::installed(&layout.site)?;
     let mut installed = 0;
     for pkg in wanted {
-        if present.iter().any(|d| same_install(pkg, d)) {
+        if present.iter().any(|d| same_install(pkg, d, lock_root)) {
             continue;
         }
         match pkg.source_kind.as_str() {
             "registry" | "url" | "git" => {
                 let wheel = fetch_wheel(pkg, target, source)?;
-                install::install_wheel_from(&wheel, layout, direct_url_of(pkg).as_deref())?;
+                install::install_wheel_from(
+                    &wheel,
+                    layout,
+                    direct_url_of(pkg, lock_root).as_deref(),
+                )?;
+                installed += 1;
+            }
+            "path" => {
+                let wheel = wheel_from_path(pkg, lock_root, source)?;
+                install::install_wheel_from(
+                    &wheel,
+                    layout,
+                    direct_url_of(pkg, lock_root).as_deref(),
+                )?;
+                installed += 1;
+            }
+            "directory" => {
+                let dir = lock_root.join(&pkg.source);
+                let builder = source.builder.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "{} is built from {} and cannot be built for another machine",
+                        pkg.name,
+                        pkg.source
+                    )
+                })?;
+                let key = builder.build_key(&tree_identity(&dir)?)?;
+                let wheel = builder.wheel_from_tree(&pkg.name, &dir, &key)?;
+                install::install_wheel_from(
+                    &wheel,
+                    layout,
+                    direct_url_of(pkg, lock_root).as_deref(),
+                )?;
                 installed += 1;
             }
             "virtual" => {}
-            "editable" | "directory" => {
+            "editable" => {
                 install_editable(lock_root, pkg, layout)?;
                 installed += 1;
             }
@@ -669,30 +855,99 @@ fn apply(
     Ok((installed, removed))
 }
 
+/// The wheel for a `path` package: the file itself when it is a wheel
+/// (checked against the lock's hash), else the archive built once.
+fn wheel_from_path(pkg: &Package, lock_root: &Path, source: &Source) -> Result<PathBuf> {
+    let file = lock_root.join(&pkg.source);
+    if !file.is_file() {
+        bail!(
+            "{} comes from {}, which is not there (the lock names it)",
+            pkg.name,
+            file.display()
+        );
+    }
+    let expected = pkg
+        .wheels
+        .first()
+        .or(pkg.sdist.as_ref())
+        .and_then(|a| a.sha256())
+        .map(str::to_owned);
+    let actual = sha256::file(&file)?;
+    if let Some(expected) = &expected {
+        if *expected != actual {
+            bail!(
+                "{} does not match the hash in uv.lock (got {actual}, expected {expected})",
+                file.display()
+            );
+        }
+    }
+    let filename = file
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    if filename.ends_with(".whl") {
+        return Ok(file);
+    }
+    let builder = source.builder.as_ref().ok_or_else(|| {
+        anyhow!(
+            "{} is a source archive and cannot be built for another machine",
+            pkg.name
+        )
+    })?;
+    builder.wheel_from_sdist(
+        &pkg.name,
+        &File {
+            filename,
+            url: crate::index::file_url(&file),
+            sha256: Some(actual),
+            requires_python: None,
+            yanked: false,
+            has_metadata: false,
+        },
+    )
+}
+
 /// The PEP 610 record a lock package installs with: none for a registry
 /// package, the URL and hash for a direct one, the repository and commit for
-/// git. Same name and version from another source is a different install.
-fn direct_url_of(pkg: &Package) -> Option<String> {
+/// git, the file and its hash for a path, the directory and a stamp of its
+/// contents for a directory build. Same name and version from another
+/// source is a different install.
+fn direct_url_of(pkg: &Package, lock_root: &Path) -> Option<String> {
+    let archive_hash = || {
+        pkg.wheels
+            .first()
+            .or(pkg.sdist.as_ref())
+            .and_then(|a| a.sha256())
+            .map(|h| format!(",\"archive_info\":{{\"hash\":\"sha256={h}\"}}"))
+            .unwrap_or_default()
+    };
     match pkg.source_kind.as_str() {
-        "url" => {
-            let hash = pkg
-                .wheels
-                .first()
-                .or(pkg.sdist.as_ref())
-                .and_then(|a| a.sha256())
-                .map(|h| format!(",\"archive_info\":{{\"hash\":\"sha256={h}\"}}"))
-                .unwrap_or_default();
+        "url" => Some(format!(
+            "{{\"url\":{}{}}}",
+            crate::json::quote(&pkg.source),
+            archive_hash()
+        )),
+        "path" => Some(format!(
+            "{{\"url\":{}{}}}",
+            crate::json::quote(&crate::index::file_url(&lock_root.join(&pkg.source))),
+            archive_hash()
+        )),
+        "directory" => {
+            let dir = lock_root.join(&pkg.source);
+            let stamp = tree_identity(&dir).ok()?;
             Some(format!(
-                "{{\"url\":{}{hash}}}",
-                crate::json::quote(&pkg.source)
+                "{{\"url\":{},\"dir_info\":{{}},\"vivar_stamp\":{}}}",
+                crate::json::quote(&crate::index::file_url(&dir)),
+                crate::json::quote(&stamp)
             ))
         }
         "git" => {
             let git = GitLock::parse(&pkg.source)?;
             let rev = git
-                .rev
-                .as_deref()
-                .map(|r| format!(",\"requested_revision\":{}", crate::json::quote(r)))
+                .reference
+                .as_ref()
+                .map(|r| format!(",\"requested_revision\":{}", crate::json::quote(r.value())))
                 .unwrap_or_default();
             let sub = git
                 .subdirectory
@@ -712,7 +967,7 @@ fn direct_url_of(pkg: &Package) -> Option<String> {
 /// A git source as the lock records it: `repo?subdirectory=sub&rev=r#commit`.
 struct GitLock {
     repo: String,
-    rev: Option<String>,
+    reference: Option<GitRef>,
     subdirectory: Option<String>,
     commit: String,
 }
@@ -732,7 +987,10 @@ impl GitLock {
         };
         Some(GitLock {
             repo: repo.to_owned(),
-            rev: param("rev"),
+            reference: param("rev")
+                .map(GitRef::Rev)
+                .or_else(|| param("tag").map(GitRef::Tag))
+                .or_else(|| param("branch").map(GitRef::Branch)),
             subdirectory: param("subdirectory"),
             commit: commit.to_owned(),
         })
@@ -742,8 +1000,14 @@ impl GitLock {
 /// The parts of a PEP 610 record that identify a source: the URL, the
 /// archive hash, the VCS commit. Records written by pip, uv or vivar differ
 /// in whitespace, order and extras; these do not.
-/// (url, archive hash, vcs commit, subdirectory)
-type SourceIdentity = (String, Option<String>, Option<String>, Option<String>);
+/// (url, archive hash, vcs commit, subdirectory, directory stamp)
+type SourceIdentity = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 fn direct_identity(json: &str) -> Option<SourceIdentity> {
     let doc = crate::json::parse(json).ok()?;
@@ -765,16 +1029,64 @@ fn direct_identity(json: &str) -> Option<SourceIdentity> {
         .and_then(|v| v.get("commit_id"))
         .and_then(|c| c.as_str())
         .map(str::to_owned);
-    Some((url, hash, commit, subdirectory))
+    // A directory build is only the same install while the directory is.
+    let stamp = doc
+        .get("vivar_stamp")
+        .and_then(|s| s.as_str())
+        .map(str::to_owned);
+    Some((url, hash, commit, subdirectory, stamp))
+}
+
+/// What a project directory's contents amount to: a hash over every file's
+/// path, size and modification time (build products and caches aside), so a
+/// directory build is redone when the source changed.
+fn tree_identity(dir: &Path) -> Result<String> {
+    fn walk(base: &Path, rel: &Path, h: &mut sha256::Sha256) -> Result<()> {
+        let mut entries: Vec<_> = fs::read_dir(base.join(rel))?.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let name = e.file_name();
+            let text = name.to_string_lossy();
+            if matches!(
+                text.as_ref(),
+                ".git" | ".venv" | "__pycache__" | "dist" | "build" | ".tox" | ".nox"
+            ) || text.ends_with(".egg-info")
+            {
+                continue;
+            }
+            let child = rel.join(&name);
+            let meta = e.metadata()?;
+            if meta.is_dir() {
+                walk(base, &child, h)?;
+            } else {
+                // As fine as the filesystem keeps it, so an edit right after
+                // a build is still another build.
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                h.update(child.to_string_lossy().replace('\\', "/").as_bytes());
+                h.update(format!("\0{}\0{mtime}\n", meta.len()).as_bytes());
+            }
+        }
+        Ok(())
+    }
+    let mut h = sha256::Sha256::new();
+    h.update(std::path::absolute(dir)?.to_string_lossy().as_bytes());
+    h.update(b"\n");
+    walk(dir, Path::new(""), &mut h)?;
+    Ok(sha256::hex(&h.finish())[..32].to_owned())
 }
 
 /// Whether what is installed is exactly this lock package: name, version and
 /// (for direct sources) the same URL, hash or commit.
-fn same_install(pkg: &Package, dist: &install::Installed) -> bool {
+fn same_install(pkg: &Package, dist: &install::Installed, lock_root: &Path) -> bool {
     if pkg.name != dist.name || pkg.version != dist.version {
         return false;
     }
-    match (direct_url_of(pkg), &dist.direct_url) {
+    match (direct_url_of(pkg, lock_root), &dist.direct_url) {
         (None, None) => true,
         (Some(want), Some(have)) => direct_identity(&want) == direct_identity(have),
         _ => false,
@@ -873,11 +1185,17 @@ impl NativeBackend {
         })
     }
 
-    fn sync_into(&self, lock_root: &Path, venv_dir: &Path, groups: &[&str]) -> Result<()> {
+    fn sync_into(
+        &self,
+        lock_root: &Path,
+        venv_dir: &Path,
+        groups: &[&str],
+        extras: &[&str],
+    ) -> Result<()> {
         let lock = Lock::read(lock_root)?;
         let version = env_version(venv_dir)?;
         let env = MarkerEnv::current(version);
-        let wanted = plan(&lock, &env, groups)?;
+        let wanted = plan_with(&lock, &env, groups, extras)?;
         let series = format!("{}.{}", version[0], version[1]);
         let target = wheelhouse::Target::new(None, &series)?;
         let layout = install::Layout::venv(
@@ -1065,7 +1383,12 @@ impl Builder<'_> {
                 file.url.clone()
             };
             let part = dir.join(format!("{}.part-{}", file.filename, std::process::id()));
-            let fetched = upgrade::fetch_to(&url, &part);
+            let fetched = match crate::index::local_path(&file.url) {
+                Some(local) => fs::copy(&local, &part)
+                    .map(|_| ())
+                    .with_context(|| format!("copying {}", local.display())),
+                None => upgrade::fetch_to(&url, &part),
+            };
             if let Err(e) = fetched {
                 let _ = fs::remove_file(&part);
                 return Err(e);
@@ -1265,7 +1588,143 @@ impl Builder<'_> {
     }
 }
 
+/// The version and metadata a built or fetched wheel carries, checked to
+/// be a wheel of `name`.
+fn wheel_metadata(name: &str, wheel: &Path) -> Result<(Version, Metadata)> {
+    let text = crate::index::metadata_from_wheel(&fs::read(wheel)?)
+        .with_context(|| format!("reading METADATA from {}", wheel.display()))?;
+    let filename = wheel
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let probe = File {
+        filename,
+        url: String::new(),
+        sha256: None,
+        requires_python: None,
+        yanked: false,
+        has_metadata: false,
+    };
+    let version = probe.version(name).ok_or_else(|| {
+        anyhow!(
+            "{} is not a wheel for {name} (the file name says otherwise)",
+            wheel.display()
+        )
+    })?;
+    Ok((version, crate::index::parse_metadata(&text)))
+}
+
+impl Builder<'_> {
+    /// Clones `repo` at `reference`, builds the project (in `subdirectory`
+    /// when given) and describes the result.
+    fn git_build(
+        &self,
+        name: &str,
+        repo: &str,
+        reference: Option<GitRef>,
+        subdirectory: Option<String>,
+    ) -> Result<Direct> {
+        if self.backend.no_build {
+            bail!("{name} comes from git and would have to be built; policy requires wheels");
+        }
+        let (src, commit) = Self::clone(repo, reference.as_ref().map(GitRef::value))?;
+        let key = self.build_key(&Self::git_identity(repo, &commit, subdirectory.as_deref()))?;
+        let wheel = Self::project_in(&src, subdirectory.as_deref())
+            .and_then(|tree| self.wheel_from_tree(name, &tree, &key));
+        let _ = fs::remove_dir_all(&src);
+        let (version, metadata) = wheel_metadata(name, &wheel?)?;
+        Ok(Direct {
+            version,
+            metadata,
+            files: Vec::new(),
+            source: ResolvedSource::Git {
+                url: repo.to_owned(),
+                reference,
+                commit,
+                subdirectory,
+            },
+        })
+    }
+}
+
 impl Fetch for Builder<'_> {
+    /// A `[tool.uv.sources]` entry: git (cloned and built), a URL (as a
+    /// direct reference), or a path: a wheel as is, an archive built, a
+    /// directory built, an editable directory built for its metadata only.
+    fn sourced(&self, name: &str, source: &Sourced) -> Result<Direct> {
+        let name = project::normalize(name);
+        match &source.kind {
+            SourceKind::Url(u) => self.direct(&Requirement {
+                name: name.clone(),
+                extras: Vec::new(),
+                specifier: crate::pep::Specifier::parse("")?,
+                marker: None,
+                url: Some(u.clone()),
+            }),
+            SourceKind::Git {
+                url,
+                reference,
+                subdirectory,
+            } => self.git_build(&name, url, reference.clone(), subdirectory.clone()),
+            SourceKind::Path { path, editable } => {
+                let abs = source.base.join(path);
+                let rel = source.rel.clone().unwrap_or_else(|| path.clone());
+                if abs.is_dir() {
+                    let key = self.build_key(&tree_identity(&abs)?)?;
+                    let wheel = self.wheel_from_tree(&name, &abs, &key)?;
+                    let (version, metadata) = wheel_metadata(&name, &wheel)?;
+                    let source = if editable.unwrap_or(false) {
+                        ResolvedSource::Editable(rel)
+                    } else {
+                        ResolvedSource::Directory(rel)
+                    };
+                    return Ok(Direct {
+                        version,
+                        metadata,
+                        files: Vec::new(),
+                        source,
+                    });
+                }
+                if !abs.is_file() {
+                    bail!(
+                        "{name}: {} does not exist ([tool.uv.sources] points at it)",
+                        abs.display()
+                    );
+                }
+                let filename = abs
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                let hash = sha256::file(&abs)?;
+                let file = File {
+                    filename: filename.clone(),
+                    url: crate::index::file_url(&abs),
+                    sha256: Some(hash.clone()),
+                    requires_python: None,
+                    yanked: false,
+                    has_metadata: false,
+                };
+                let wheel = if filename.ends_with(".whl") {
+                    abs.clone()
+                } else {
+                    self.wheel_from_sdist(&name, &file)?
+                };
+                let (version, metadata) = wheel_metadata(&name, &wheel)?;
+                Ok(Direct {
+                    version,
+                    metadata,
+                    files: vec![file],
+                    source: ResolvedSource::Path(rel),
+                })
+            }
+            SourceKind::Index(_) | SourceKind::Workspace => {
+                bail!("{name}: not a direct source")
+            }
+        }
+    }
+
     fn wheel_from_sdist(&self, name: &str, sdist: &File) -> Result<PathBuf> {
         if self.backend.no_build {
             bail!("{name} ships only a source distribution and policy requires wheels");
@@ -1286,54 +1745,11 @@ impl Fetch for Builder<'_> {
     fn direct(&self, req: &Requirement) -> Result<Direct> {
         let url = req.url.clone().context("not a direct reference")?;
         let name = project::normalize(&req.name);
-        let metadata_of = |wheel: &Path| -> Result<(Version, Metadata)> {
-            let text = crate::index::metadata_from_wheel(&fs::read(wheel)?)
-                .with_context(|| format!("reading METADATA from {}", wheel.display()))?;
-            let filename = wheel
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
-            let probe = File {
-                filename,
-                url: String::new(),
-                sha256: None,
-                requires_python: None,
-                yanked: false,
-                has_metadata: false,
-            };
-            let version = probe.version(&name).ok_or_else(|| {
-                anyhow!(
-                    "{} is not a wheel for {name} (the file name says otherwise)",
-                    wheel.display()
-                )
-            })?;
-            Ok((version, crate::index::parse_metadata(&text)))
-        };
+        let metadata_of = |wheel: &Path| wheel_metadata(&name, wheel);
         if url.starts_with("git+") {
-            if self.backend.no_build {
-                bail!("{name} comes from git and would have to be built; policy requires wheels");
-            }
             let subdirectory = crate::resolve::git_subdirectory(&url)?;
             let (repo, rev) = crate::resolve::git_parts(&url);
-            let (src, commit) = Self::clone(&repo, rev.as_deref())?;
-            let key =
-                self.build_key(&Self::git_identity(&repo, &commit, subdirectory.as_deref()))?;
-            let wheel = Self::project_in(&src, subdirectory.as_deref())
-                .and_then(|tree| self.wheel_from_tree(&name, &tree, &key));
-            let _ = fs::remove_dir_all(&src);
-            let (version, metadata) = metadata_of(&wheel?)?;
-            return Ok(Direct {
-                version,
-                metadata,
-                files: Vec::new(),
-                source: ResolvedSource::Git {
-                    url: repo,
-                    rev,
-                    commit,
-                    subdirectory,
-                },
-            });
+            return self.git_build(&name, &repo, rev.map(GitRef::Rev), subdirectory);
         }
         // `#sha256=…` on the URL is a promise to hold the download to.
         let (url, expected) = split_hash_fragment(&url)?;
@@ -1390,13 +1806,51 @@ impl Fetch for Builder<'_> {
 }
 
 impl Backend for NativeBackend {
-    fn add(&self, dir: &Path, packages: &[String], group: Option<&str>) -> Result<()> {
+    fn add(
+        &self,
+        dir: &Path,
+        packages: &[String],
+        group: Option<&str>,
+        editable: bool,
+    ) -> Result<()> {
         let project = Project::require(dir)?;
+        // A local wheel, archive or project directory becomes a bare
+        // requirement plus a `path` source, as uv writes it.
+        let mut requirements: Vec<String> = Vec::new();
+        let mut paths: Vec<(String, String, bool)> = Vec::new();
         for p in packages {
-            Requirement::parse(p)?; // fail before touching the file
+            let path = Path::new(p);
+            let local = path.exists()
+                && (path.is_dir()
+                    || p.ends_with(".whl")
+                    || p.ends_with(".tar.gz")
+                    || p.ends_with(".zip"));
+            if local {
+                let name = if path.is_dir() {
+                    Project::load(path)
+                        .with_context(|| format!("{p} is not a Python project"))?
+                        .name()
+                } else {
+                    let file = path.file_name().unwrap_or_default().to_string_lossy();
+                    let stem = file
+                        .trim_end_matches(".whl")
+                        .trim_end_matches(".tar.gz")
+                        .trim_end_matches(".zip");
+                    project::normalize(stem.split('-').next().unwrap_or(stem))
+                };
+                let rel = project::relative_path(&project.root, path);
+                paths.push((name.clone(), rel, editable && path.is_dir()));
+                requirements.push(name);
+            } else {
+                Requirement::parse(p)?; // fail before touching the file
+                requirements.push(p.clone());
+            }
         }
-        for p in packages {
-            project::add_dependency(&project.root, p, group)?;
+        for r in &requirements {
+            project::add_dependency(&project.root, r, group)?;
+        }
+        for (name, rel, editable) in &paths {
+            project::add_path_source(&project.root, name, rel, *editable)?;
         }
         let project = Project::require(dir)?;
         self.relock(&project, &[], false, false)?;
@@ -1420,6 +1874,7 @@ impl Backend for NativeBackend {
         }
         for p in packages {
             project::remove_dependency(&project.root, p)?;
+            project::remove_source(&project.root, p)?;
         }
         let project = Project::require(dir)?;
         self.relock(&project, &[], false, false)?;
@@ -1436,7 +1891,7 @@ impl Backend for NativeBackend {
         self.sync_groups(dir, &["dev"])
     }
 
-    fn sync_groups(&self, dir: &Path, groups: &[&str]) -> Result<()> {
+    fn sync_with(&self, dir: &Path, groups: &[&str], extras: &[&str]) -> Result<()> {
         let project = crate::project::Project::require(dir)?;
         let root = project.venv_root().to_path_buf();
         // Like `uv sync`: no lockfile, or one that no longer covers what the
@@ -1446,7 +1901,7 @@ impl Backend for NativeBackend {
         }
         let mut all: Vec<&str> = vec!["dev"];
         all.extend(groups.iter().copied().filter(|g| *g != "dev"));
-        self.sync_into(&root, &root.join(".venv"), &all)
+        self.sync_into(&root, &root.join(".venv"), &all, extras)
     }
 
     fn upgrade(&self, dir: &Path, packages: &[String], dry_run: bool) -> Result<()> {
@@ -1525,7 +1980,7 @@ impl Backend for NativeBackend {
             .iter()
             .filter(|p| matches!(p.source_kind.as_str(), "registry" | "url" | "git"))
         {
-            if present.iter().any(|d| same_install(pkg, d)) {
+            if present.iter().any(|d| same_install(pkg, d, &venv_dir)) {
                 continue;
             }
             if let Some(old) = present.iter().find(|d| d.name == pkg.name) {
@@ -1533,7 +1988,7 @@ impl Backend for NativeBackend {
             }
             let wheel =
                 self.with_source(Some(&series), |source| fetch_wheel(pkg, &target, source))?;
-            install::install_wheel_from(&wheel, &layout, direct_url_of(pkg).as_deref())?;
+            install::install_wheel_from(&wheel, &layout, direct_url_of(pkg, &venv_dir).as_deref())?;
             installed += 1;
         }
         eprintln!("native install: {installed} package(s)");
@@ -1547,7 +2002,7 @@ impl Backend for NativeBackend {
             .map(|l| l.split(" #").next().unwrap_or(l).trim().to_owned())
             .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('-'))
             .collect();
-        self.add(dir, &reqs, group)
+        self.add(dir, &reqs, group, false)
     }
 
     fn lock_check(&self, dir: &Path) -> Result<()> {

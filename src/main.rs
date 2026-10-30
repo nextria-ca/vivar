@@ -87,11 +87,16 @@ forces it). For torch, --cuda picks the PyTorch index for a CUDA or ROCm variant
 for whatever this machine's driver supports."
     )]
     Add {
+        /// Requirements (`numpy`, `pandas>=2`, `pkg @ git+https://…`), or local
+        /// wheels, archives and project directories (added as `path` sources)
         #[arg(required = true)]
         packages: Vec<String>,
         /// Add to a dependency group, e.g. dev
         #[arg(long)]
         group: Option<String>,
+        /// Install a local project directory editable
+        #[arg(short, long)]
+        editable: bool,
         /// PyTorch build for torch/torchvision/torchaudio: a CUDA version (12.4),
         /// `cpu`, `rocm6.2`, `auto` (match this machine's GPU; the default) or `none` (PyPI as is)
         #[arg(long)]
@@ -168,6 +173,9 @@ GPU vivar detects."
         /// Install this profile's packages (`auto` picks the one for this machine's GPU)
         #[arg(long)]
         profile: Option<String>,
+        /// Also install an extra of the project (repeatable)
+        #[arg(long)]
+        extra: Vec<String>,
     },
     /// Run a command, a `[tool.vivar.scripts]` task, or a PEP 723 script in the
     /// project environment (no activation needed)
@@ -573,6 +581,7 @@ fn main() -> Result<()> {
         Command::Add {
             packages,
             group,
+            editable,
             cuda,
         } => {
             let project = require(project, &cwd)?;
@@ -580,7 +589,7 @@ fn main() -> Result<()> {
             venv::ensure(project.venv_root(), &project.name())?;
             transact(&project, &*backend, &cwd, group.as_deref(), || {
                 route_pytorch(&project, &packages, cuda.as_deref())?;
-                backend.add(&cwd, &packages, group.as_deref())?;
+                backend.add(&cwd, &packages, group.as_deref(), editable)?;
                 venv::mark_synced(project.venv_root());
                 after_install(&project, &policy)
             })?;
@@ -745,7 +754,7 @@ fn main() -> Result<()> {
                     project::declare_profile(&project.root, &name, &packages)?;
                     // uv adds to the group without installing it; a new profile is
                     // installed and made the active one, so policy sees the packages.
-                    backend.add(&cwd, &packages, Some(&name))?;
+                    backend.add(&cwd, &packages, Some(&name), false)?;
                     backend.sync_group(&cwd, Some(&name))?;
                     venv::mark_profile(project.venv_root(), Some(&name));
                     venv::mark_synced(project.venv_root());
@@ -793,11 +802,11 @@ fn main() -> Result<()> {
             backend.lock(&cwd)?;
             check_hashes(&project, &policy)?;
         }
-        Command::Sync { profile } => {
+        Command::Sync { profile, extra } => {
             let project = require(project, &cwd)?;
             project.check_declared()?;
             venv::ensure(project.venv_root(), &project.name())?;
-            let group = match profile.as_deref() {
+            let profile = match profile.as_deref() {
                 None => None,
                 Some("auto") => {
                     let profiles = project.profiles();
@@ -819,8 +828,19 @@ fn main() -> Result<()> {
                     Some(name.to_owned())
                 }
             };
-            backend.sync_group(&cwd, group.as_deref())?;
-            venv::mark_profile(project.venv_root(), group.as_deref());
+            // A profile is a dependency group, or an extra of the project
+            // when it is declared as one.
+            let mut groups: Vec<&str> = Vec::new();
+            let mut extras: Vec<&str> = extra.iter().map(String::as_str).collect();
+            if let Some(p) = profile.as_deref() {
+                if project.has_group(p) || !project.has_extra(p) {
+                    groups.push(p);
+                } else {
+                    extras.push(p);
+                }
+            }
+            backend.sync_with(&cwd, &groups, &extras)?;
+            venv::mark_profile(project.venv_root(), profile.as_deref());
             venv::mark_synced(project.venv_root());
             after_install(&project, &policy)?;
         }

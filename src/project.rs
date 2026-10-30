@@ -140,18 +140,8 @@ pub fn route_to_pytorch_index(
     let index_name = format!("pytorch-{tag}");
     let path = root.join(PYPROJECT);
     let mut doc: DocumentMut = fs::read_to_string(&path)?.parse()?;
-    let mut implicit = Table::new();
-    implicit.set_implicit(true);
-    let tool = doc
-        .entry("tool")
-        .or_insert(Item::Table(implicit.clone()))
-        .as_table_mut()
-        .context("`tool` is not a table")?;
-    let uv = tool
-        .entry("uv")
-        .or_insert(Item::Table(implicit))
-        .as_table_mut()
-        .context("`tool.uv` is not a table")?;
+    let tool = top_table(&mut doc, "tool")?;
+    let uv = child_table(tool, "uv")?;
 
     let indexes = uv
         .entry("index")
@@ -168,11 +158,7 @@ pub fn route_to_pytorch_index(
         index["explicit"] = value(true);
         indexes.push(index);
     }
-    let sources = uv
-        .entry("sources")
-        .or_insert(Item::Table(Table::new()))
-        .as_table_mut()
-        .context("`tool.uv.sources` is not a table")?;
+    let sources = child_table(uv, "sources")?;
     for package in packages {
         let name = normalize(requirement_name(package));
         let mut source = toml_edit::InlineTable::new();
@@ -208,16 +194,8 @@ pub fn declare_profile(root: &Path, name: &str, packages: &[String]) -> Result<(
     route_to_pytorch_index(root, packages, name, Some(name))?;
     let path = root.join(PYPROJECT);
     let mut doc: DocumentMut = fs::read_to_string(&path)?.parse()?;
-    let tool = doc["tool"]
-        .as_table_mut()
-        .context("`tool` is not a table")?;
-    let mut vivar_default = Table::new();
-    vivar_default.set_implicit(true);
-    let vivar = tool
-        .entry("vivar")
-        .or_insert(Item::Table(vivar_default))
-        .as_table_mut()
-        .context("`tool.vivar` is not a table")?;
+    let tool = top_table(&mut doc, "tool")?;
+    let vivar = child_table(tool, "vivar")?;
     let mut profiles: Vec<String> = vivar
         .get("profiles")
         .and_then(Item::as_array)
@@ -239,9 +217,7 @@ pub fn declare_profile(root: &Path, name: &str, packages: &[String]) -> Result<(
 
     // uv must know the groups exclude each other, or it resolves them together.
     // Only the set made of profile groups is ours; other conflict sets stay.
-    let uv = tool["uv"]
-        .as_table_mut()
-        .context("`tool.uv` is not a table")?;
+    let uv = child_table(tool, "uv")?;
     let mut conflicts: Array = uv
         .get("conflicts")
         .and_then(Item::as_array)
@@ -349,6 +325,82 @@ pub fn add_dependency(root: &Path, requirement: &str, group: Option<&str>) -> Re
     array.push(requirement);
     tidy_array(array);
     fs::write(&path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Points `name` at a local file or directory through `[tool.uv.sources]`
+/// (`{ path = "…" }`, plus `editable = true` when asked), replacing any
+/// earlier entry for the package.
+pub fn add_path_source(root: &Path, name: &str, rel: &str, editable: bool) -> Result<()> {
+    let path = root.join(PYPROJECT);
+    let mut doc: DocumentMut = fs::read_to_string(&path)?.parse()?;
+    let tool = top_table(&mut doc, "tool")?;
+    let uv = child_table(tool, "uv")?;
+    let sources = child_table(uv, "sources")?;
+    let mut source = toml_edit::InlineTable::new();
+    source.insert("path", rel.into());
+    if editable {
+        source.insert("editable", true.into());
+    }
+    sources[&normalize(name)] = value(source);
+    fs::write(&path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Drops the `[tool.uv.sources]` entry for `name`, if any.
+pub fn remove_source(root: &Path, name: &str) -> Result<()> {
+    let path = root.join(PYPROJECT);
+    let mut doc: DocumentMut = fs::read_to_string(&path)?.parse()?;
+    let name = normalize(name);
+    // `Item::get_mut` would insert what it does not find; the table-level
+    // lookups do not.
+    fn uv_table(doc: &mut DocumentMut) -> Option<&mut dyn toml_edit::TableLike> {
+        doc.get_mut("tool")
+            .and_then(Item::as_table_like_mut)
+            .and_then(|t| t.get_mut("uv"))
+            .and_then(Item::as_table_like_mut)
+    }
+    let mut emptied = false;
+    if let Some(sources) = uv_table(&mut doc)
+        .and_then(|u| u.get_mut("sources"))
+        .and_then(Item::as_table_like_mut)
+    {
+        let key = sources
+            .iter()
+            .find(|(k, _)| normalize(k) == name)
+            .map(|(k, _)| k.to_owned());
+        if let Some(k) = key {
+            sources.remove(&k);
+        }
+        emptied = sources.is_empty();
+    }
+    if emptied {
+        if let Some(uv) = uv_table(&mut doc) {
+            uv.remove("sources");
+        }
+    }
+    fs::write(&path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
+}
+
+/// `to` relative to the directory `from`, with forward slashes (`../x/y`).
+pub fn relative_path(from: &Path, to: &Path) -> String {
+    let from = std::path::absolute(from).unwrap_or_else(|_| from.to_path_buf());
+    let to = std::path::absolute(to).unwrap_or_else(|_| to.to_path_buf());
+    let mut base = from.clone();
+    let mut up = 0;
+    loop {
+        if let Ok(rest) = to.strip_prefix(&base) {
+            let rest = rest.to_string_lossy().replace('\\', "/");
+            return match (up, rest.is_empty()) {
+                (0, true) => ".".to_owned(),
+                (0, false) => rest,
+                (_, true) => "../".repeat(up).trim_end_matches('/').to_owned(),
+                (_, false) => format!("{}{rest}", "../".repeat(up)),
+            };
+        }
+        if !base.pop() {
+            return to.to_string_lossy().replace('\\', "/");
+        }
+        up += 1;
+    }
 }
 
 /// Removes a package from `[project] dependencies` and every group.
@@ -668,6 +720,95 @@ pub struct UvIndex {
     pub default: bool,
 }
 
+/// A git reference a source asks for, as `[tool.uv.sources]` spells it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GitRef {
+    Rev(String),
+    Tag(String),
+    Branch(String),
+}
+
+impl GitRef {
+    /// The query key uv writes it under.
+    pub fn key(&self) -> &'static str {
+        match self {
+            GitRef::Rev(_) => "rev",
+            GitRef::Tag(_) => "tag",
+            GitRef::Branch(_) => "branch",
+        }
+    }
+
+    pub fn value(&self) -> &str {
+        match self {
+            GitRef::Rev(v) | GitRef::Tag(v) | GitRef::Branch(v) => v,
+        }
+    }
+}
+
+/// Where a `[tool.uv.sources]` entry says a package comes from.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SourceKind {
+    /// A `[[tool.uv.index]]` by name.
+    Index(String),
+    /// A workspace member.
+    Workspace,
+    Git {
+        url: String,
+        reference: Option<GitRef>,
+        subdirectory: Option<String>,
+    },
+    /// A wheel or source archive at a URL.
+    Url(String),
+    /// A file or directory, as written: relative to the pyproject declaring it.
+    Path {
+        path: String,
+        editable: Option<bool>,
+    },
+}
+
+/// One `[tool.uv.sources]` entry: a source, and when it applies (a dependency
+/// group, an extra of the project, an environment marker).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UvSource {
+    pub kind: SourceKind,
+    pub group: Option<String>,
+    pub extra: Option<String>,
+    pub marker: Option<String>,
+    /// The directory of the pyproject that declares it.
+    pub base: PathBuf,
+}
+
+impl UvSource {
+    /// The group or extra this entry is specific to, if any.
+    pub fn selector(&self) -> Option<Selector> {
+        match (&self.group, &self.extra) {
+            (Some(g), _) => Some(Selector::Group(g.clone())),
+            (None, Some(e)) => Some(Selector::Extra(e.clone())),
+            (None, None) => None,
+        }
+    }
+}
+
+/// One member of a `[tool.uv.conflicts]` set: a dependency group or an extra
+/// of the project that excludes the others in its set (a profile).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Selector {
+    Group(String),
+    Extra(String),
+}
+
+impl Selector {
+    pub fn name(&self) -> &str {
+        match self {
+            Selector::Group(n) | Selector::Extra(n) => n,
+        }
+    }
+
+    pub fn is_group(&self) -> bool {
+        matches!(self, Selector::Group(_))
+    }
+}
+
 /// A `[tool.uv.sources]` value as a list of tables: one inline table, a
 /// `[tool.uv.sources.pkg]` table, or an array of inline tables. `None` for
 /// anything else.
@@ -682,6 +823,50 @@ fn source_entries(item: &Item) -> Option<Vec<toml_edit::InlineTable>> {
         return a.iter().map(|v| v.as_inline_table().cloned()).collect();
     }
     None
+}
+
+/// The standard table at `parent[key]`, made on demand (implicit, so it is
+/// not written out empty). An inline table written by another tool (`uv`
+/// leaves `tool.uv = {}` behind) is turned into a standard one first.
+fn child_table<'a>(parent: &'a mut Table, key: &str) -> Result<&'a mut Table> {
+    if let Some(inline) = parent.get(key).and_then(Item::as_inline_table).cloned() {
+        // Re-inserted under a fresh key, so the inline form's spacing does
+        // not end up in a header (`[tool.uv ]`); a parent left with nothing
+        // but sub-tables needs no header of its own.
+        let mut table = inline.into_table();
+        table.set_implicit(true);
+        parent.remove(key);
+        parent.insert(key, Item::Table(table));
+        if parent
+            .iter()
+            .all(|(_, v)| v.is_table_like() || v.is_array_of_tables())
+        {
+            parent.set_implicit(true);
+        }
+    }
+    let mut implicit = Table::new();
+    implicit.set_implicit(true);
+    parent
+        .entry(key)
+        .or_insert(Item::Table(implicit))
+        .as_table_mut()
+        .with_context(|| format!("`{key}` in pyproject.toml is not a table"))
+}
+
+/// `child_table` at the document's top level.
+fn top_table<'a>(doc: &'a mut DocumentMut, key: &str) -> Result<&'a mut Table> {
+    if let Some(inline) = doc.get(key).and_then(Item::as_inline_table).cloned() {
+        let mut table = inline.into_table();
+        table.set_implicit(true);
+        doc.remove(key);
+        doc.insert(key, Item::Table(table));
+    }
+    let mut implicit = Table::new();
+    implicit.set_implicit(true);
+    doc.entry(key)
+        .or_insert(Item::Table(implicit))
+        .as_table_mut()
+        .with_context(|| format!("`{key}` in pyproject.toml is not a table"))
 }
 
 /// A project rooted at the directory containing `pyproject.toml`. In a uv
@@ -783,6 +968,13 @@ impl Project {
     }
 
     /// Whether `[dependency-groups]` declares `group`.
+    /// Whether `[project.optional-dependencies]` declares this extra.
+    pub fn has_extra(&self, extra: &str) -> bool {
+        self.requirement_sections()
+            .1
+            .contains_key(&normalize(extra))
+    }
+
     pub fn has_group(&self, group: &str) -> bool {
         self.doc
             .get("dependency-groups")
@@ -905,47 +1097,22 @@ impl Project {
     pub fn uv_only_features(&self) -> Vec<&'static str> {
         let mut v = Vec::new();
         let uv = self.doc.get("tool").and_then(|t| t.get("uv"));
-        // Sources are supported when they name an index or a workspace member,
-        // unconditionally; git/path/url sources, marker or extra selectors,
-        // and conflicts over extras are uv's alone.
+        // Every table-shaped source is handled (index, workspace, git, url,
+        // path, with group, extra and marker selectors); anything else is not.
         if let Some(t) = uv
             .and_then(|u| u.get("sources"))
             .and_then(Item::as_table_like)
         {
             for (_, item) in t.iter() {
-                let Some(entries) = source_entries(item) else {
+                if source_entries(item).is_none() {
                     v.push("sources in a form other than a table (tool.uv.sources)");
                     break;
-                };
-                let unsupported = entries.iter().any(|e| {
-                    let index = e.get("index").and_then(|i| i.as_str()).is_some();
-                    let workspace = e.get("workspace").and_then(|w| w.as_bool()) == Some(true);
-                    let selector = e.get("marker").is_some() || e.get("extra").is_some();
-                    !(index || workspace) || selector
-                });
-                if unsupported {
-                    v.push("sources other than a plain index or workspace member (tool.uv.sources with git/path/url, marker or extra)");
-                    break;
                 }
-            }
-        }
-        if let Some(a) = uv.and_then(|u| u.get("conflicts")).and_then(Item::as_array) {
-            if a.iter().any(|set| {
-                set.as_array().is_some_and(|s| {
-                    s.iter().any(|m| {
-                        m.as_inline_table()
-                            .is_none_or(|t| t.get("group").and_then(|g| g.as_str()).is_none())
-                    })
-                })
-            }) {
-                v.push("conflicts over extras (tool.uv.conflicts)");
             }
         }
         v
     }
 
-    /// The workspace's member projects (directories under the root matching
-    /// `tool.uv.workspace.members` and holding a pyproject.toml), for a root.
     pub fn members(&self) -> Result<Vec<Project>> {
         if !self.is_workspace_root() {
             return Ok(Vec::new());
@@ -1013,10 +1180,8 @@ impl Project {
             .unwrap_or_default()
     }
 
-    /// `[tool.uv.sources]` entries that name an index: normalized package →
-    /// `(index name, group)` list. Workspace sources are not listed; the
-    /// resolver knows the members.
-    pub fn uv_sources(&self) -> std::collections::BTreeMap<String, Vec<(String, Option<String>)>> {
+    /// `[tool.uv.sources]`: normalized package → its entries, in order.
+    pub fn uv_sources(&self) -> std::collections::BTreeMap<String, Vec<UvSource>> {
         let mut out = std::collections::BTreeMap::new();
         let Some(t) = self
             .doc
@@ -1028,16 +1193,40 @@ impl Project {
             return out;
         };
         for (pkg, item) in t.iter() {
-            let entries: Vec<(String, Option<String>)> = source_entries(item)
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|e| {
-                    Some((
-                        e.get("index")?.as_str()?.to_owned(),
-                        e.get("group").and_then(|g| g.as_str()).map(str::to_owned),
-                    ))
-                })
-                .collect();
+            let mut entries = Vec::new();
+            for e in source_entries(item).unwrap_or_default() {
+                let text = |k: &str| e.get(k).and_then(|v| v.as_str()).map(str::to_owned);
+                let kind = if let Some(i) = text("index") {
+                    SourceKind::Index(i)
+                } else if e.get("workspace").and_then(|w| w.as_bool()) == Some(true) {
+                    SourceKind::Workspace
+                } else if let Some(url) = text("git") {
+                    SourceKind::Git {
+                        url,
+                        reference: text("rev")
+                            .map(GitRef::Rev)
+                            .or_else(|| text("tag").map(GitRef::Tag))
+                            .or_else(|| text("branch").map(GitRef::Branch)),
+                        subdirectory: text("subdirectory"),
+                    }
+                } else if let Some(url) = text("url") {
+                    SourceKind::Url(url)
+                } else if let Some(path) = text("path") {
+                    SourceKind::Path {
+                        path,
+                        editable: e.get("editable").and_then(|v| v.as_bool()),
+                    }
+                } else {
+                    continue;
+                };
+                entries.push(UvSource {
+                    kind,
+                    group: text("group"),
+                    extra: text("extra").map(|x| normalize(&x)),
+                    marker: text("marker"),
+                    base: self.root.clone(),
+                });
+            }
             if !entries.is_empty() {
                 out.insert(normalize(pkg), entries);
             }
@@ -1045,9 +1234,10 @@ impl Project {
         out
     }
 
-    /// `[tool.uv.conflicts]` sets made of groups: each set's groups exclude
-    /// each other (profiles).
-    pub fn conflict_groups(&self) -> Vec<Vec<String>> {
+    /// `[tool.uv.conflicts]`: sets of groups and extras that exclude each
+    /// other (profiles). A member naming another package is left out.
+    pub fn conflict_sets(&self) -> Vec<Vec<Selector>> {
+        let own = normalize(&self.name());
         self.doc
             .get("tool")
             .and_then(|t| t.get("uv"))
@@ -1056,17 +1246,25 @@ impl Project {
             .map(|a| {
                 a.iter()
                     .filter_map(|set| {
-                        let groups: Vec<String> = set
+                        let items: Vec<Selector> = set
                             .as_array()?
                             .iter()
                             .filter_map(|m| {
-                                m.as_inline_table()?
-                                    .get("group")?
-                                    .as_str()
-                                    .map(str::to_owned)
+                                let t = m.as_inline_table()?;
+                                let package = t.get("package").and_then(|p| p.as_str());
+                                if package.is_some_and(|p| normalize(p) != own) {
+                                    return None;
+                                }
+                                if let Some(g) = t.get("group").and_then(|g| g.as_str()) {
+                                    Some(Selector::Group(g.to_owned()))
+                                } else {
+                                    t.get("extra")
+                                        .and_then(|e| e.as_str())
+                                        .map(|e| Selector::Extra(normalize(e)))
+                                }
                             })
                             .collect();
-                        (!groups.is_empty()).then_some(groups)
+                        (!items.is_empty()).then_some(items)
                     })
                     .collect()
             })
@@ -1521,6 +1719,99 @@ lint = ["ruff"]
         assert_eq!(pytorch_variant_tag("cu118"), "cu118");
         assert_eq!(pytorch_variant_tag("CPU"), "cpu");
         assert_eq!(pytorch_variant_tag("rocm6.2"), "rocm6.2");
+    }
+
+    #[test]
+    fn reads_typed_sources_and_conflicts() {
+        let tmp = TempDir::new("sources");
+        let project = project_with(
+            &tmp.0,
+            "[project]\nname = \"t\"\ndependencies = []\n[project.optional-dependencies]\ncpu = []\ngpu = []\n\n[tool.uv.sources]\na = { index = \"x\", group = \"g\" }\nb = [{ git = \"https://h/r.git\", tag = \"v1\", subdirectory = \"sub\", marker = \"sys_platform == 'linux'\" }, { url = \"https://h/b.whl\" }]\nc = { path = \"../c\", editable = true }\nd = { workspace = true }\ne = { index = \"x\", extra = \"GPU\" }\n\n[tool.uv]\nconflicts = [[{ extra = \"cpu\" }, { extra = \"gpu\" }], [{ group = \"a\" }, { package = \"other\", group = \"b\" }]]\n",
+        );
+        let sources = project.uv_sources();
+        assert_eq!(sources["a"][0].kind, SourceKind::Index("x".into()));
+        assert_eq!(
+            sources["a"][0].selector(),
+            Some(Selector::Group("g".into()))
+        );
+        assert_eq!(
+            sources["b"][0].kind,
+            SourceKind::Git {
+                url: "https://h/r.git".into(),
+                reference: Some(GitRef::Tag("v1".into())),
+                subdirectory: Some("sub".into()),
+            }
+        );
+        assert_eq!(
+            sources["b"][0].marker.as_deref(),
+            Some("sys_platform == 'linux'")
+        );
+        assert_eq!(
+            sources["b"][1].kind,
+            SourceKind::Url("https://h/b.whl".into())
+        );
+        assert_eq!(
+            sources["c"][0].kind,
+            SourceKind::Path {
+                path: "../c".into(),
+                editable: Some(true)
+            }
+        );
+        assert_eq!(sources["c"][0].base, tmp.0);
+        assert_eq!(sources["d"][0].kind, SourceKind::Workspace);
+        assert_eq!(
+            sources["e"][0].selector(),
+            Some(Selector::Extra("gpu".into()))
+        );
+        assert_eq!(
+            project.conflict_sets(),
+            vec![
+                vec![Selector::Extra("cpu".into()), Selector::Extra("gpu".into())],
+                vec![Selector::Group("a".into())],
+            ]
+        );
+        assert!(project.uv_only_features().is_empty());
+
+        // `uv remove` leaves `tool.uv = {}` behind: still a table to us.
+        let text = fs::read_to_string(tmp.0.join(PYPROJECT)).unwrap();
+        let cut = text.find("[tool.uv.sources]").unwrap();
+        fs::write(
+            tmp.0.join(PYPROJECT),
+            format!("{}[tool]\nuv = {{}}\n", &text[..cut]),
+        )
+        .unwrap();
+        add_path_source(&tmp.0, "Mini_Pkg", "wheels/mini.whl", false).unwrap();
+        add_path_source(&tmp.0, "lib", "../lib", true).unwrap();
+        let text = fs::read_to_string(tmp.0.join(PYPROJECT)).unwrap();
+        assert!(
+            text.contains("mini-pkg = { path = \"wheels/mini.whl\" }"),
+            "{text}"
+        );
+        assert!(
+            text.contains("lib = { path = \"../lib\", editable = true }"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\n[tool.uv.sources]\n")
+                && !text.contains("[tool]\n")
+                && !text.contains("[tool.uv ]"),
+            "{text}"
+        );
+        remove_source(&tmp.0, "mini-pkg").unwrap();
+        let text = fs::read_to_string(tmp.0.join(PYPROJECT)).unwrap();
+        assert!(!text.contains("mini-pkg"), "{text}");
+        // Removing from a project without sources changes nothing.
+        let before =
+            "[project]\nname = \"t\"\ndependencies = []\n\n[tool.vivar.policy]\ndeny = []\n";
+        fs::write(tmp.0.join(PYPROJECT), before).unwrap();
+        remove_source(&tmp.0, "nothing").unwrap();
+        assert_eq!(fs::read_to_string(tmp.0.join(PYPROJECT)).unwrap(), before);
+        assert_eq!(
+            relative_path(Path::new("/a/b"), Path::new("/a/b/c/d.whl")),
+            "c/d.whl"
+        );
+        assert_eq!(relative_path(Path::new("/a/b"), Path::new("/a/x")), "../x");
+        assert_eq!(relative_path(Path::new("/a/b"), Path::new("/a/b")), ".");
     }
 
     #[test]

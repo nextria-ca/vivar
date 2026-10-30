@@ -35,13 +35,16 @@ pub fn entries(data: &[u8]) -> Result<Vec<Entry>> {
         .ok_or_else(|| anyhow!("not a zip file (no end-of-central-directory record)"))?;
     let mut count = u16le(data, eocd + 10)? as u64;
     let mut pos = u32le(data, eocd + 16)? as u64;
-    if count == 0xffff || pos == 0xffff_ffff {
-        // The zip64 locator sits right before the EOCD and points at the
-        // zip64 EOCD record, which holds the real count and offset.
-        let locator = eocd
-            .checked_sub(20)
-            .filter(|&l| data[l..].starts_with(&[0x50, 0x4b, 0x06, 0x07]))
-            .ok_or_else(|| anyhow!("zip64 archive without a zip64 locator"))?;
+    // The zip64 locator sits right before the EOCD and points at the zip64
+    // EOCD record, which holds the real count and offset. A saturated count
+    // without a locator is an ordinary archive with exactly that many entries.
+    let locator = eocd
+        .checked_sub(20)
+        .filter(|&l| data[l..].starts_with(&[0x50, 0x4b, 0x06, 0x07]));
+    if pos == 0xffff_ffff && locator.is_none() {
+        bail!("zip64 archive without a zip64 locator");
+    }
+    if let Some(locator) = locator.filter(|_| count == 0xffff || pos == 0xffff_ffff) {
         let record = u64le(data, locator + 8)? as usize;
         if !data
             .get(record..record + 4)
@@ -525,6 +528,15 @@ mod tests {
         let locator = broken.len() - 22 - 20;
         broken[locator..locator + 4].copy_from_slice(&[0; 4]);
         assert!(entries(&broken).is_err());
+        // An ordinary archive may hold exactly 65,535 entries: the saturated
+        // count alone does not make it zip64.
+        let mut plain = ZIP.to_vec();
+        let n = plain.len();
+        plain[n - 12..n - 10].copy_from_slice(&0xffffu16.to_le_bytes());
+        assert!(entries(&plain).is_err()); // not three entries after all
+        let mut plain = ZIP.to_vec();
+        plain[n - 14..n - 12].copy_from_slice(&0xffffu16.to_le_bytes()); // entries on this disk
+        assert_eq!(entries(&plain).unwrap().len(), 3);
     }
 
     #[test]

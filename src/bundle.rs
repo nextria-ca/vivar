@@ -483,20 +483,20 @@ pub fn verify_static(path: &Path) -> Result<StaticReport> {
     let tmp = std::env::temp_dir().join(format!("vivar-static-{}", std::process::id()));
     let _ = fs::remove_dir_all(&tmp);
     let result = (|| {
-        let dir = if path.is_dir() {
-            path.to_path_buf()
+        let (dir, from_archive) = if path.is_dir() {
+            (absolute(path)?, false)
         } else {
             fs::create_dir_all(&tmp)?;
             extract(path, &tmp)?;
-            tmp.clone()
+            (tmp.clone(), true)
         };
-        static_checks(&dir)
+        static_checks(&dir, from_archive)
     })();
     let _ = fs::remove_dir_all(&tmp);
     result
 }
 
-fn static_checks(dir: &Path) -> Result<StaticReport> {
+fn static_checks(dir: &Path, from_archive: bool) -> Result<StaticReport> {
     let manifest = manifest_of(dir)?;
     let field = |k: &str| {
         manifest
@@ -518,16 +518,22 @@ fn static_checks(dir: &Path) -> Result<StaticReport> {
         findings.push(("error", subject.to_owned(), detail));
     };
 
-    // 1. Integrity: the checksum list, and the pre-relocation inventory
-    // while the bundle still sits where `pack` left it.
+    // 1. Integrity: the checksum list always; the pre-relocation inventory
+    // for an archive, and for a directory still sitting as `pack` left it
+    // (an unpacked bundle's launchers and pyvenv.cfg were rewritten).
     for bad in verify_checksums(dir)? {
         err("integrity", format!("{bad} since the bundle was packed"));
     }
-    let unrelocated = pyvenv_cfg(&dir.join(".venv"), "home").ok().as_deref()
-        == Some(field("python-home").as_str());
-    if unrelocated && dir.join(INVENTORY).is_file() {
-        for bad in verify_inventory(dir)? {
-            err("integrity", format!("{bad} since the bundle was packed"));
+    let unrelocated = from_archive
+        || pyvenv_cfg(&dir.join(".venv"), "home").ok().as_deref()
+            == Some(field("python-home").as_str());
+    if unrelocated {
+        if dir.join(INVENTORY).is_file() {
+            for bad in verify_inventory(dir)? {
+                err("integrity", format!("{bad} since the bundle was packed"));
+            }
+        } else if from_archive {
+            err("integrity", format!("the bundle has no {INVENTORY}"));
         }
     }
 
@@ -656,10 +662,18 @@ fn static_checks(dir: &Path) -> Result<StaticReport> {
             let first = first.lines().next().unwrap_or("");
             if let Some(interp) = first.strip_prefix("#!") {
                 let interp = interp.split_whitespace().next().unwrap_or("");
-                let own = venv_paths.iter().any(|v| !v.is_empty() && interp.starts_with(v.as_str()))
-                    || interp == "python" // vivar's Windows scripts, started by their .cmd shim
-                    || !interp.starts_with('/') && !interp.contains(":\\"); // /usr/bin/env style
-                if !own {
+                // Only a Python interpreter has to be the bundle's own; a
+                // shell script, an `env` shebang or the `#!python` placeholder
+                // of vivar's Windows scripts point nowhere in particular.
+                let is_python = Path::new(interp)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("python"))
+                    && (interp.starts_with('/') || interp.contains(":\\"));
+                let own = venv_paths
+                    .iter()
+                    .any(|v| !v.is_empty() && interp.starts_with(v.as_str()));
+                if is_python && !own {
                     err(
                         &name,
                         format!("shebang points outside the bundle at {interp}"),

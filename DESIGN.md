@@ -242,14 +242,16 @@ lock, universal markers, writes `uv.lock` that `uv lock --check` accepts), `nati
 The native resolver keeps one version per package per fork: when two requirements on a
 name can never apply together it resolves each side of the splitting marker on its own
 (recursively, four levels deep) and writes uv-style `resolution-markers`, top-level and
-per variant, which `plan` already follows; forks and profiles do not combine. It works per
+per variant, which `plan` already follows. It works per
 Python minor within the project's `requires-python` (a marker that would split a minor at
 a patch level is reported, not guessed), checks artifacts against
 every environment a dependency applies to, treats a
 wheelhouse `index-url` as the whole index (never PyPI behind it), honours
-`[[tool.uv.index]]` and `[tool.uv.sources]` (a package routed to an index, per group when
-asked; a `default = true` index replaces PyPI; a policy wheelhouse overrides them all),
-and resolves profiles (`tool.uv.conflicts` over groups) as a base plus one resolution
+`[[tool.uv.index]]` and every table form of `[tool.uv.sources]` (an index, git, a URL, a
+`path` to a wheel, archive or project directory, editable or built, per group or extra
+when asked, and under a `marker`, on which the lock forks; a `default = true` index
+replaces PyPI; a policy wheelhouse overrides them all),
+and resolves profiles (`tool.uv.conflicts` over groups or extras) as a base plus one resolution
 per group merged into a lock whose variants are told apart by pinned edges (version and,
 when needed, source); a merge the lock cannot express (a shared package whose pins
 differ by profile) is reported. Workspaces resolve as one: every member is a root of
@@ -272,6 +274,17 @@ venv launchers copied from the bundled Python, `.cmd` shims), so no launcher stu
 needed. The resolver prefetches listings and newest metadata of each release's
 dependencies on eight background threads; a torch-class project (79 packages) resolves
 in well under a minute cold and in half a second warm, and `uv lock --check` accepts it.
+
+Sources batch (2026-10-30): the native backend's last gaps against uv closed. Every
+`[tool.uv.sources]` form resolves (git with `rev`/`tag`/`branch` and `subdirectory`, `url`,
+`path` to a wheel, archive or directory, `editable`, and `marker`/`extra`/`group`
+selectors), conflicts over extras are profiles like conflicts over groups
+(`sync --extra`, or `--profile` when the extra is declared as one), and each profile may
+fork: one lock holds pinned edges and `resolution-markers` together, since every edge
+carries the variant it resolved to. `requires-dist` names each declared source
+(`index = …` with `conflict = …`, `git = …`, `path`/`directory`/`editable`) as uv writes it.
+`vivar add ./x.whl` and `vivar add -e ../lib` write `path` sources; a directory build is
+redone when its files change (a stamp of paths, sizes and mtimes in `direct_url.json`).
 
 Deferred: native dependencies via conda-forge (phase 2).
 

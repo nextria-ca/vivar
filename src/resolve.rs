@@ -8,9 +8,11 @@
 
 use crate::index::{File, Index, Metadata};
 use crate::pep::{eval_marker, MarkerEnv, Requirement, Specifier, Version};
+use crate::project::{GitRef, Selector, SourceKind};
 use crate::wheelhouse::Target;
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::PathBuf;
 
 /// What to resolve: the project's own requirements by section.
 #[derive(Debug, Clone, Default)]
@@ -27,6 +29,20 @@ pub struct Roots {
     /// Workspace members, each a root of its own: resolved together, laid
     /// out in the lock beside the root, installed editable from `path`.
     pub members: Vec<Member>,
+    /// Where `[tool.uv.sources]` sends the roots' requirements, for the
+    /// lock's `requires-dist` metadata.
+    pub sources: Vec<RootSource>,
+}
+
+/// A root requirement's declared source: an index, git (no commit yet), a
+/// URL, a file or directory; for one group or extra when it is specific to
+/// one, under a marker when it is conditional.
+#[derive(Debug, Clone)]
+pub struct RootSource {
+    pub name: String,
+    pub source: Source,
+    pub selector: Option<Selector>,
+    pub marker: Option<String>,
 }
 
 /// A workspace member: its requirements and where it lives under the root.
@@ -38,15 +54,6 @@ pub struct Member {
 }
 
 impl Roots {
-    /// Drops `groups` from the root and every member (a profile's groups
-    /// leave the base), or keeps only them when `keep` is set.
-    pub fn retain_groups(&mut self, groups: &[String], keep: bool) {
-        self.groups.retain(|g, _| groups.contains(g) == keep);
-        for m in &mut self.members {
-            m.roots.retain_groups(groups, keep);
-        }
-    }
-
     /// Puts group `g` back into the root and members from `full`.
     pub fn restore_group(&mut self, full: &Roots, g: &str) {
         if let Some(reqs) = full.groups.get(g) {
@@ -54,6 +61,41 @@ impl Roots {
         }
         for (m, fm) in self.members.iter_mut().zip(&full.members) {
             m.roots.restore_group(&fm.roots, g);
+        }
+    }
+
+    /// Drops the groups and extras in `selectors` from the root and every
+    /// member (a profile's leave the base), or keeps only them.
+    pub fn retain_selectors(&mut self, selectors: &[Selector], keep: bool) {
+        let groups: Vec<String> = selectors
+            .iter()
+            .filter(|s| s.is_group())
+            .map(|s| s.name().to_owned())
+            .collect();
+        let extras: Vec<String> = selectors
+            .iter()
+            .filter(|s| !s.is_group())
+            .map(|s| s.name().to_owned())
+            .collect();
+        self.groups.retain(|g, _| groups.contains(g) == keep);
+        self.extras.retain(|e, _| extras.contains(e) == keep);
+        for m in &mut self.members {
+            m.roots.retain_selectors(selectors, keep);
+        }
+    }
+
+    /// Puts one group or extra back into the root and members from `full`.
+    pub fn restore_selector(&mut self, full: &Roots, s: &Selector) {
+        match s {
+            Selector::Group(g) => self.restore_group(full, g),
+            Selector::Extra(e) => {
+                if let Some(reqs) = full.extras.get(e) {
+                    self.extras.insert(e.clone(), reqs.clone());
+                }
+                for (m, fm) in self.members.iter_mut().zip(&full.members) {
+                    m.roots.restore_selector(&fm.roots, s);
+                }
+            }
         }
     }
 
@@ -97,14 +139,34 @@ pub struct ResolvedPackage {
     pub name: String,
     pub version: Version,
     pub files: Vec<File>,
-    /// Dependencies with the markers they carry, as they go into the lock.
-    pub dependencies: Vec<Requirement>,
+    /// Dependencies with the markers they carry, as they go into the lock,
+    /// each with what it resolved to alongside this package.
+    pub dependencies: Vec<Edge>,
     pub source: Source,
-    /// What each dependency resolved to alongside this package, so a lock
-    /// holding several variants of a name can pin the edge.
-    pub resolved: BTreeMap<String, Pin>,
     /// The fork sides this variant belongs to (empty: all of them).
     pub resolution_markers: Vec<String>,
+}
+
+/// One dependency edge: the requirement and the variant it resolved to, so
+/// a lock holding several variants of a name can pin the edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Edge {
+    pub req: Requirement,
+    pub pin: Option<Pin>,
+}
+
+impl Edge {
+    pub fn plain(req: Requirement) -> Edge {
+        Edge { req, pin: None }
+    }
+
+    /// Same requirement on the same variant.
+    fn same(&self, other: &Edge) -> bool {
+        self.req.name == other.req.name
+            && self.req.extras == other.req.extras
+            && self.req.marker == other.req.marker
+            && self.pin == other.pin
+    }
 }
 
 /// One chosen variant of a package: its version and where it came from.
@@ -125,10 +187,51 @@ pub enum Source {
     /// to a commit.
     Git {
         url: String,
-        rev: Option<String>,
+        reference: Option<GitRef>,
         commit: String,
         subdirectory: Option<String>,
     },
+    /// A wheel or source archive on disk, relative to the lock's root.
+    Path(String),
+    /// A project directory on disk, built and installed as a package.
+    Directory(String),
+    /// A project directory on disk, installed editable.
+    Editable(String),
+}
+
+impl Source {
+    /// The lock's `source` table for this source.
+    pub fn lock_table(&self) -> toml_edit::InlineTable {
+        let mut src = toml_edit::InlineTable::new();
+        match self {
+            Source::Registry(u) => src.insert("registry", u.as_str().into()),
+            Source::Url(u) => src.insert("url", u.as_str().into()),
+            Source::Git {
+                url,
+                reference,
+                commit,
+                subdirectory,
+            } => src.insert(
+                "git",
+                git_lock_url(url, reference, commit, subdirectory).into(),
+            ),
+            Source::Path(p) => src.insert("path", p.as_str().into()),
+            Source::Directory(p) => src.insert("directory", p.as_str().into()),
+            Source::Editable(p) => src.insert("editable", p.as_str().into()),
+        };
+        src
+    }
+}
+
+/// A `[tool.uv.sources]` entry handed to the resolver: the package is
+/// fetched or built from it instead of looked up on an index.
+#[derive(Debug, Clone)]
+pub struct Sourced {
+    pub kind: SourceKind,
+    /// The directory the entry's path is relative to.
+    pub base: PathBuf,
+    /// The same path relative to the lock's root, for the lock.
+    pub rel: Option<String>,
 }
 
 /// What a direct requirement (`name @ url`) resolves to.
@@ -144,90 +247,94 @@ pub struct Direct {
 /// built from source distributions. Without one, both are refused.
 pub trait Fetch {
     fn direct(&self, req: &Requirement) -> Result<Direct>;
+    /// A package from a `[tool.uv.sources]` entry (git, url, path).
+    fn sourced(&self, name: &str, source: &Sourced) -> Result<Direct>;
     /// A wheel built from `sdist` (cached by its hash).
     fn wheel_from_sdist(&self, name: &str, sdist: &File) -> Result<std::path::PathBuf>;
 }
 
 pub struct Resolution {
     pub packages: Vec<ResolvedPackage>,
-    /// Every assigned version, by name.
-    pub assigned: BTreeMap<String, Version>,
     /// Every assignment with its source, by name.
     pub pins: BTreeMap<String, Pin>,
 }
 
-/// What goes into a lock: one resolution, or a base plus one per profile
-/// (conflicting dependency groups) merged, where a name may have several
-/// variants and the edges into it are pinned.
+/// What goes into a lock: one resolution, the merged sides of a fork, or a
+/// base plus one per profile (conflicting groups or extras) merged, where a
+/// name may have several variants told apart by version and source (edges
+/// pin them) and by `resolution-markers` (forks).
 pub struct Lockable {
     pub packages: Vec<ResolvedPackage>,
-    /// Pins for the root's edges: `None` for its dependencies and extras,
-    /// `Some(group)` for a dependency group resolved on its own.
-    pub root_pins: BTreeMap<Option<String>, BTreeMap<String, Pin>>,
+    /// What the roots' edges resolved to: `None` for the dependencies and
+    /// extras, `Some(selector)` for a group or extra resolved on its own.
+    /// A name pinned differently on the sides of a fork lists every pin.
+    pub root_pins: BTreeMap<Option<Selector>, BTreeMap<String, Vec<Pin>>>,
     /// The markers the lock forks on, when it does.
     pub fork_markers: Vec<String>,
-    /// Whether edges into a multi-variant name carry a version (profiles) or
-    /// the variants are told apart by `resolution-markers` alone (forks).
-    pub pin_edges: bool,
 }
 
 impl Lockable {
     pub fn single(r: Resolution) -> Lockable {
         Lockable {
             packages: r.packages,
-            root_pins: BTreeMap::from([(None, r.pins)]),
+            root_pins: BTreeMap::from([(None, pins_as_sets(r.pins))]),
             fork_markers: Vec::new(),
-            pin_edges: true,
         }
     }
 
     /// Merges the sides of a fork: a release present on several sides is one
     /// package carrying each side's marker; a name with a single variant
-    /// across all sides needs no markers at all.
+    /// across all sides needs no markers at all. One side is just itself.
     pub fn merge_forks(sides: Vec<(String, Resolution)>) -> Lockable {
+        if sides.len() == 1 {
+            return Lockable::single(sides.into_iter().next().map(|(_, r)| r).unwrap());
+        }
         let mut packages: Vec<ResolvedPackage> = Vec::new();
-        let mut root_pins = None;
+        let mut root_pins: BTreeMap<String, Vec<Pin>> = BTreeMap::new();
         let mut fork_markers = Vec::new();
         // A release seen from several sides may list different dependencies
-        // (another platform's wheel): an edge one side lacks is scoped to the
-        // sides that have it.
+        // (another platform's wheel) or pin them differently: an edge one
+        // side lacks is scoped to the sides that have it.
         // An `extra == 'x'` clause stays at the top level, where the lock
         // writer looks for it.
-        let scope = |r: &Requirement, side: &str| -> Requirement {
-            let mut r = r.clone();
+        let scope = |e: &Edge, side: &str| -> Edge {
+            let mut r = e.req.clone();
             r.marker = Some(match &r.marker {
                 Some(m) => match split_extra(m) {
-                    (Some(e), Some(rest)) => format!("extra == '{e}' and ({rest}) and ({side})"),
-                    (Some(e), None) => format!("extra == '{e}' and ({side})"),
+                    (Some(x), Some(rest)) => format!("extra == '{x}' and ({rest}) and ({side})"),
+                    (Some(x), None) => format!("extra == '{x}' and ({side})"),
                     (None, _) => format!("({m}) and ({side})"),
                 },
                 None => side.to_owned(),
             });
-            r
+            Edge {
+                req: r,
+                pin: e.pin.clone(),
+            }
         };
         for (marker, r) in sides {
-            if root_pins.is_none() {
-                root_pins = Some(r.pins);
+            for (name, pin) in r.pins {
+                let set = root_pins.entry(name).or_default();
+                if !set.contains(&pin) {
+                    set.push(pin);
+                }
             }
             for mut p in r.packages {
                 if let Some(existing) = packages
                     .iter_mut()
                     .find(|q| q.name == p.name && q.version == p.version && q.source == p.source)
                 {
-                    let same = |a: &Requirement, b: &Requirement| {
-                        a.name == b.name && a.extras == b.extras && a.marker == b.marker
-                    };
-                    let only_mine: Vec<Requirement> = p
+                    let only_mine: Vec<Edge> = p
                         .dependencies
                         .iter()
-                        .filter(|d| !existing.dependencies.iter().any(|e| same(e, d)))
+                        .filter(|d| !existing.dependencies.iter().any(|e| e.same(d)))
                         .cloned()
                         .collect();
                     let only_theirs: Vec<usize> = existing
                         .dependencies
                         .iter()
                         .enumerate()
-                        .filter(|(_, e)| !p.dependencies.iter().any(|d| same(e, d)))
+                        .filter(|(_, e)| !p.dependencies.iter().any(|d| e.same(d)))
                         .map(|(i, _)| i)
                         .collect();
                     if !only_theirs.is_empty() {
@@ -264,24 +371,37 @@ impl Lockable {
         packages.sort_by(|a, b| (&a.name, &a.version).cmp(&(&b.name, &b.version)));
         Lockable {
             packages,
-            root_pins: BTreeMap::from([(None, root_pins.unwrap_or_default())]),
+            root_pins: BTreeMap::from([(None, root_pins)]),
             fork_markers,
-            pin_edges: false,
         }
     }
 
-    /// Merges a base resolution with the resolutions of conflicting groups.
-    /// Packages identical in name, version and source collapse into one. The
-    /// lock pins each edge once, so a shared package whose dependencies, or a
-    /// base dependency whose version, differ between profiles cannot be
-    /// written and is reported (uv's forks can express it).
-    pub fn merge(base: Resolution, profiles: Vec<(String, Resolution)>) -> Result<Lockable> {
-        let mut packages: Vec<ResolvedPackage> = Vec::new();
-        let mut root_pins = BTreeMap::new();
-        let base_pins = base.pins.clone();
-        root_pins.insert(None, base.pins);
-        let mut add = |rs: Vec<ResolvedPackage>, group: &str| -> Result<()> {
-            for p in rs {
+    /// Merges a base lock with the locks of conflicting groups or extras
+    /// (each possibly forked). Packages identical in name, version and
+    /// source collapse into one. An edge is pinned once, so a shared package
+    /// whose dependencies, or a base dependency whose version, differ between
+    /// profiles cannot be written and is reported (uv's conflict markers can
+    /// express it).
+    pub fn merge(base: Lockable, profiles: Vec<(Selector, Lockable)>) -> Result<Lockable> {
+        let mut packages = base.packages;
+        let mut root_pins = base.root_pins;
+        let mut fork_markers = base.fork_markers;
+        let base_pins = root_pins.get(&None).cloned().unwrap_or_default();
+        for (selector, lk) in profiles {
+            let group = selector.name().to_owned();
+            let theirs = lk.root_pins.get(&None).cloned().unwrap_or_default();
+            for (name, pins) in &base_pins {
+                if let Some(other) = theirs.get(name) {
+                    if other != pins {
+                        bail!(
+                            "{name} resolves to {} with profile {group} but {} without; a base dependency must agree across profiles (uv can fork it)",
+                            describe_pins(other),
+                            describe_pins(pins)
+                        );
+                    }
+                }
+            }
+            for p in lk.packages {
                 if let Some(existing) = packages
                     .iter_mut()
                     .find(|q| q.name == p.name && q.version == p.version && q.source == p.source)
@@ -289,23 +409,34 @@ impl Lockable {
                     // The same release seen from another profile: keep every
                     // edge it saw, and insist its pins agree.
                     for d in p.dependencies {
-                        if !existing.dependencies.iter().any(|e| {
-                            e.name == d.name && e.extras == d.extras && e.marker == d.marker
-                        }) {
+                        let clash = existing.dependencies.iter().find(|e| {
+                            e.req.name == d.req.name
+                                && e.req.extras == d.req.extras
+                                && e.req.marker == d.req.marker
+                                && e.pin != d.pin
+                        });
+                        if let Some(e) = clash {
+                            bail!(
+                                "{} {} needs {} {} in profile {group} but {} elsewhere; one lock cannot hold both (uv can fork it)",
+                                p.name,
+                                p.version,
+                                d.req.name,
+                                d.pin.as_ref().map_or("?".to_owned(), |x| x.version.to_string()),
+                                e.pin.as_ref().map_or("?".to_owned(), |x| x.version.to_string())
+                            );
+                        }
+                        if !existing.dependencies.iter().any(|e| e.same(&d)) {
                             existing.dependencies.push(d);
                         }
                     }
-                    for (dep, pin) in p.resolved {
-                        match existing.resolved.get(&dep) {
-                            Some(prev) if *prev != pin => bail!(
-                                "{} {} needs {dep} {} in profile {group} but {} elsewhere; one lock cannot hold both (uv can fork it)",
-                                p.name,
-                                p.version,
-                                pin.version,
-                                prev.version
-                            ),
-                            _ => {
-                                existing.resolved.insert(dep, pin);
+                    // Markers say where a variant applies: present everywhere
+                    // in one resolution, it applies everywhere.
+                    if existing.resolution_markers.is_empty() || p.resolution_markers.is_empty() {
+                        existing.resolution_markers.clear();
+                    } else {
+                        for m in p.resolution_markers {
+                            if !existing.resolution_markers.contains(&m) {
+                                existing.resolution_markers.push(m);
                             }
                         }
                     }
@@ -313,30 +444,18 @@ impl Lockable {
                     packages.push(p);
                 }
             }
-            Ok(())
-        };
-        add(base.packages, "the base")?;
-        for (group, r) in profiles {
-            for (name, pin) in &base_pins {
-                if let Some(other) = r.pins.get(name) {
-                    if other != pin {
-                        bail!(
-                            "{name} resolves to {} with profile {group} but {} without; a base dependency must agree across profiles (uv can fork it)",
-                            other.version,
-                            pin.version
-                        );
-                    }
+            for m in lk.fork_markers {
+                if !fork_markers.contains(&m) {
+                    fork_markers.push(m);
                 }
             }
-            add(r.packages, &group)?;
-            root_pins.insert(Some(group), r.pins);
+            root_pins.insert(Some(selector), theirs);
         }
         packages.sort_by(|a, b| (&a.name, &a.version).cmp(&(&b.name, &b.version)));
         Ok(Lockable {
             packages,
             root_pins,
-            fork_markers: Vec::new(),
-            pin_edges: true,
+            fork_markers,
         })
     }
 
@@ -352,6 +471,27 @@ impl Lockable {
     fn variants(&self, name: &str) -> usize {
         self.packages.iter().filter(|p| p.name == name).count()
     }
+
+    /// Every version assigned to a name (one, or one per fork side).
+    pub fn assigned(&self) -> BTreeMap<String, Version> {
+        let mut out = BTreeMap::new();
+        for p in &self.packages {
+            out.entry(p.name.clone())
+                .or_insert_with(|| p.version.clone());
+        }
+        out
+    }
+}
+
+fn pins_as_sets(pins: BTreeMap<String, Pin>) -> BTreeMap<String, Vec<Pin>> {
+    pins.into_iter().map(|(n, p)| (n, vec![p])).collect()
+}
+
+fn describe_pins(pins: &[Pin]) -> String {
+    pins.iter()
+        .map(|p| p.version.to_string())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Two requirements on one package that can never hold together; the lock
@@ -492,17 +632,18 @@ pub fn resolve_with_forks<'a>(
                     m
                 }
             };
-            let marker = restrictions
-                .iter()
-                .map(|(m, holds)| {
-                    if *holds {
-                        paren(m.clone())
-                    } else {
-                        paren(negate_marker(m).unwrap_or_else(|_| m.clone()))
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" and ");
+            let mut clauses: Vec<String> = Vec::new();
+            for (m, holds) in &restrictions {
+                let clause = if *holds {
+                    paren(m.clone())
+                } else {
+                    paren(negate_marker(m).unwrap_or_else(|_| m.clone()))
+                };
+                if !clauses.contains(&clause) {
+                    clauses.push(clause);
+                }
+            }
+            let marker = clauses.join(" and ");
             Ok(vec![(marker, r)])
         }
         Err(e) => match e.downcast_ref::<ForkNeeded>() {
@@ -527,6 +668,8 @@ pub struct Resolver<'a> {
     machine_included: bool,
     /// Packages routed to another index (`[tool.uv.sources]`).
     routes: Vec<(String, Index)>,
+    /// Packages that come from git, a URL or a path (`[tool.uv.sources]`).
+    sourced: BTreeMap<String, Sourced>,
     /// Indexes searched before the main one for everything else
     /// (`[[tool.uv.index]]` without `explicit`), first match wins.
     defaults: Vec<Index>,
@@ -603,6 +746,7 @@ impl<'a> Resolver<'a> {
             index,
             machine_included: true,
             routes: Vec::new(),
+            sourced: BTreeMap::new(),
             defaults: Vec::new(),
             envs: Vec::new(),
             pythons: Vec::new(),
@@ -642,6 +786,18 @@ impl<'a> Resolver<'a> {
     pub fn defaults(mut self, defaults: Vec<Index>) -> Self {
         self.defaults = defaults;
         self
+    }
+
+    /// Packages fetched or built from a declared source instead of an index.
+    pub fn sources(mut self, sources: BTreeMap<String, Sourced>) -> Self {
+        self.sourced = sources;
+        self
+    }
+
+    /// How many environments this resolver serves; none after restrictions
+    /// that contradict each other.
+    pub fn env_count(&self) -> usize {
+        self.envs.len()
     }
 
     /// The index `name` comes from: its route, else the first default index
@@ -1136,18 +1292,32 @@ impl<'a> Resolver<'a> {
             // selection lives in the state, the fetched artifact in a cache.
             let mut req = req;
             let mut reexpand_direct = false;
-            if let Some(url) = req.url.clone() {
+            // A declared source (`[tool.uv.sources]`) makes a plain
+            // requirement direct too, unless the requirement names a URL itself.
+            let sourced = match &req.url {
+                None => self.sourced.get(&req.name).cloned(),
+                Some(_) => None,
+            };
+            if req.url.is_some() || sourced.is_some() {
                 let fetch = self.fetch.ok_or_else(|| {
                     anyhow!(
                         "{}: direct references need the native backend's builder",
                         req.name
                     )
                 })?;
-                let cache_key = (req.name.clone(), url.clone());
+                let key = match (&req.url, &sourced) {
+                    (Some(u), _) => u.clone(),
+                    (None, Some(src)) => format!("source:{:?}", src.kind),
+                    (None, None) => unreachable!(),
+                };
+                let cache_key = (req.name.clone(), key);
                 let d = match self.direct_cache.get(&cache_key) {
                     Some(d) => d.clone(),
                     None => {
-                        let d = fetch.direct(&req)?;
+                        let d = match &sourced {
+                            Some(src) => fetch.sourced(&req.name, src)?,
+                            None => fetch.direct(&req)?,
+                        };
                         self.direct_cache.insert(cache_key, d.clone());
                         d
                     }
@@ -1297,13 +1467,12 @@ impl<'a> Resolver<'a> {
                     })
                     .collect()
             };
-            let mut dependencies: Vec<Requirement> = Vec::new();
+            let mut dependencies: Vec<Edge> = Vec::new();
             for (_, r) in state.edges.iter().filter(|(from, _)| from == name) {
-                if !dependencies
-                    .iter()
-                    .any(|d| d.name == r.name && d.extras == r.extras && d.marker == r.marker)
-                {
-                    dependencies.push(r.clone());
+                if !dependencies.iter().any(|d| {
+                    d.req.name == r.name && d.req.extras == r.extras && d.req.marker == r.marker
+                }) {
+                    dependencies.push(Edge::plain(r.clone()));
                 }
             }
             let (files, source) = match state.directs.get(name) {
@@ -1319,7 +1488,6 @@ impl<'a> Resolver<'a> {
                 files,
                 dependencies,
                 source,
-                resolved: BTreeMap::new(),
                 resolution_markers: Vec::new(),
             });
         }
@@ -1337,18 +1505,11 @@ impl<'a> Resolver<'a> {
             })
             .collect();
         for p in &mut packages {
-            p.resolved = p
-                .dependencies
-                .iter()
-                .filter_map(|d| pins.get(&d.name).map(|pin| (d.name.clone(), pin.clone())))
-                .collect();
+            for d in &mut p.dependencies {
+                d.pin = pins.get(&d.req.name).cloned();
+            }
         }
-        let assigned = state.assigned.iter().cloned().collect();
-        Ok(Resolution {
-            packages,
-            assigned,
-            pins,
-        })
+        Ok(Resolution { packages, pins })
     }
 
     /// Two constraints that never apply on the same environment: the
@@ -1385,7 +1546,11 @@ impl<'a> Resolver<'a> {
         let ahead: Vec<String> = meta
             .requires_dist
             .iter()
-            .filter(|d| d.url.is_none() && !self.routes.iter().any(|(n, _)| *n == d.name))
+            .filter(|d| {
+                d.url.is_none()
+                    && !self.routes.iter().any(|(n, _)| *n == d.name)
+                    && !self.sourced.contains_key(&d.name)
+            })
             .map(|d| d.name.clone())
             .collect();
         // Only when the main index is the one these names would come from: with
@@ -1451,10 +1616,11 @@ impl<'a> Resolver<'a> {
 /// An actual pin to one release (`==1.2.3`, `===x`), not `==1.*` or a range.
 /// `git+https://host/repo.git@rev` → (`https://host/repo.git`, `Some("rev")`).
 /// The lock's form of a git source, as uv writes it: the repository, then
-/// `?subdirectory=…` and `&rev=…` as asked, then `#commit`.
+/// `?subdirectory=…` and `&rev=…` (or `tag=`, `branch=`) as asked, then
+/// `#commit` (left off when there is none yet, as in `requires-dist`).
 pub fn git_lock_url(
     url: &str,
-    rev: &Option<String>,
+    reference: &Option<GitRef>,
     commit: &str,
     subdirectory: &Option<String>,
 ) -> String {
@@ -1462,14 +1628,19 @@ pub fn git_lock_url(
     if let Some(s) = subdirectory {
         query.push(format!("subdirectory={s}"));
     }
-    if let Some(r) = rev {
-        query.push(format!("rev={r}"));
+    if let Some(r) = reference {
+        query.push(format!("{}={}", r.key(), r.value()));
     }
-    if query.is_empty() {
-        format!("{url}#{commit}")
-    } else {
-        format!("{url}?{}#{commit}", query.join("&"))
+    let mut out = url.to_owned();
+    if !query.is_empty() {
+        out.push('?');
+        out.push_str(&query.join("&"));
     }
+    if !commit.is_empty() {
+        out.push('#');
+        out.push_str(commit);
+    }
+    out
 }
 
 /// The `subdirectory` named in a direct git reference's fragment
@@ -1624,153 +1795,231 @@ pub fn write_lock(roots: &Roots, lock: &Lockable) -> String {
         }
         doc["resolution-markers"] = value(a);
     }
-    let source_table = |source: &Source| {
-        let mut src = InlineTable::new();
-        match source {
-            Source::Registry(u) => src.insert("registry", u.as_str().into()),
-            Source::Url(u) => src.insert("url", u.as_str().into()),
-            Source::Git {
-                url,
-                rev,
-                commit,
-                subdirectory,
-            } => src.insert("git", git_lock_url(url, rev, commit, subdirectory).into()),
-        };
-        src
+    let extras_array = |r: &Requirement| {
+        let mut a = Array::new();
+        for e in &r.extras {
+            a.push(e.as_str());
+        }
+        a
     };
-    // An edge into a name with several variants says which one: by version,
-    // and by source when the same version comes from two places.
-    let dep_entry =
-        |r: &Requirement, marker: Option<&str>, pins: Option<&BTreeMap<String, Pin>>| {
-            let mut t = InlineTable::new();
-            t.insert("name", r.name.as_str().into());
-            if lock.pin_edges && lock.variants(&r.name) > 1 {
-                if let Some(pin) = pins.and_then(|p| p.get(&r.name)) {
-                    t.insert("version", pin.version.to_string().into());
-                    if lock.same_version_variants(&r.name, &pin.version) > 1 {
-                        t.insert("source", source_table(&pin.source).into());
-                    }
-                }
-            }
-            if !r.extras.is_empty() {
-                let mut a = Array::new();
-                for e in &r.extras {
-                    a.push(e.as_str());
-                }
-                t.insert("extra", a.into());
-            }
-            if let Some(m) = marker {
-                t.insert("marker", m.into());
-            }
-            t
-        };
-    // In a forked lock an edge into a forked name is written once per
-    // variant, pinned to it and scoped by its markers (as uv does); every
-    // other edge is written once.
-    let fork_entries = |r: &Requirement| -> Vec<InlineTable> {
+    // The entries for one edge. The variants it may point at are those
+    // its pins allow (every variant when it has none). One variant: pinned
+    // by version (and source when the version is shared) whenever the name
+    // has several. Several, from a fork: one entry per variant, pinned and
+    // scoped by the variant's side, as uv writes forked locks.
+    let entries_for = |r: &Requirement, pins: &[Pin], from_sides: &[String]| -> Vec<InlineTable> {
         let variants: Vec<&ResolvedPackage> = lock
             .packages
             .iter()
-            .filter(|p| p.name == r.name && !p.resolution_markers.is_empty())
-            .collect();
-        if lock.pin_edges || variants.len() < 2 {
-            return vec![dep_entry(r, r.marker.as_deref(), None)];
-        }
-        variants
-            .iter()
-            .filter_map(|v| {
-                let side = if v.resolution_markers.len() == 1 {
-                    v.resolution_markers[0].clone()
-                } else {
-                    v.resolution_markers
+            .filter(|p| p.name == r.name)
+            .filter(|p| {
+                pins.is_empty()
+                    || pins
                         .iter()
-                        .map(|m| format!("({m})"))
-                        .collect::<Vec<_>>()
-                        .join(" or ")
-                };
-                let marker = match &r.marker {
-                    Some(m) if *m == side => side.clone(),
-                    Some(m) => format!("({m}) and ({side})"),
-                    None => side.clone(),
-                };
-                // An edge is left out only when its own marker is exactly the
-                // negation of the variant's side; anything less certain stays.
-                if let Some(m) = &r.marker {
-                    let opposite = negate_marker(m).ok().as_deref() == Some(side.as_str())
-                        || negate_marker(&side).ok().as_deref() == Some(m.as_str());
-                    if opposite {
-                        return None;
-                    }
-                }
-                let mut t = InlineTable::new();
-                t.insert("name", r.name.as_str().into());
+                        .any(|pin| pin.version == p.version && pin.source == p.source)
+            })
+            // An edge from one side of a fork points only at variants on that side.
+            .filter(|p| {
+                from_sides.is_empty()
+                    || p.resolution_markers.is_empty()
+                    || p.resolution_markers.iter().any(|m| from_sides.contains(m))
+            })
+            .collect();
+        let total = lock.variants(&r.name);
+        let mut out = Vec::new();
+        if variants.len() <= 1 {
+            let mut t = InlineTable::new();
+            t.insert("name", r.name.as_str().into());
+            if let Some(v) = variants.first().filter(|_| total > 1) {
                 t.insert("version", v.version.to_string().into());
                 if lock.same_version_variants(&v.name, &v.version) > 1 {
-                    t.insert("source", source_table(&v.source).into());
+                    t.insert("source", v.source.lock_table().into());
                 }
-                if !r.extras.is_empty() {
-                    let mut a = Array::new();
-                    for e in &r.extras {
-                        a.push(e.as_str());
-                    }
-                    t.insert("extra", a.into());
+            }
+            if !r.extras.is_empty() {
+                t.insert("extra", extras_array(r).into());
+            }
+            if let Some(m) = &r.marker {
+                t.insert("marker", m.as_str().into());
+            }
+            out.push(t);
+            return out;
+        }
+        for v in variants {
+            let side = if v.resolution_markers.len() == 1 {
+                v.resolution_markers[0].clone()
+            } else {
+                v.resolution_markers
+                    .iter()
+                    .map(|m| format!("({m})"))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            };
+            // An edge is left out only when its own marker is exactly the
+            // negation of the variant's side; anything less certain stays.
+            if let Some(m) = &r.marker {
+                let opposite = negate_marker(m).ok().as_deref() == Some(side.as_str())
+                    || negate_marker(&side).ok().as_deref() == Some(m.as_str());
+                if opposite {
+                    continue;
                 }
+            }
+            let marker = match &r.marker {
+                Some(m) if *m == side || side.is_empty() => m.clone(),
+                Some(m) => format!("({m}) and ({side})"),
+                None => side.clone(),
+            };
+            let mut t = InlineTable::new();
+            t.insert("name", r.name.as_str().into());
+            t.insert("version", v.version.to_string().into());
+            if lock.same_version_variants(&v.name, &v.version) > 1 {
+                t.insert("source", v.source.lock_table().into());
+            }
+            if !r.extras.is_empty() {
+                t.insert("extra", extras_array(r).into());
+            }
+            if !marker.is_empty() {
                 t.insert("marker", marker.into());
-                Some(t)
-            })
-            .collect()
+            }
+            out.push(t);
+        }
+        out
     };
-    let dep_array = |reqs: &[Requirement], pins: Option<&BTreeMap<String, Pin>>| {
+    let no_pins: Vec<Pin> = Vec::new();
+    let no_sides: Vec<String> = Vec::new();
+    // A root's edges, pinned by what its group or extra resolved to.
+    let root_array = |reqs: &[Requirement], selector: Option<&Selector>| {
+        let pins = lock
+            .root_pins
+            .get(&selector.cloned())
+            .or_else(|| lock.root_pins.get(&None));
         let mut a = Array::new();
         for r in reqs.iter().filter(|r| resolved.contains(&r.name)) {
-            if lock.pin_edges {
-                a.push(dep_entry(r, r.marker.as_deref(), pins));
-            } else {
-                for t in fork_entries(r) {
-                    a.push(t);
-                }
+            let own = pins.and_then(|p| p.get(&r.name)).unwrap_or(&no_pins);
+            for t in entries_for(r, own, &no_sides) {
+                a.push(t);
             }
         }
         a
     };
-    let base_pins = lock.root_pins.get(&None);
-    let spec_entry = |r: &Requirement, extra: Option<&str>| {
-        let mut t = InlineTable::new();
-        t.insert("name", r.name.as_str().into());
-        if !r.extras.is_empty() {
-            let mut a = Array::new();
-            for e in &r.extras {
-                a.push(e.as_str());
-            }
-            t.insert("extras", a.into());
-        }
-        match r.url.as_deref() {
-            Some(u) if u.starts_with("git+") => {
-                let (repo, _) = git_parts(u);
-                t.insert("git", repo.into());
-            }
-            Some(u) => {
-                t.insert("url", u.into());
-            }
-            None => {
-                let spec = r.specifier.to_string();
-                if !spec.is_empty() {
-                    t.insert("specifier", spec.into());
-                }
-            }
-        }
-        let marker = match (r.marker.as_deref(), extra) {
-            (Some(m), Some(e)) if m.contains(" or ") => Some(format!("({m}) and extra == '{e}'")),
-            (Some(m), Some(e)) => Some(format!("{m} and extra == '{e}'")),
-            (Some(m), None) => Some(m.to_owned()),
-            (None, Some(e)) => Some(format!("extra == '{e}'")),
-            (None, None) => None,
+    // `requires-dist`: what the project declares, with its declared source
+    // (an index, git, a URL, a file, a directory) and the group or extra
+    // that source is specific to.
+    let root_name = crate::project::normalize(&roots.name);
+    let spec_entries =
+        |r: &Requirement, extra: Option<&str>, group: Option<&str>| -> Vec<InlineTable> {
+            let selector = match (group, extra) {
+                (Some(g), _) => Some(Selector::Group(g.to_owned())),
+                (None, Some(e)) => Some(Selector::Extra(e.to_owned())),
+                (None, None) => None,
+            };
+            let declared: Vec<&RootSource> = roots
+                .sources
+                .iter()
+                .filter(|s| s.name == r.name)
+                .filter(|s| s.selector.is_none() || s.selector == selector)
+                .collect();
+            // The most specific entries win: the selector's own, else the plain ones.
+            let specific: Vec<&RootSource> = declared
+                .iter()
+                .copied()
+                .filter(|s| s.selector.is_some())
+                .collect();
+            let chosen: Vec<Option<&RootSource>> = if !specific.is_empty() {
+                specific.into_iter().map(Some).collect()
+            } else if !declared.is_empty() {
+                declared.into_iter().map(Some).collect()
+            } else {
+                vec![None]
+            };
+            chosen
+                .into_iter()
+                .map(|src| {
+                    let mut t = InlineTable::new();
+                    t.insert("name", r.name.as_str().into());
+                    if !r.extras.is_empty() {
+                        t.insert("extras", extras_array(r).into());
+                    }
+                    let spec = r.specifier.to_string();
+                    match (r.url.as_deref(), src) {
+                        (Some(u), _) if u.starts_with("git+") => {
+                            let (repo, rev) = git_parts(u);
+                            let sub = git_subdirectory(u).ok().flatten();
+                            t.insert(
+                                "git",
+                                git_lock_url(&repo, &rev.map(GitRef::Rev), "", &sub).into(),
+                            );
+                        }
+                        (Some(u), _) => {
+                            t.insert("url", u.into());
+                        }
+                        (None, Some(s)) => {
+                            match &s.source {
+                                Source::Registry(url) => {
+                                    if !spec.is_empty() {
+                                        t.insert("specifier", spec.as_str().into());
+                                    }
+                                    t.insert("index", url.as_str().into());
+                                }
+                                Source::Git {
+                                    url,
+                                    reference,
+                                    subdirectory,
+                                    ..
+                                } => {
+                                    t.insert(
+                                        "git",
+                                        git_lock_url(url, reference, "", subdirectory).into(),
+                                    );
+                                }
+                                Source::Url(u) => {
+                                    t.insert("url", u.as_str().into());
+                                }
+                                Source::Path(p) => {
+                                    t.insert("path", p.as_str().into());
+                                }
+                                Source::Directory(p) => {
+                                    t.insert("directory", p.as_str().into());
+                                }
+                                Source::Editable(p) => {
+                                    t.insert("editable", p.as_str().into());
+                                }
+                            }
+                            if let Some(sel) = &s.selector {
+                                let mut c = InlineTable::new();
+                                c.insert("package", root_name.as_str().into());
+                                c.insert(
+                                    if sel.is_group() { "group" } else { "extra" },
+                                    sel.name().into(),
+                                );
+                                t.insert("conflict", c.into());
+                            }
+                        }
+                        (None, None) => {
+                            if !spec.is_empty() {
+                                t.insert("specifier", spec.as_str().into());
+                            }
+                        }
+                    }
+                    let source_marker = src.and_then(|s| s.marker.clone());
+                    let mut clauses: Vec<String> = Vec::new();
+                    for m in [r.marker.clone(), source_marker].into_iter().flatten() {
+                        clauses.push(if m.contains(" or ") {
+                            format!("({m})")
+                        } else {
+                            m
+                        });
+                    }
+                    if let Some(e) = extra {
+                        clauses.push(format!("extra == '{e}'"));
+                    }
+                    if !clauses.is_empty() {
+                        t.insert("marker", clauses.join(" and ").into());
+                    }
+                    t
+                })
+                .collect()
         };
-        if let Some(m) = marker {
-            t.insert("marker", m.into());
-        }
-        t
-    };
 
     let mut packages = ArrayOfTables::new();
     // The project itself, then each workspace member: all roots of the lock.
@@ -1782,31 +2031,34 @@ pub fn write_lock(roots: &Roots, lock: &Lockable) -> String {
         src.insert(if r.editable { "editable" } else { "virtual" }, path.into());
         root["source"] = value(src);
         if !r.dependencies.is_empty() {
-            root["dependencies"] = value(dep_array(&r.dependencies, base_pins));
+            root["dependencies"] = value(root_array(&r.dependencies, None));
         }
         if !r.extras.is_empty() {
             let mut t = Table::new();
             for (k, v) in &r.extras {
-                t[k.as_str()] = value(dep_array(v, base_pins));
+                t[k.as_str()] = value(root_array(v, Some(&Selector::Extra(k.clone()))));
             }
             root["optional-dependencies"] = Item::Table(t);
         }
         if !r.groups.is_empty() {
             let mut t = Table::new();
             for (k, v) in &r.groups {
-                let pins = lock.root_pins.get(&Some(k.clone())).or(base_pins);
-                t[k.as_str()] = value(dep_array(v, pins));
+                t[k.as_str()] = value(root_array(v, Some(&Selector::Group(k.clone()))));
             }
             root["dev-dependencies"] = Item::Table(t);
         }
         let mut meta = Table::new();
         let mut rd = Array::new();
         for d in &r.dependencies {
-            rd.push(spec_entry(d, None));
+            for e in spec_entries(d, None, None) {
+                rd.push(e);
+            }
         }
         for (k, v) in &r.extras {
             for d in v {
-                rd.push(spec_entry(d, Some(k)));
+                for e in spec_entries(d, Some(k), None) {
+                    rd.push(e);
+                }
             }
         }
         meta["requires-dist"] = value(rd);
@@ -1815,7 +2067,9 @@ pub fn write_lock(roots: &Roots, lock: &Lockable) -> String {
             for (k, v) in &r.groups {
                 let mut a = Array::new();
                 for d in v {
-                    a.push(spec_entry(d, None));
+                    for e in spec_entries(d, None, Some(k)) {
+                        a.push(e);
+                    }
                 }
                 t[k.as_str()] = value(a);
             }
@@ -1857,30 +2111,27 @@ pub fn write_lock(roots: &Roots, lock: &Lockable) -> String {
             }
             t["resolution-markers"] = value(a);
         }
-        let mut src = InlineTable::new();
-        match &p.source {
-            Source::Registry(url) => src.insert("registry", url.as_str().into()),
-            Source::Url(u) => src.insert("url", u.as_str().into()),
-            Source::Git {
-                url,
-                rev,
-                commit,
-                subdirectory,
-            } => src.insert("git", git_lock_url(url, rev, commit, subdirectory).into()),
-        };
-        t["source"] = value(src);
+        t["source"] = value(p.source.lock_table());
         // Plain edges go to `dependencies`; `extra == 'x'` edges under the
         // extra, so an installer following `extra = [...]` finds them.
         let mut plain = Array::new();
         let mut by_extra: BTreeMap<String, Array> = BTreeMap::new();
         for d in &p.dependencies {
-            match d.marker.as_deref().map(split_extra) {
-                Some((Some(extra), rest)) => by_extra.entry(extra).or_default().push(dep_entry(
-                    d,
-                    rest.as_deref(),
-                    Some(&p.resolved),
-                )),
-                _ => plain.push(dep_entry(d, d.marker.as_deref(), Some(&p.resolved))),
+            let pins: Vec<Pin> = d.pin.iter().cloned().collect();
+            let (extra, req) = match d.req.marker.as_deref().map(split_extra) {
+                Some((Some(extra), rest)) => {
+                    let mut r = d.req.clone();
+                    r.marker = rest;
+                    (Some(extra), r)
+                }
+                _ => (None, d.req.clone()),
+            };
+            let target = match extra {
+                Some(e) => by_extra.entry(e).or_default(),
+                None => &mut plain,
+            };
+            for e in entries_for(&req, &pins, &p.resolution_markers) {
+                target.push(e);
             }
         }
         if !plain.is_empty() {
@@ -1893,9 +2144,14 @@ pub fn write_lock(roots: &Roots, lock: &Lockable) -> String {
             }
             t["optional-dependencies"] = Item::Table(ot);
         }
+        // A file on disk is listed by name and hash, as uv does; anything
+        // fetched by URL keeps the URL.
+        let local = matches!(p.source, Source::Path(_));
         if let Some(sd) = p.files.iter().find(|f| !f.is_wheel()) {
             let mut e = InlineTable::new();
-            e.insert("url", sd.url.as_str().into());
+            if !local {
+                e.insert("url", sd.url.as_str().into());
+            }
             if let Some(h) = &sd.sha256 {
                 e.insert("hash", format!("sha256:{h}").into());
             }
@@ -1904,7 +2160,11 @@ pub fn write_lock(roots: &Roots, lock: &Lockable) -> String {
         let mut wheels = Array::new();
         for f in p.files.iter().filter(|f| f.is_wheel()) {
             let mut e = InlineTable::new();
-            e.insert("url", f.url.as_str().into());
+            if local {
+                e.insert("filename", f.filename.as_str().into());
+            } else {
+                e.insert("url", f.url.as_str().into());
+            }
             if let Some(h) = &f.sha256 {
                 e.insert("hash", format!("sha256:{h}").into());
             }
@@ -2068,27 +2328,23 @@ mod tests {
                 files: vec![],
                 dependencies: deps
                     .iter()
-                    .map(|d| Requirement::parse(d).unwrap())
+                    .map(|d| {
+                        let req = Requirement::parse(d).unwrap();
+                        let pin = resolved
+                            .iter()
+                            .find(|(n, _)| *n == req.name)
+                            .map(|(_, v)| pin(v));
+                        Edge { req, pin }
+                    })
                     .collect(),
                 source: reg.clone(),
-                resolved: resolved
-                    .iter()
-                    .map(|(n, v)| (n.to_string(), pin(v)))
-                    .collect(),
                 resolution_markers: Vec::new(),
             };
-        let assigned = |pairs: &[(&str, &str)]| -> BTreeMap<String, Version> {
-            pairs
-                .iter()
-                .map(|(n, v)| (n.to_string(), Version::parse(v).unwrap()))
-                .collect()
-        };
         let pins = |pairs: &[(&str, &str)]| -> BTreeMap<String, Pin> {
             pairs.iter().map(|(n, v)| (n.to_string(), pin(v))).collect()
         };
         let base = Resolution {
             packages: vec![pkg("numpy", "2.0", &[], &[])],
-            assigned: assigned(&[("numpy", "2.0")]),
             pins: pins(&[("numpy", "2.0")]),
         };
         let cpu = Resolution {
@@ -2096,7 +2352,6 @@ mod tests {
                 pkg("numpy", "2.0", &[], &[]),
                 pkg("torch", "2.5.0+cpu", &["numpy"], &[("numpy", "2.0")]),
             ],
-            assigned: assigned(&[("numpy", "2.0"), ("torch", "2.5.0+cpu")]),
             pins: pins(&[("numpy", "2.0"), ("torch", "2.5.0+cpu")]),
         };
         let cu = Resolution {
@@ -2110,18 +2365,20 @@ mod tests {
                 ),
                 pkg("nvidia-cublas", "12.4", &[], &[]),
             ],
-            assigned: assigned(&[
-                ("numpy", "2.0"),
-                ("torch", "2.5.0+cu124"),
-                ("nvidia-cublas", "12.4"),
-            ]),
             pins: pins(&[
                 ("numpy", "2.0"),
                 ("torch", "2.5.0+cu124"),
                 ("nvidia-cublas", "12.4"),
             ]),
         };
-        let lock = Lockable::merge(base, vec![("cpu".into(), cpu), ("cu124".into(), cu)]).unwrap();
+        let lock = Lockable::merge(
+            Lockable::single(base),
+            vec![
+                (Selector::Group("cpu".into()), Lockable::single(cpu)),
+                (Selector::Group("cu124".into()), Lockable::single(cu)),
+            ],
+        )
+        .unwrap();
         assert_eq!(
             lock.packages.iter().filter(|p| p.name == "torch").count(),
             2
@@ -2305,6 +2562,221 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A wheelhouse with pure-Python wheels `name` at each of `versions`.
+    fn wheelhouse(dir: &std::path::Path, name: &str, versions: &[&str]) {
+        std::fs::create_dir_all(dir).unwrap();
+        for v in versions {
+            let meta = format!("Metadata-Version: 2.1\nName: {name}\nVersion: {v}\n");
+            let whl = stored_zip(&[
+                (&format!("{name}-{v}.dist-info/METADATA"), meta.as_bytes()),
+                (
+                    &format!("{name}-{v}.dist-info/WHEEL"),
+                    b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+                ),
+            ]);
+            std::fs::write(dir.join(format!("{name}-{v}-py3-none-any.whl")), whl).unwrap();
+        }
+    }
+
+    #[test]
+    fn profiles_and_forks_share_one_lock() {
+        let dir = std::env::temp_dir().join(format!("vivar-forkprof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        wheelhouse(&dir, "fk", &["1.0", "2.0"]);
+        wheelhouse(&dir, "variant", &["1.0", "2.0"]);
+        let index = Index::new(Some(dir.to_str().unwrap()));
+        // The base forks on the Python version; two conflicting groups pin
+        // another package differently.
+        let roots = Roots {
+            name: "app".into(),
+            version: "0.1.0".into(),
+            requires_python: Some(">=3.12".into()),
+            dependencies: vec![
+                Requirement::parse("fk<2; python_version < '3.13'").unwrap(),
+                Requirement::parse("fk>=2; python_version >= '3.13'").unwrap(),
+            ],
+            groups: BTreeMap::from([
+                (
+                    "slow".to_owned(),
+                    vec![Requirement::parse("variant==1.0").unwrap()],
+                ),
+                (
+                    "fast".to_owned(),
+                    vec![Requirement::parse("variant==2.0").unwrap()],
+                ),
+            ]),
+            ..Default::default()
+        };
+        let profiles = [
+            Selector::Group("slow".into()),
+            Selector::Group("fast".into()),
+        ];
+        let resolve = |roots: &Roots| -> Lockable {
+            let build = |restrictions: &[(String, bool)]| -> Result<Resolver<'_>> {
+                let mut r = Resolver::new(&index, [3, 12, 0], true).requires_python(Some(">=3.12"));
+                for (m, holds) in restrictions {
+                    r = r.restrict(m, *holds);
+                }
+                Ok(r)
+            };
+            Lockable::merge_forks(resolve_with_forks(&build, roots, Vec::new()).unwrap())
+        };
+        let mut base_roots = roots.clone();
+        base_roots.retain_selectors(&profiles, false);
+        assert!(base_roots.groups.is_empty());
+        let base = resolve(&base_roots);
+        assert_eq!(base.packages.len(), 2, "the base forks on fk");
+        let mut sides = Vec::new();
+        for sel in &profiles {
+            let mut pr = base_roots.clone();
+            pr.restore_selector(&roots, sel);
+            sides.push((sel.clone(), resolve(&pr)));
+        }
+        let lock = Lockable::merge(base, sides).unwrap();
+        assert_eq!(lock.packages.iter().filter(|p| p.name == "fk").count(), 2);
+        assert_eq!(
+            lock.packages.iter().filter(|p| p.name == "variant").count(),
+            2
+        );
+        assert!(lock.fork_markers.len() == 2, "{:?}", lock.fork_markers);
+        let text = write_lock(&roots, &lock);
+        assert!(text.contains("resolution-markers = ["), "{text}");
+        assert!(
+            text.contains("dependencies = [{ name = \"fk\", version = \"1.0\", marker = \"python_version < '3.13'\" }, { name = \"fk\", version = \"2.0\", marker = \"python_version >= '3.13'\" }]"),
+            "{text}"
+        );
+        assert!(
+            text.contains("slow = [{ name = \"variant\", version = \"1.0\" }]")
+                && text.contains("fast = [{ name = \"variant\", version = \"2.0\" }]"),
+            "{text}"
+        );
+        let parsed = crate::lock::Lock::parse(&text).unwrap();
+        let names = |v: [u32; 3], groups: &[&str]| -> Vec<String> {
+            crate::native::plan(&parsed, &MarkerEnv::current(v), groups)
+                .unwrap()
+                .iter()
+                .map(|p| format!("{} {}", p.name, p.version))
+                .collect()
+        };
+        assert_eq!(
+            names([3, 12, 0], &["slow"]),
+            vec!["app 0.1.0", "fk 1.0", "variant 1.0"]
+        );
+        assert_eq!(
+            names([3, 13, 0], &["fast"]),
+            vec!["app 0.1.0", "fk 2.0", "variant 2.0"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn requires_dist_names_declared_sources() {
+        let reg = Source::Registry("https://pypi.org/simple".into());
+        let roots = Roots {
+            name: "app".into(),
+            version: "0.1.0".into(),
+            dependencies: vec![
+                Requirement::parse("torch").unwrap(),
+                Requirement::parse("minipkg").unwrap(),
+                Requirement::parse("gitpkg").unwrap(),
+                Requirement::parse("lib").unwrap(),
+            ],
+            groups: BTreeMap::from([(
+                "cu124".to_owned(),
+                vec![Requirement::parse("torchvision").unwrap()],
+            )]),
+            sources: vec![
+                RootSource {
+                    name: "torch".into(),
+                    source: Source::Registry("https://download.pytorch.org/whl/cpu".into()),
+                    selector: None,
+                    marker: Some("sys_platform == 'linux'".into()),
+                },
+                RootSource {
+                    name: "torch".into(),
+                    source: Source::Registry("https://download.pytorch.org/whl/cu124".into()),
+                    selector: None,
+                    marker: Some("sys_platform != 'linux'".into()),
+                },
+                RootSource {
+                    name: "minipkg".into(),
+                    source: Source::Path("wheels/minipkg-1.0-py3-none-any.whl".into()),
+                    selector: None,
+                    marker: None,
+                },
+                RootSource {
+                    name: "gitpkg".into(),
+                    source: Source::Git {
+                        url: "https://h/r.git".into(),
+                        reference: Some(GitRef::Tag("v1".into())),
+                        commit: String::new(),
+                        subdirectory: Some("sub".into()),
+                    },
+                    selector: None,
+                    marker: None,
+                },
+                RootSource {
+                    name: "lib".into(),
+                    source: Source::Editable("../lib".into()),
+                    selector: None,
+                    marker: None,
+                },
+                RootSource {
+                    name: "torchvision".into(),
+                    source: Source::Registry("https://download.pytorch.org/whl/cu124".into()),
+                    selector: Some(Selector::Group("cu124".into())),
+                    marker: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let mini = ResolvedPackage {
+            name: "minipkg".into(),
+            version: Version::parse("1.0").unwrap(),
+            files: vec![File {
+                filename: "minipkg-1.0-py3-none-any.whl".into(),
+                url: "file:///x/wheels/minipkg-1.0-py3-none-any.whl".into(),
+                sha256: Some("ab".repeat(32)),
+                requires_python: None,
+                yanked: false,
+                has_metadata: false,
+            }],
+            dependencies: vec![],
+            source: Source::Path("wheels/minipkg-1.0-py3-none-any.whl".into()),
+            resolution_markers: Vec::new(),
+        };
+        let text = write_lock(
+            &roots,
+            &Lockable::single(Resolution {
+                packages: vec![mini],
+                pins: BTreeMap::from([(
+                    "minipkg".to_owned(),
+                    Pin {
+                        version: Version::parse("1.0").unwrap(),
+                        source: reg.clone(),
+                    },
+                )]),
+            }),
+        );
+        for needle in [
+            "{ name = \"torch\", index = \"https://download.pytorch.org/whl/cpu\", marker = \"sys_platform == 'linux'\" }",
+            "{ name = \"torch\", index = \"https://download.pytorch.org/whl/cu124\", marker = \"sys_platform != 'linux'\" }",
+            "{ name = \"minipkg\", path = \"wheels/minipkg-1.0-py3-none-any.whl\" }",
+            "{ name = \"gitpkg\", git = \"https://h/r.git?subdirectory=sub&tag=v1\" }",
+            "{ name = \"lib\", editable = \"../lib\" }",
+            "{ name = \"torchvision\", index = \"https://download.pytorch.org/whl/cu124\", conflict = { package = \"app\", group = \"cu124\" } }",
+            "source = { path = \"wheels/minipkg-1.0-py3-none-any.whl\" }",
+            "wheels = [{ filename = \"minipkg-1.0-py3-none-any.whl\", hash = \"sha256:abab",
+        ] {
+            assert!(text.contains(needle), "{needle} missing from\n{text}");
+        }
+        let parsed = crate::lock::Lock::parse(&text).unwrap();
+        let p = parsed.get("minipkg").unwrap();
+        assert_eq!(p.source_kind, "path");
+        assert_eq!(p.wheels[0].filename(), "minipkg-1.0-py3-none-any.whl");
+        assert!(p.hashed);
+    }
+
     #[test]
     fn lock_puts_extra_edges_under_the_extra() {
         let roots = Roots {
@@ -2324,11 +2796,10 @@ mod tests {
             version: Version::parse("2.32.0").unwrap(),
             files: vec![],
             dependencies: vec![
-                Requirement::parse("urllib3<3").unwrap(),
-                Requirement::parse("PySocks>=1.5.6; extra == 'socks'").unwrap(),
+                Edge::plain(Requirement::parse("urllib3<3").unwrap()),
+                Edge::plain(Requirement::parse("PySocks>=1.5.6; extra == 'socks'").unwrap()),
             ],
             source: Source::Registry("https://pypi.org/simple".into()),
-            resolved: BTreeMap::new(),
             resolution_markers: Vec::new(),
         };
         let direct = ResolvedPackage {
@@ -2338,11 +2809,10 @@ mod tests {
             dependencies: vec![],
             source: Source::Git {
                 url: "https://example.com/minipkg.git".into(),
-                rev: Some("main".into()),
+                reference: Some(GitRef::Branch("main".into())),
                 commit: "abc123".into(),
-                subdirectory: None,
+                subdirectory: Some("sub".into()),
             },
-            resolved: BTreeMap::new(),
             resolution_markers: Vec::new(),
         };
         assert_eq!(
@@ -2367,19 +2837,17 @@ mod tests {
             &roots,
             &Lockable::single(Resolution {
                 packages: vec![direct],
-                assigned: BTreeMap::new(),
                 pins: BTreeMap::new(),
             }),
         );
         assert!(
-            text.contains("source = { git = \"https://example.com/minipkg.git?rev=main#abc123\" }"),
+            text.contains("source = { git = \"https://example.com/minipkg.git?subdirectory=sub&branch=main#abc123\" }"),
             "{text}"
         );
         let text = write_lock(
             &roots,
             &Lockable::single(Resolution {
                 packages: vec![pkg],
-                assigned: BTreeMap::new(),
                 pins: BTreeMap::new(),
             }),
         );

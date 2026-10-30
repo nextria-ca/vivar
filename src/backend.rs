@@ -56,7 +56,15 @@ impl Change {
 }
 
 pub trait Backend {
-    fn add(&self, dir: &Path, packages: &[String], group: Option<&str>) -> Result<()>;
+    /// Adds requirements (or local paths) to the project; `editable` installs
+    /// a local directory editable.
+    fn add(
+        &self,
+        dir: &Path,
+        packages: &[String],
+        group: Option<&str>,
+        editable: bool,
+    ) -> Result<()>;
     fn remove(&self, dir: &Path, packages: &[String]) -> Result<()>;
     fn lock(&self, dir: &Path) -> Result<()>;
     fn sync(&self, dir: &Path) -> Result<()>;
@@ -64,8 +72,12 @@ pub trait Backend {
     fn sync_group(&self, dir: &Path, group: Option<&str>) -> Result<()> {
         self.sync_groups(dir, &group.into_iter().collect::<Vec<_>>())
     }
+    /// Syncs with these dependency groups and these extras of the project.
+    fn sync_with(&self, dir: &Path, groups: &[&str], extras: &[&str]) -> Result<()>;
     /// Like `sync`, also installing these dependency groups.
-    fn sync_groups(&self, dir: &Path, groups: &[&str]) -> Result<()>;
+    fn sync_groups(&self, dir: &Path, groups: &[&str]) -> Result<()> {
+        self.sync_with(dir, groups, &[])
+    }
     /// Re-resolves `packages` (all when empty) to their newest allowed versions;
     /// `dry_run` only reports what would change.
     fn upgrade(&self, dir: &Path, packages: &[String], dry_run: bool) -> Result<()>;
@@ -221,9 +233,18 @@ impl UvBackend {
 }
 
 impl Backend for UvBackend {
-    fn add(&self, dir: &Path, packages: &[String], group: Option<&str>) -> Result<()> {
+    fn add(
+        &self,
+        dir: &Path,
+        packages: &[String],
+        group: Option<&str>,
+        editable: bool,
+    ) -> Result<()> {
         let mut cmd = self.uv(dir);
         cmd.arg("add");
+        if editable {
+            cmd.arg("--editable");
+        }
         if let Some(group) = group {
             cmd.args(["--group", group]);
         }
@@ -247,11 +268,14 @@ impl Backend for UvBackend {
         self.sync_group(dir, None)
     }
 
-    fn sync_groups(&self, dir: &Path, groups: &[&str]) -> Result<()> {
+    fn sync_with(&self, dir: &Path, groups: &[&str], extras: &[&str]) -> Result<()> {
         let mut cmd = self.uv(dir);
         cmd.arg("sync");
         for group in groups {
             cmd.args(["--group", group]);
+        }
+        for extra in extras {
+            cmd.args(["--extra", extra]);
         }
         Self::check(cmd)
     }

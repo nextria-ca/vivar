@@ -191,9 +191,11 @@ impl Lock {
                 })
                 .unwrap_or_default();
 
+            // A file on disk (a `path` source) is listed by name, not URL.
             let artifact = |t: &toml_edit::InlineTable| Artifact {
                 url: t
                     .get("url")
+                    .or_else(|| t.get("filename"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_owned(),

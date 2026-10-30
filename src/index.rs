@@ -500,7 +500,7 @@ pub fn same_origin(a: &str, b: &str) -> bool {
 
 /// A `file://` URL for a wheelhouse member: absolute, percent-encoded, and
 /// decoded back by `local_path`.
-fn file_url(path: &std::path::Path) -> String {
+pub fn file_url(path: &std::path::Path) -> String {
     let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let p = abs.display().to_string().replace('\\', "/");
     let mut out = String::from("file:///");

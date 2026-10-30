@@ -10,7 +10,7 @@ See [DESIGN.md](DESIGN.md) for the why and the roadmap, and
 ## Status
 
 **Usable today, pre-1.0.** Phases 0, 3 and 4 of the [design](DESIGN.md) are implemented,
-tested on Linux, macOS and Windows in CI (109 tests), and reviewed. No release has been
+tested on Linux, macOS and Windows in CI (112 tests), and reviewed. No release has been
 tagged yet; see Install for how to get it in the meantime.
 
 What works:
@@ -42,9 +42,14 @@ Python project: `pyproject.toml` (PEP 621), `.python-version`, a normal `.venv`,
 
 Without uv, direct references (`pkg @ https://…/pkg.whl`, a `.tar.gz`, or
 `git+https://…@rev#subdirectory=sub`) and packages that ship only a source distribution
-are built by vivar's own PEP 517 driver and cached; extra indexes, per-package sources,
-profiles (`cpu` / `cu124` / `rocm6.2`) and workspaces resolve natively too, so nothing in
-the day-to-day flow needs uv. CI runs the whole suite on both backends. Not yet: native (conda-forge) dependencies, and
+are built by vivar's own PEP 517 driver and cached. Every form of `[tool.uv.sources]`
+resolves natively: an index (per group, per extra, or under a marker, which forks the
+lock), git (`rev`, `tag` or `branch`, with `subdirectory`), a URL, a local wheel or archive
+(`path`), and a local project directory (built, or `editable`). Profiles
+(`cpu` / `cu124` / `rocm6.2`) over dependency groups or extras, forks and workspaces
+combine in one lock, and `vivar add ./dist/x.whl` or `vivar add -e ../lib` writes the
+`path` source the way uv does. Nothing in the day-to-day flow needs uv, and CI runs the
+whole suite on both backends. Not yet: native (conda-forge) dependencies, and
 model-weight management (out of scope by decision).
 
 ## Install
@@ -191,6 +196,8 @@ vivar policy                    # the effective policy and which file each rule 
 vivar add torch                 # picks the PyTorch build for this machine's GPU (--cuda 12.4 / cpu / rocm6.2 / none)
 vivar profile add cu124 torch torchvision   # a machine variant; `profile add cpu torch` another, same lockfile
 vivar sync --profile auto       # install the profile that fits this machine's GPU
+vivar sync --extra viz          # also install an extra of the project (profiles can be extras too)
+vivar add ./dist/x.whl ../lib   # local wheels, archives and project dirs become `path` sources (-e: editable)
 vivar pack --target linux-x86_64 --python 3.12   # a bundle for another machine, built here
 vivar pack --zstd --use-host-cuda               # faster compression; leave CUDA libs to the target
 vivar kernel install            # register .venv as a Jupyter kernel (needs ipykernel)

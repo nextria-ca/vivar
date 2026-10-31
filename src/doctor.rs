@@ -107,6 +107,25 @@ pub fn run(cwd: &Path) -> Result<i32> {
     if system.is_file() && org.as_ref().is_some_and(|(p, _)| *p != system) {
         line(true, format!("system policy {}", system.display()));
     }
+    if system.is_file() {
+        // A locked policy anyone can edit locks nothing.
+        match project::system_policy_problem(&system) {
+            Some(problem) => line(
+                false,
+                format!("{problem}: a user could rewrite the system policy"),
+            ),
+            None if cfg!(unix) => line(
+                true,
+                "system policy is root-owned and not writable by others".to_owned(),
+            ),
+            None => println!("info system policy ownership is not checked on this platform"),
+        }
+    }
+    if let Some((_, policy)) = &org {
+        if policy.locked && policy.index_url.is_none() {
+            println!("warn locked policy sets no index-url: package sources are not pinned, only keys and the conda mirror");
+        }
+    }
     match org {
         Some((path, policy)) => line(
             true,

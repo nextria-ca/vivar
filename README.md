@@ -11,7 +11,7 @@ draws on.
 
 **Usable today, pre-1.0.** Every planned phase is implemented (projects, policy, polish,
 the uv-free core, and native dependencies from conda-forge), tested on Linux, macOS and
-Windows in CI (132 tests), and reviewed. Releases are tagged `v*`, starting with v0.1.0 (v0.1.1 adds the verified installs, dated bundles and GPU fit checks; v0.1.2 the locked policy, per-GPU checks and store garbage collection);
+Windows in CI (135 tests), and reviewed. Releases are tagged `v*`, starting with v0.1.0 (v0.1.1 adds the verified installs, dated bundles and GPU fit checks; v0.1.2 the locked policy, per-GPU checks and store garbage collection; v0.1.3 the agent skill and the policy audit checks);
 see Install.
 
 What works:
@@ -164,6 +164,24 @@ offline bundle needs no network at all.
 
 CI runs the full test suite on all three. A bundle only unpacks on the OS and
 CPU architecture it was packed on.
+
+## Use it from Claude Code or Codex
+
+vivar ships a skill (the `SKILL.md` format both agents read) that teaches them the
+commands, the policy rules and the bundle workflow, so "set up this project with
+vivar", "bundle this for the air-gapped box" or "check the GPU setup" just work.
+One command installs it for both:
+
+```sh
+vivar skill install            # ~/.claude/skills/vivar and ~/.codex/skills/vivar ($CODEX_HOME honoured)
+vivar skill install --project  # into this repository (.claude/skills, .agents/skills), so teammates get it too
+vivar skill show               # print it
+```
+
+The skill lives in [`skills/vivar/SKILL.md`](skills/vivar/SKILL.md) and is built into
+the binary, so no checkout is needed. Without vivar on a machine yet, copying that one
+folder into `~/.claude/skills/` or `~/.codex/skills/` does the same, and the skill
+itself tells the agent how to install vivar.
 
 ## Quick start
 
@@ -454,7 +472,11 @@ PyTorch is not routed to download.pytorch.org, a wheelhouse never falls back to
 downloads, channel URLs must live under the conda mirror, and the verifier ignores `VIVAR_TRUSTED_KEYS` and the machine's own
 key. The machine-wide file's location comes from the OS, not from `%ProgramData%`.
 Ship it inside the offline bundle or by configuration management; `vivar doctor`
-and `vivar policy` show which files are in effect.
+and `vivar policy` show which files are in effect, `policy --json` prints every rule
+(including `locked`, `artifact-hosts`, `conda-url` and `blocked-channels`) for audits,
+and `doctor` fails when the system policy file or its directory is not root-owned or is
+writable by others (a locked policy anyone can edit locks nothing). `locked` without an
+`index-url` pins keys and the conda mirror only; both commands say so.
 - Policy is read from the nearest `pyproject.toml` above the current directory.
 
 Existing `[tool.vivar]` sections are never overwritten by `vivar init`.

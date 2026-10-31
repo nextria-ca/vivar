@@ -1,0 +1,4 @@
+# Files the binary embeds or runs: one line ending everywhere.
+src/verify.py text eol=lf
+skills/**/SKILL.md text eol=lf
+install.sh text eol=lf

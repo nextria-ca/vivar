@@ -928,6 +928,124 @@ fn tasks_and_inline_scripts_run_in_the_right_env() {
 }
 
 #[test]
+fn locked_index_checks_every_download_hop() {
+    // An index of our own whose listing points at a wheel that redirects
+    // to another origin (same host, other port). Under a locked policy the
+    // redirect is refused unless that origin is in artifact-hosts.
+    let tmp = TempDir::new("hops");
+    let dir = &tmp.0;
+    init(dir);
+    ok(dir, &["add", "six"]);
+    let wh = dir.join("wh");
+    ok(dir, &["export", "wheelhouse", "-o", wh.to_str().unwrap()]);
+    let wheel = fs::read_dir(&wh)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("six-"))
+        .expect("the exported six wheel");
+    let filename = wheel.file_name().unwrap().to_string_lossy().into_owned();
+    const SERVER: &str = r#"import http.server, json, sys, threading, hashlib, os
+wheel = sys.argv[1]
+name = os.path.basename(wheel)
+data = open(wheel, 'rb').read()
+digest = hashlib.sha256(data).hexdigest()
+class Files(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        self.send_response(200); self.send_header('Content-Length', str(len(data))); self.end_headers(); self.wfile.write(data)
+files = http.server.HTTPServer(('127.0.0.1', 0), Files)
+class Index(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        if self.path.startswith('/simple/six/'):
+            body = json.dumps({'meta': {'api-version': '1.0'}, 'name': 'six', 'files': [{'filename': name, 'url': 'http://127.0.0.1:%d/files/%s' % (index.server_address[1], name), 'hashes': {'sha256': digest}, 'requires-python': '>=2.7', 'yanked': False}]}).encode()
+            self.send_response(200); self.send_header('Content-Type', 'application/vnd.pypi.simple.v1+json'); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+        elif self.path.startswith('/files/'):
+            self.send_response(302); self.send_header('Location', 'http://127.0.0.1:%d/%s' % (files.server_address[1], name)); self.end_headers()
+        else:
+            self.send_response(404); self.end_headers()
+index = http.server.HTTPServer(('127.0.0.1', 0), Index)
+print(index.server_address[1], files.server_address[1], flush=True)
+threading.Thread(target=files.serve_forever, daemon=True).start()
+index.serve_forever()
+"#;
+    let python = dir.join(".venv").join(BIN).join(exe("python"));
+    let mut server = Command::new(&python)
+        .args(["-c", SERVER, wheel.to_str().unwrap()])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut ports = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(server.stdout.take().unwrap()),
+        &mut ports,
+    )
+    .unwrap();
+    let (index_port, files_port) = ports.trim().split_once(' ').unwrap();
+    let index = format!("http://127.0.0.1:{index_port}/simple");
+
+    let proj = dir.join("locked");
+    fs::create_dir_all(&proj).unwrap();
+    ok(&proj, &["init", "demo", "--python", "3.12", "--no-sync"]);
+    let policy = dir.join("locked.toml");
+    let run = |text: &str| {
+        fs::write(&policy, text).unwrap();
+        Command::new(env!("CARGO_BIN_EXE_vivar"))
+            .current_dir(&proj)
+            .env("VIVAR_POLICY", &policy)
+            .env("VIVAR_CACHE_DIR", dir.join("cache"))
+            .env("VIVAR_INDEX_TTL", "0")
+            .env_remove("VIVAR_BACKEND")
+            .args(["add", "six"])
+            .output()
+            .unwrap()
+    };
+    // The redirect leaves the index's origin: refused before any byte is used.
+    let out = run(&format!(
+        "[policy]\nlocked = true\nindex-url = \"{index}\"\n"
+    ));
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("outside the hosts policy allows"),
+        "{stderr}"
+    );
+    assert!(!proj.join("uv.lock").exists() || !read(&proj.join("uv.lock")).contains("six"));
+    // Named as an artifact host, the same redirect is fine, and the lock
+    // records the index's URL, not where it redirected to.
+    let out = run(&format!(
+        "[policy]\nlocked = true\nindex-url = \"{index}\"\nartifact-hosts = [\"127.0.0.1:{files_port}\"]\n"
+    ));
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout_of(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lock = read(&proj.join("uv.lock"));
+    assert!(
+        lock.contains(&format!("http://127.0.0.1:{index_port}/files/{filename}")),
+        "{lock}"
+    );
+    assert!(!lock.contains(&format!("127.0.0.1:{files_port}")), "{lock}");
+    let out = Command::new(env!("CARGO_BIN_EXE_vivar"))
+        .current_dir(&proj)
+        .env("VIVAR_POLICY", &policy)
+        .env("VIVAR_CACHE_DIR", dir.join("cache"))
+        .args(["run", "python", "-c", "import six; print(six.__version__)"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout_of(&out).trim().starts_with("1."));
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
+#[test]
 fn clean_collects_store_entries_no_environment_links() {
     let tmp = TempDir::new("store-gc");
     let dir = &tmp.0;

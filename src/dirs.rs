@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use std::env;
 use std::path::PathBuf;
 
-fn home() -> Result<PathBuf> {
+pub fn home() -> Result<PathBuf> {
     let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     env::var_os(var)
         .map(PathBuf::from)

@@ -1090,6 +1090,66 @@ pub fn system_policy_path() -> PathBuf {
     }
 }
 
+/// Why the machine-wide policy file cannot be trusted to come from an
+/// administrator, if it cannot: not root-owned, or writable by group or
+/// others (the directory too, since a writable directory lets the file be
+/// replaced). Only Unix ownership is checked.
+pub fn system_policy_problem(path: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // The file and every directory above it, as named; a symlink at any
+        // step must be root-owned itself and its target chain checked the
+        // same way, since whoever owns a link decides where it points.
+        fn check(path: &Path, depth: u32) -> Option<String> {
+            if depth > 8 {
+                return Some(format!("{} goes through too many symlinks", path.display()));
+            }
+            for p in path.ancestors() {
+                let Ok(m) = fs::symlink_metadata(p) else {
+                    continue;
+                };
+                let what = if p == path {
+                    "policy file"
+                } else {
+                    "policy directory"
+                };
+                if m.uid() != 0 {
+                    return Some(format!(
+                        "{what} {} is owned by uid {}, not root",
+                        p.display(),
+                        m.uid()
+                    ));
+                }
+                if m.file_type().is_symlink() {
+                    let target = fs::read_link(p).ok()?;
+                    let target = if target.is_absolute() {
+                        target
+                    } else {
+                        p.parent().unwrap_or(Path::new("/")).join(target)
+                    };
+                    if let Some(problem) = check(&target, depth + 1) {
+                        return Some(problem);
+                    }
+                } else if m.mode() & 0o022 != 0 {
+                    return Some(format!(
+                        "{what} {} is writable by group or others (mode {:o})",
+                        p.display(),
+                        m.mode() & 0o777
+                    ));
+                }
+            }
+            None
+        }
+        check(path, 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// The org-wide policy, if one is configured: the user's file
 /// (`VIVAR_POLICY`, else the config directory's `policy.toml`) under the
 /// system file, with the path of the first that exists. `[policy]` table,
@@ -2370,6 +2430,34 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(path, system);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_system_policy_must_be_root_owned_and_not_writable_by_others() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let tmp = TempDir::new("syspolicy");
+        let file = tmp.0.join("policy.toml");
+        fs::write(&file, "[policy]\nlocked = true\n").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&tmp.0, fs::Permissions::from_mode(0o755)).unwrap();
+        let problem = system_policy_problem(&file);
+        // The file is ours: root-owned only when the tests run as root (and
+        // then a world-writable temp directory above it is itself a finding).
+        if fs::metadata(&file).unwrap().uid() == 0 {
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o666)).unwrap();
+            let problem = system_policy_problem(&file).unwrap();
+            assert!(problem.contains("writable"), "{problem}");
+        } else {
+            let problem = problem.unwrap();
+            assert!(problem.contains("not root"), "{problem}");
+            // A symlink is judged by its owner, so a user's link to a good
+            // file is a finding too.
+            let link = tmp.0.join("link.toml");
+            std::os::unix::fs::symlink(&file, &link).unwrap();
+            let problem = system_policy_problem(&link).unwrap();
+            assert!(problem.contains("not root"), "{problem}");
+        }
     }
 
     #[test]

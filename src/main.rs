@@ -31,6 +31,7 @@ mod sbom;
 mod sha256;
 mod sha512;
 mod sign;
+mod skill;
 mod tar;
 mod tool;
 mod upgrade;
@@ -304,6 +305,17 @@ they are never put on a command line. --dry-run shows what would be sent."
     Completions { shell: clap_complete::Shell },
     /// Write man pages (vivar.1 and one per subcommand) into a directory
     Man { dir: PathBuf },
+    /// The vivar skill for coding agents (Claude Code, Codex): install or print it
+    #[command(
+        long_about = "A SKILL.md that teaches Claude Code and Codex how to drive vivar. `vivar skill \
+install` puts it where both agents look (~/.claude/skills/vivar and $CODEX_HOME/skills/vivar, \
+default ~/.codex/skills/vivar); `--project` installs it into the current project instead \
+(.claude/skills/vivar and .agents/skills/vivar), where it ships with the repository."
+    )]
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
     /// Archive the synced environment plus its Python for another machine
     #[command(
         long_about = "Archive the synced .venv, its standalone Python, pyproject.toml, uv.lock and \
@@ -513,6 +525,18 @@ enum KernelCommand {
     Uninstall { name: String },
     /// List Jupyter kernels
     List,
+}
+
+#[derive(Subcommand)]
+enum SkillCommand {
+    /// Install the skill for Claude Code and Codex (user-wide, or --project)
+    Install {
+        /// Into this project (.claude/skills, .agents/skills) instead of the home directories
+        #[arg(long)]
+        project: bool,
+    },
+    /// Print the skill
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -1251,6 +1275,21 @@ fn main() -> Result<()> {
             let names = man::write_all(&Cli::command(), &dir)?;
             println!("wrote {} man pages to {}", names.len(), dir.display());
         }
+        Command::Skill { command } => match command {
+            SkillCommand::Install {
+                project: in_project,
+            } => {
+                let root = match (in_project, &project) {
+                    (true, Some(p)) => Some(p.root.clone()),
+                    (true, None) => Some(cwd.clone()),
+                    (false, _) => None,
+                };
+                for path in skill::install(root.as_deref())? {
+                    println!("installed {}", path.display());
+                }
+            }
+            SkillCommand::Show => print!("{}", skill::SKILL),
+        },
         Command::Pack {
             output,
             slim,
@@ -1867,7 +1906,7 @@ fn print_policy(project: Option<&Project>, policy: &project::Policy, json: bool)
         };
         let path_json = |p: &std::path::Path| json::quote(&p.display().to_string());
         println!(
-            "{{\"deny\":{},\"index-url\":{},\"allow-licenses\":{},\"license-exceptions\":{},\"require-hashes\":{},\"require-wheels\":{},\"telemetry\":{},\"network\":{},\"require-signed-bundles\":{},\"trusted-keys\":{},\"locked\":{},\"sources\":{{\"project\":{},\"workspace\":{},\"org\":{},\"system\":{}}}}}",
+            "{{\"deny\":{},\"index-url\":{},\"allow-licenses\":{},\"license-exceptions\":{},\"require-hashes\":{},\"require-wheels\":{},\"telemetry\":{},\"network\":{},\"require-signed-bundles\":{},\"trusted-keys\":{},\"locked\":{},\"artifact-hosts\":{},\"blocked-channels\":{},\"allow-anaconda-defaults\":{},\"conda-url\":{},\"sources\":{{\"project\":{},\"workspace\":{},\"org\":{},\"system\":{}}}}}",
             list(&policy.deny),
             policy.index_url.as_deref().map_or("null".to_owned(), json::quote),
             policy.allow_licenses.as_deref().map_or("null".to_owned(), list),
@@ -1879,6 +1918,10 @@ fn print_policy(project: Option<&Project>, policy: &project::Policy, json: bool)
             policy.require_signed_bundles,
             list(&policy.trusted_keys),
             policy.locked,
+            list(&policy.artifact_hosts),
+            list(&policy.blocked_channels),
+            policy.allow_anaconda_defaults.unwrap_or(false),
+            policy.conda_url.as_deref().map_or("null".to_owned(), json::quote),
             project.map_or("null".to_owned(), |p| path_json(&p.root.join(project::PYPROJECT))),
             project
                 .and_then(|p| p.workspace.as_deref())
@@ -1939,8 +1982,26 @@ fn print_policy(project: Option<&Project>, policy: &project::Policy, json: bool)
     if !policy.trusted_keys.is_empty() {
         println!("  trusted-keys:       {}", policy.trusted_keys.join(", "));
     }
+    if !policy.artifact_hosts.is_empty() {
+        println!("  artifact-hosts:     {}", policy.artifact_hosts.join(", "));
+    }
+    if let Some(url) = &policy.conda_url {
+        println!("  conda-url:          {url}");
+    }
+    if !policy.blocked_channels.is_empty() {
+        println!(
+            "  blocked-channels:   {}",
+            policy.blocked_channels.join(", ")
+        );
+    }
+    if policy.allow_anaconda_defaults.unwrap_or(false) {
+        println!("  anaconda defaults:  allowed");
+    }
     if policy.locked {
         println!("  locked:             yes (index, conda mirror and trusted keys come from the locked policy only)");
+        if policy.index_url.is_none() {
+            println!("  warning:            locked without index-url: package sources are not pinned, only keys and the conda mirror");
+        }
     }
     println!("from");
     match project {
